@@ -41,7 +41,20 @@ export const TwilioSettingsModal: React.FC<TwilioSettingsModalProps> = ({
 
   if (!isOpen) return null;
 
-  const appUrl = serverConfig?.appUrl || window.location.origin;
+  // Dynamically resolve application URL: prioritize current browser origin if on a public domain,
+  // or use explicit non-localhost domain from server configuration.
+  const appUrl = (() => {
+    if (typeof window !== 'undefined' && window.location.origin) {
+      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+      if (!isLocalHost) {
+        if (serverConfig?.appUrl && !serverConfig.appUrl.includes('localhost') && !serverConfig.appUrl.includes('127.0.0.1')) {
+          return serverConfig.appUrl;
+        }
+        return window.location.origin;
+      }
+    }
+    return serverConfig?.appUrl || (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
+  })();
   const outboundWebhook = `${appUrl}/api/twiml/outbound`;
   const gatherWebhook = `${appUrl}/api/twiml/gather`;
 
