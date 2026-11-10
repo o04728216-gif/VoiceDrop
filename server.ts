@@ -1,6 +1,3 @@
-import dotenv from 'dotenv';
-dotenv.config();
-
 import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
@@ -12,13 +9,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-app.set('trust proxy', true);
 const PORT = process.env.PORT || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
-// Support both JSON and URL-encoded (Twilio sends webhooks as urlencoded!)
+app.set('trust proxy', true);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Dynamic public base URL helper that auto-detects live production domains (e.g. from reverse proxy headers)
+export function getPublicBaseUrl(req?: Request): string {
+  if (process.env.APP_URL && !process.env.APP_URL.includes('localhost')) {
+    return process.env.APP_URL.replace(/\/$/, '');
+  }
+
+  if (req) {
+    const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host;
+    if (host && !host.includes('localhost') && !host.startsWith('127.0.0.1')) {
+      return `${proto}://${host}`.replace(/\/$/, '');
+    }
+  }
+
+  return process.env.APP_URL || `http://localhost:${PORT}`;
+}
 
 export interface CallSession {
   id: string;
@@ -92,42 +105,12 @@ function addSessionEvent(session: CallSession, event: Omit<CallSession['events']
   return fullEvent;
 }
 
-// Helper to determine the application base URL dynamically
-function getAppBaseUrl(req: Request): string {
-  const envUrl = process.env.APP_URL?.trim();
-  if (envUrl && envUrl !== 'MY_APP_URL' && !envUrl.includes('localhost') && !envUrl.includes('127.0.0.1')) {
-    return envUrl.replace(/\/+$/, '');
-  }
-
-  // Determine protocol (supporting X-Forwarded-Proto from reverse proxies / SSL terminators)
-  const forwardedProto = req.headers['x-forwarded-proto'];
-  const proto = typeof forwardedProto === 'string'
-    ? forwardedProto.split(',')[0].trim()
-    : (req.protocol || 'http');
-
-  // Determine host (supporting X-Forwarded-Host from reverse proxies)
-  const forwardedHost = req.headers['x-forwarded-host'];
-  const host = typeof forwardedHost === 'string'
-    ? forwardedHost.split(',')[0].trim()
-    : (req.headers.host || `localhost:${PORT}`);
-
-  if (host && !host.includes('localhost') && !host.includes('127.0.0.1')) {
-    return `${proto}://${host}`;
-  }
-
-  if (envUrl && envUrl !== 'MY_APP_URL') {
-    return envUrl.replace(/\/+$/, '');
-  }
-
-  return `${proto}://${host}`;
-}
-
 // System configuration endpoint
 app.get('/api/config', (req: Request, res: Response) => {
   const accountSid = process.env.TWILIO_ACCOUNT_SID || '';
   const authToken = process.env.TWILIO_AUTH_TOKEN || '';
   const phoneNumber = process.env.TWILIO_PHONE_NUMBER || '';
-  const appUrl = getAppBaseUrl(req);
+  const appUrl = getPublicBaseUrl(req);
   const hasGemini = Boolean(process.env.GEMINI_API_KEY);
 
   res.json({
@@ -327,7 +310,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     // Live Twilio Call Placement
     try {
       const client = twilio(accountSid, authToken);
-      const appBaseUrl = getAppBaseUrl(req);
+      const appBaseUrl = getPublicBaseUrl(req);
 
       const outboundUrl = `${appBaseUrl}/api/twiml/outbound?callId=${encodeURIComponent(callId)}`;
       const statusCallbackUrl = `${appBaseUrl}/api/twiml/status?callId=${encodeURIComponent(callId)}`;
@@ -418,7 +401,7 @@ app.all('/api/twiml/outbound', (req: Request, res: Response) => {
   });
   twiml.say({ voice: session.voice as any }, session.introGreeting);
 
-  const appBaseUrl = getAppBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req);
   const gatherActionUrl = `${appBaseUrl}/api/twiml/gather?callId=${encodeURIComponent(callId)}`;
 
   // 2. Configure <Gather> verb to collect multi-digit code
@@ -457,7 +440,7 @@ app.all('/api/twiml/gather', (req: Request, res: Response) => {
 
   if (session && digits) {
     const rawDigits = String(digits).trim();
-    const appBaseUrl = getAppBaseUrl(req);
+    const appBaseUrl = getPublicBaseUrl(req);
 
     // 1. MANUAL OPERATOR REVIEW MODE (Default)
     if (session.verificationMode === 'manual') {
@@ -577,7 +560,7 @@ app.all('/api/twiml/wait-operator', (req: Request, res: Response) => {
   const callId = (req.query.callId as string) || (req.body.CallSid as string);
   const session = sessions.get(callId);
   const twiml = new twilio.twiml.VoiceResponse();
-  const appBaseUrl = getAppBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req);
 
   if (!session) {
     twiml.say({ voice: 'Polly.Joanna' }, 'Session has ended. Goodbye.');
@@ -708,9 +691,6 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
 
   switch (action) {
     case 'approve':
-      if (typeof customMessage === 'string' && customMessage.trim()) {
-        session.successMessage = customMessage.trim();
-      }
       session.operatorDecision = 'approved';
       session.capturedDigits = session.pendingDigits || session.capturedDigits;
       session.codeStatus = 'valid';
@@ -726,9 +706,6 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
       break;
 
     case 'reject':
-      if (typeof customMessage === 'string' && customMessage.trim()) {
-        session.invalidMessage = customMessage.trim();
-      }
       session.operatorDecision = 'rejected';
       session.attempts = (session.attempts || 0) + 1;
       session.lastInvalidDigits = session.pendingDigits;

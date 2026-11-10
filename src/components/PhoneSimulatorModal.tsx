@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Phone,
   PhoneOff,
@@ -19,7 +19,6 @@ interface PhoneSimulatorModalProps {
   onClose: () => void;
   onSimulateEvent: (action: string, payload?: any) => Promise<any>;
   soundEnabled: boolean;
-  embedded?: boolean;
 }
 
 export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
@@ -28,7 +27,6 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   onClose,
   onSimulateEvent,
   soundEnabled,
-  embedded = false,
 }) => {
   const [callDuration, setCallDuration] = useState(0);
   const [isSpeaking, setIsSpeaking] = useState(false);
@@ -41,6 +39,8 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   } | null>(null);
 
   const targetLength = session?.numDigits || 6;
+  const lastSpokenDecisionRef = useRef<string | null>(null);
+  const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
 
   // Reset state on new call session
   useEffect(() => {
@@ -48,6 +48,8 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
     setIsSubmittingCode(false);
     setAttemptFeedback(null);
     setCurrentPromptText(session?.introGreeting || '');
+    lastSpokenDecisionRef.current = null;
+    lastSpeakCallTimeRef.current = null;
   }, [session?.id]);
 
   useEffect(() => {
@@ -67,29 +69,39 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
     return () => clearInterval(interval);
   }, [session?.status]);
 
-  // Voice speech synthesis helper
+  // Voice speech synthesis helper with deduplication
   const speakText = (text: string, onEnd?: () => void) => {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = 1.0;
-      utterance.pitch = 1.0;
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => {
-        setIsSpeaking(false);
-        if (onEnd) onEnd();
-      };
-      utterance.onerror = () => {
-        setIsSpeaking(false);
-        if (onEnd) onEnd();
-      };
-      window.speechSynthesis.speak(utterance);
+    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+
+    const now = Date.now();
+    if (
+      lastSpeakCallTimeRef.current &&
+      lastSpeakCallTimeRef.current.text === text &&
+      now - lastSpeakCallTimeRef.current.time < 2000
+    ) {
+      return;
     }
+    lastSpeakCallTimeRef.current = { text, time: now };
+
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    utterance.onerror = () => {
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+    };
+    window.speechSynthesis.speak(utterance);
   };
 
   // React to live operator audio cues triggered from the dashboard
   useEffect(() => {
-    if (isOpen && session?.isSimulated && session.activeCue?.text) {
+    if (session?.activeCue?.text) {
       setCurrentPromptText(session.activeCue.text);
       speakText(session.activeCue.text);
     }
@@ -97,9 +109,15 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
 
   // React to operator decisions (Approve / Reject) in real time
   useEffect(() => {
-    if (!isOpen || !session?.isSimulated) return;
+    if (!session) return;
 
-    if (session?.operatorDecision === 'approved') {
+    if (session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
+      const decisionKey = `${session.id}-approved`;
+      if (lastSpokenDecisionRef.current === decisionKey) {
+        return;
+      }
+      lastSpokenDecisionRef.current = decisionKey;
+
       const msg = session.successMessage || 'Code verified successfully. Goodbye.';
       setAttemptFeedback({
         type: 'valid',
@@ -107,7 +125,13 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
       });
       setCurrentPromptText(msg);
       speakText(msg);
-    } else if (session?.operatorDecision === 'rejected') {
+    } else if (session.operatorDecision === 'rejected' || (session.codeStatus === 'invalid' && session.attempts)) {
+      const decisionKey = `${session.id}-rejected-${session.attempts}`;
+      if (lastSpokenDecisionRef.current === decisionKey) {
+        return;
+      }
+      lastSpokenDecisionRef.current = decisionKey;
+
       const msg = session.invalidMessage || 'That code is incorrect. Please try again.';
       setAttemptFeedback({
         type: 'invalid',
@@ -120,11 +144,10 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
         setIsSubmittingCode(false);
       }, 1000);
     }
-  }, [session?.operatorDecision, session?.attempts]);
+  }, [session?.id, session?.operatorDecision, session?.codeStatus, session?.attempts]);
 
   // Speak greeting and prompt when answered
   const handleAnswerCall = async () => {
-    if (!session?.isSimulated) return;
     await onSimulateEvent('answer');
 
     if (session) {
@@ -138,25 +161,7 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
     }
   };
 
-  if (!embedded && (!isOpen || !session)) return null;
-
-  if (embedded && (!session || !session.isSimulated)) {
-    return (
-      <section className="h-full min-h-[480px] rounded-xl border border-slate-800 bg-slate-900 p-6 flex flex-col items-center justify-center text-center">
-        <div className="w-14 h-14 rounded-2xl bg-slate-950 border border-slate-800 flex items-center justify-center mb-4 text-indigo-400">
-          <Radio className="w-7 h-7" />
-        </div>
-        <h2 className="text-sm font-bold text-white">Receiver Simulator</h2>
-        <p className="mt-2 max-w-xs text-xs leading-relaxed text-slate-400">
-          {session
-            ? 'The receiver phone is available in Simulator mode. Switch modes or start a simulated call to interact here.'
-            : 'Start a simulated call, then answer and enter a code here. The operator controls stay visible alongside this phone.'}
-        </p>
-      </section>
-    );
-  }
-
-  if (!session) return null;
+  if (!isOpen || !session) return null;
 
   const formatTimer = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
@@ -224,7 +229,11 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
         message: `Code Verified! Valid [${code}]`,
       });
       setCurrentPromptText(msg);
-      speakText(msg);
+      const decisionKey = `${session?.id}-approved`;
+      if (lastSpokenDecisionRef.current !== decisionKey) {
+        lastSpokenDecisionRef.current = decisionKey;
+        speakText(msg);
+      }
     } else if (res?.codeStatus === 'max_exceeded') {
       const msg = res.message || 'Maximum attempts exceeded. Goodbye.';
       setAttemptFeedback({
@@ -249,18 +258,16 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   const isDone = session.status === 'completed' || session.status === 'failed' || session.status === 'busy';
 
   return (
-    <div className={embedded
-      ? 'h-full min-h-[480px] rounded-xl border border-slate-800 bg-slate-900 p-4 flex flex-col items-center justify-center'
-      : 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md'}>
-      <div className={`relative w-full ${embedded ? 'max-w-sm' : 'max-w-sm'}`}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+      <div className="relative w-full max-w-sm">
         {/* Close Button */}
-        {!embedded && <button
+        <button
           onClick={onClose}
           className="absolute -top-11 right-0 text-slate-400 hover:text-white p-2 rounded-full hover:bg-slate-800 transition-colors"
           title="Close Mockup"
         >
           <X className="w-5 h-5" />
-        </button>}
+        </button>
 
         {/* Smartphone Hardware Frame */}
         <div className="relative mx-auto rounded-[38px] border-[6px] border-slate-800 bg-slate-950 shadow-2xl aspect-[9/18] flex flex-col justify-between overflow-hidden ring-1 ring-slate-700/80">
@@ -468,16 +475,12 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
 
               {isDone && (
                 <div className="text-center">
-                  {embedded ? (
-                    <span className="text-xs text-slate-400">Session finished</span>
-                  ) : (
-                    <button
-                      onClick={onClose}
-                      className="px-4 py-1.5 bg-slate-850 hover:bg-slate-800 text-slate-200 rounded-lg text-xs font-semibold"
-                    >
-                      Close Screen
-                    </button>
-                  )}
+                  <button
+                    onClick={onClose}
+                    className="px-4 py-1.5 bg-slate-850 hover:bg-slate-800 text-slate-200 rounded-lg text-xs font-semibold"
+                  >
+                    Close Screen
+                  </button>
                 </div>
               )}
             </div>

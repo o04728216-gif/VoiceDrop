@@ -42,7 +42,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const isTwilioReady = serverConfig?.isTwilioConfigured;
   const isCallLive =
     activeSession &&
-    ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input'].includes(
+    ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
       activeSession.status
     );
 

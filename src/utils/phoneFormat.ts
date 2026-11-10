@@ -8,23 +8,32 @@ export function cleanDigits(input: string): string {
 
 /**
  * Formats raw digits into US phone format: +1 (XXX) XXX-XXXX
+ * Robust against editing and backspacing without prepending duplicate '1's.
  */
 export function formatUsPhoneDisplay(input: string): string {
+  if (!input || !input.trim()) return '';
+
   let digits = cleanDigits(input);
 
-  // Strip an explicit +1 prefix at every input length so partial typing keeps
-  // the country code out of the local number. Also accept a full 11-digit 1 prefix.
-  if (/^\s*\+1\b/.test(input) || (digits.startsWith('1') && digits.length > 10)) {
+  // In US NANP, valid area codes CANNOT begin with 0 or 1 ([2-9]XX only).
+  // Therefore, any leading '1' is the country code prefix (+1).
+  // Strip the leading 1 so we work solely with the 10-digit national number.
+  if (digits.startsWith('1')) {
     digits = digits.slice(1);
   }
 
-  // Cap at 10 digits
-  const trimmed = digits.slice(0, 10);
+  // Cap at 10 national digits
+  const national = digits.slice(0, 10);
 
-  if (trimmed.length === 0) return '';
-  if (trimmed.length <= 3) return `+1 (${trimmed}`;
-  if (trimmed.length <= 6) return `+1 (${trimmed.slice(0, 3)}) ${trimmed.slice(3)}`;
-  return `+1 (${trimmed.slice(0, 3)}) ${trimmed.slice(3, 6)}-${trimmed.slice(6, 10)}`;
+  // If no national digits entered yet
+  if (national.length === 0) {
+    if (input === '+' || input.length <= 1) return input;
+    return '+1 (';
+  }
+
+  if (national.length <= 3) return `+1 (${national}`;
+  if (national.length <= 6) return `+1 (${national.slice(0, 3)}) ${national.slice(3)}`;
+  return `+1 (${national.slice(0, 3)}) ${national.slice(3, 6)}-${national.slice(6, 10)}`;
 }
 
 /**
@@ -38,7 +47,8 @@ export function validateUsPhoneNumber(input: string): {
 } {
   let digits = cleanDigits(input);
 
-  if (digits.startsWith('1') && digits.length === 11) {
+  // Strip leading US country code 1
+  if (digits.startsWith('1')) {
     digits = digits.slice(1);
   }
 

@@ -58,7 +58,7 @@ export interface VoiceProfile {
   name: string;
   gender: 'Female' | 'Male';
   accent: string;
-  provider: 'Amazon Polly' | 'Amazon Polly Neural' | 'Amazon Polly Generative' | 'Google' | 'Standard';
+  provider: 'Amazon Polly' | 'Google' | 'Standard';
   samplePreview: string;
 }
 

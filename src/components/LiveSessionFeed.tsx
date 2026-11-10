@@ -49,17 +49,6 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const [showTwimlModal, setShowTwimlModal] = useState(false);
   const [customCueText, setCustomCueText] = useState('');
   const [isSendingCue, setIsSendingCue] = useState(false);
-  const [holdPrompt, setHoldPrompt] = useState('');
-  const [incorrectPrompt, setIncorrectPrompt] = useState('');
-  const [repeatPrompt, setRepeatPrompt] = useState('');
-  const [approvalPrompt, setApprovalPrompt] = useState('');
-
-  useEffect(() => {
-    setHoldPrompt(session?.holdMessage || '');
-    setIncorrectPrompt(session?.invalidMessage || '');
-    setRepeatPrompt(session?.script || '');
-    setApprovalPrompt(session?.successMessage || '');
-  }, [session?.id]);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
   // Trigger celebration confetti when multi-digit code is verified valid
@@ -424,7 +413,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
                 <button
                   type="button"
-                  onClick={() => onOperatorAction?.('approve', approvalPrompt)}
+                  onClick={() => onOperatorAction?.('approve')}
                   className="py-3 px-4 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs uppercase flex items-center justify-center gap-2 shadow-lg shadow-emerald-600/30 transition-all cursor-pointer active:scale-[0.98]"
                 >
                   <CheckCircle2 className="w-4 h-4" />
@@ -433,7 +422,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
 
                 <button
                   type="button"
-                  onClick={() => onOperatorAction?.('reject', incorrectPrompt)}
+                  onClick={() => onOperatorAction?.('reject')}
                   className="py-3 px-4 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs uppercase flex items-center justify-center gap-2 shadow-lg shadow-rose-600/30 transition-all cursor-pointer active:scale-[0.98]"
                 >
                   <AlertTriangle className="w-4 h-4" />
@@ -457,30 +446,36 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               </div>
 
               {/* Quick Canned Audio Buttons */}
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <label className="text-[11px] text-amber-300 space-y-1">
-                  <span className="flex items-center gap-1"><PauseCircle className="w-3.5 h-3.5" /> Hold / wait prompt</span>
-                  <textarea value={holdPrompt} onChange={(e) => setHoldPrompt(e.target.value)} rows={2} className="w-full p-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-amber-500" />
-                  <button type="button" onClick={() => onOperatorAction?.('hold', holdPrompt)} className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-amber-300 text-xs font-semibold hover:bg-slate-800">Speak hold prompt</button>
-                </label>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                <button
+                  type="button"
+                  onClick={() => onOperatorAction?.('hold')}
+                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-amber-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
+                  title="Speaks 'Kindly hold while we verify...'"
+                >
+                  <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
+                  <span>"Kindly Hold / Please Wait"</span>
+                </button>
 
-                <label className="text-[11px] text-rose-300 space-y-1">
-                  <span className="flex items-center gap-1"><AlertTriangle className="w-3.5 h-3.5" /> Incorrect / retry prompt</span>
-                  <textarea value={incorrectPrompt} onChange={(e) => setIncorrectPrompt(e.target.value)} rows={2} className="w-full p-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-rose-500" />
-                  <button type="button" onClick={() => onOperatorAction?.('incorrect_prompt', incorrectPrompt)} className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-rose-300 text-xs font-semibold hover:bg-slate-800">Speak retry prompt</button>
-                </label>
+                <button
+                  type="button"
+                  onClick={() => onOperatorAction?.('incorrect_prompt')}
+                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-rose-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
+                  title="Speaks 'The code entered is incorrect. Please try again.'"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                  <span>"Password / Code Incorrect"</span>
+                </button>
 
-                <label className="text-[11px] text-indigo-300 space-y-1">
-                  <span className="flex items-center gap-1"><RotateCcw className="w-3.5 h-3.5" /> Repeat code request</span>
-                  <textarea value={repeatPrompt} onChange={(e) => setRepeatPrompt(e.target.value)} rows={2} className="w-full p-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-indigo-500" />
-                  <button type="button" onClick={() => onOperatorAction?.('custom_cue', repeatPrompt)} className="px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-indigo-300 text-xs font-semibold hover:bg-slate-800">Speak request</button>
-                </label>
-
-                <label className="text-[11px] text-emerald-300 space-y-1">
-                  <span className="flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> Approval / success prompt</span>
-                  <textarea value={approvalPrompt} onChange={(e) => setApprovalPrompt(e.target.value)} rows={2} className="w-full p-2 rounded-lg bg-slate-900 border border-slate-700 text-xs text-slate-200 focus:outline-none focus:border-emerald-500" />
-                  <span className="block text-slate-500">Used when you approve the entered code.</span>
-                </label>
+                <button
+                  type="button"
+                  onClick={() => onOperatorAction?.('custom_cue', session.script)}
+                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-indigo-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
+                  title="Repeats the original code collection prompt"
+                >
+                  <RotateCcw className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>"Repeat Code Request"</span>
+                </button>
               </div>
 
               {/* Custom Spoken Text Broadcaster ("Say to Caller Now") */}
@@ -509,16 +504,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             </div>
           )}
 
-          {/* Keypad visualizer */}
-          <KeypadVisualizer
-            activeDigit={activeDigit || (displayDigits ? displayDigits[displayDigits.length - 1] : null)}
-            keypadActions={{}}
-            soundEnabled={soundEnabled}
-            onKeyPress={onSimulateDtmf}
-            interactive={isCallActive}
-          />
-
-          {/* Event Stream Log */}
+          {/* Event Stream Log (Positioned on top of Keypad Matrix) */}
           <div className="flex-1 flex flex-col bg-slate-950 border border-slate-800 rounded-xl p-4 min-h-[180px]">
             <div className="flex items-center justify-between mb-2.5 pb-2 border-b border-slate-800">
               <div className="flex items-center gap-2">
@@ -576,6 +562,15 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               <div ref={eventsEndRef} />
             </div>
           </div>
+
+          {/* Keypad Matrix visualizer */}
+          <KeypadVisualizer
+            activeDigit={activeDigit || (displayDigits ? displayDigits[displayDigits.length - 1] : null)}
+            keypadActions={{}}
+            soundEnabled={soundEnabled}
+            onKeyPress={onSimulateDtmf}
+            interactive={isCallActive}
+          />
         </div>
       )}
 

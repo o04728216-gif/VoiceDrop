@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Phone,
   Play,
@@ -19,26 +19,8 @@ import {
   PauseCircle,
 } from 'lucide-react';
 import { VOICE_PROFILES } from '../utils/constants';
-import { cleanDigits, formatUsPhoneDisplay, validateUsPhoneNumber } from '../utils/phoneFormat';
+import { formatUsPhoneDisplay, validateUsPhoneNumber } from '../utils/phoneFormat';
 import { TwilioConfig } from '../types/telephony';
-
-const PROMPTS_STORAGE_KEY = 'voicedrop_dispatcher_prompts';
-const DEFAULT_PROMPTS = {
-  holdMessage: 'Kindly hold while your information is being processed.',
-  introGreeting: 'Hello, thank you for answering. This is an automated security verification call.',
-  script: 'Please enter your 6-digit authorization code on your phone keypad now, followed by the pound sign.',
-  invalidMessage: 'That code is incorrect. Please re-enter your 6-digit code on your keypad now, followed by the pound sign.',
-  successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
-};
-
-const loadSavedPrompts = () => {
-  try {
-    const saved = localStorage.getItem(PROMPTS_STORAGE_KEY);
-    return saved ? { ...DEFAULT_PROMPTS, ...JSON.parse(saved) } : DEFAULT_PROMPTS;
-  } catch {
-    return DEFAULT_PROMPTS;
-  }
-};
 
 interface ControlCenterProps {
   onLaunchCall: (params: {
@@ -63,6 +45,44 @@ interface ControlCenterProps {
   twilioConfig: TwilioConfig | null;
 }
 
+const STORAGE_PREFIX = 'voicedrop_prompts_';
+const STORAGE_KEYS = {
+  introGreeting: `${STORAGE_PREFIX}introGreeting`,
+  script: `${STORAGE_PREFIX}script`,
+  holdMessage: `${STORAGE_PREFIX}holdMessage`,
+  invalidMessage: `${STORAGE_PREFIX}invalidMessage`,
+  successMessage: `${STORAGE_PREFIX}successMessage`,
+  numDigits: `${STORAGE_PREFIX}numDigits`,
+  voice: `${STORAGE_PREFIX}voice`,
+  verificationMode: `${STORAGE_PREFIX}verificationMode`,
+  maxAttempts: `${STORAGE_PREFIX}maxAttempts`,
+  isCustomEdited: `${STORAGE_PREFIX}isCustomEdited`,
+};
+
+const DEFAULT_TEMPLATES = {
+  6: {
+    introGreeting: 'Hello, thank you for answering. This is an automated security verification call.',
+    script: 'Please enter your 6-digit authorization code on your phone keypad now, followed by the pound sign.',
+    holdMessage: 'Kindly hold while your information is being processed.',
+    invalidMessage: 'That code is incorrect. Please re-enter your 6-digit code on your keypad now, followed by the pound sign.',
+    successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
+  },
+  4: {
+    introGreeting: 'Hello, thank you for answering. This is your account security verification call.',
+    script: 'Please enter your 4-digit security PIN on your phone keypad now, followed by the pound sign.',
+    holdMessage: 'Kindly hold while your information is being processed.',
+    invalidMessage: 'That PIN is incorrect. Please re-enter your 4-digit PIN on your keypad now, followed by the pound sign.',
+    successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
+  },
+  5: {
+    introGreeting: 'Hello, thank you for answering. This is automated identity verification.',
+    script: 'Please enter your 5-digit account number or ZIP code on your keypad now, followed by the pound key.',
+    holdMessage: 'Kindly hold while your information is being processed.',
+    invalidMessage: 'That entry is incorrect. Please re-enter your 5-digit number on your keypad now, followed by the pound key.',
+    successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
+  },
+};
+
 export const ControlCenter: React.FC<ControlCenterProps> = ({
   onLaunchCall,
   isLoading,
@@ -70,80 +90,155 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   mode,
   hasGemini,
 }) => {
-  const [rawPhone, setRawPhone] = useState('(555) 382-9104');
-  const phoneInputRef = useRef<HTMLInputElement>(null);
-  const [numDigits, setNumDigits] = useState<number>(6);
-  const [selectedVoice, setSelectedVoice] = useState('Polly.Joanna');
+  const [rawPhone, setRawPhone] = useState('+1 (555) 382-9104');
   const [isEnhancing, setIsEnhancing] = useState(false);
-
-  // Verification mode: Manual operator review is default
-  const [verificationMode, setVerificationMode] = useState<'manual' | 'auto'>('manual');
-
-  // Spoken message while operator reviews code
-  const [savedPrompts] = useState(loadSavedPrompts);
-  const [holdMessage, setHoldMessage] = useState(savedPrompts.holdMessage);
-
-  // 1. Immediate message played right when phone answers
-  const [introGreeting, setIntroGreeting] = useState(savedPrompts.introGreeting);
-
-  // 2. Expected valid code (used in auto mode)
-  const [expectedCode, setExpectedCode] = useState('482910');
-
-  // 3. Message requesting the code
-  const [script, setScript] = useState(savedPrompts.script);
-
-  // 4. Invalid code message (plays if code is incorrect so user can retry)
-  const [invalidMessage, setInvalidMessage] = useState(savedPrompts.invalidMessage);
-
-  // 5. Message after valid code is collected
-  const [successMessage, setSuccessMessage] = useState(savedPrompts.successMessage);
-
-  const [maxAttempts, setMaxAttempts] = useState(3);
   const [activeTab, setActiveTab] = useState<'main' | 'prompts'>('main');
 
-  useEffect(() => {
-    localStorage.setItem(PROMPTS_STORAGE_KEY, JSON.stringify({
-      holdMessage,
-      introGreeting,
-      script,
-      invalidMessage,
-      successMessage,
-    }));
-  }, [holdMessage, introGreeting, script, invalidMessage, successMessage]);
+  // Persistent settings with localStorage
+  const [numDigits, setNumDigitsState] = useState<number>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.numDigits);
+    return saved ? Number(saved) : 6;
+  });
+
+  const [selectedVoice, setSelectedVoiceState] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_KEYS.voice) || 'Polly.Joanna';
+  });
+
+  const [verificationMode, setVerificationModeState] = useState<'manual' | 'auto'>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.verificationMode);
+    return (saved as 'manual' | 'auto') || 'manual';
+  });
+
+  const [isCustomEdited, setIsCustomEdited] = useState<boolean>(() => {
+    return localStorage.getItem(STORAGE_KEYS.isCustomEdited) === 'true';
+  });
+
+  // 1. Spoken message while operator reviews code
+  const [holdMessage, setHoldMessageState] = useState<string>(() => {
+    return (
+      localStorage.getItem(STORAGE_KEYS.holdMessage) ||
+      'Kindly hold while your information is being processed.'
+    );
+  });
+
+  // 2. Immediate message played right when phone answers
+  const [introGreeting, setIntroGreetingState] = useState<string>(() => {
+    return (
+      localStorage.getItem(STORAGE_KEYS.introGreeting) ||
+      'Hello, thank you for answering. This is an automated security verification call.'
+    );
+  });
+
+  // 3. Expected valid code (used in auto mode)
+  const [expectedCode, setExpectedCode] = useState('482910');
+
+  // 4. Message requesting the code
+  const [script, setScriptState] = useState<string>(() => {
+    return (
+      localStorage.getItem(STORAGE_KEYS.script) ||
+      'Please enter your 6-digit authorization code on your phone keypad now, followed by the pound sign.'
+    );
+  });
+
+  // 5. Invalid code message (plays if code is incorrect so user can retry)
+  const [invalidMessage, setInvalidMessageState] = useState<string>(() => {
+    return (
+      localStorage.getItem(STORAGE_KEYS.invalidMessage) ||
+      'That code is incorrect. Please re-enter your 6-digit code on your keypad now, followed by the pound sign.'
+    );
+  });
+
+  // 6. Message after valid code is collected
+  const [successMessage, setSuccessMessageState] = useState<string>(() => {
+    return (
+      localStorage.getItem(STORAGE_KEYS.successMessage) ||
+      'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.'
+    );
+  });
+
+  const [maxAttempts, setMaxAttemptsState] = useState<number>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.maxAttempts);
+    return saved ? Number(saved) : 3;
+  });
+
+  // Persistent setters ensuring prompts stay as last edited and never change on refresh
+  const setIntroGreeting = (val: string) => {
+    setIntroGreetingState(val);
+    localStorage.setItem(STORAGE_KEYS.introGreeting, val);
+    localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+    setIsCustomEdited(true);
+  };
+
+  const setScript = (val: string) => {
+    setScriptState(val);
+    localStorage.setItem(STORAGE_KEYS.script, val);
+    localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+    setIsCustomEdited(true);
+  };
+
+  const setHoldMessage = (val: string) => {
+    setHoldMessageState(val);
+    localStorage.setItem(STORAGE_KEYS.holdMessage, val);
+    localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+    setIsCustomEdited(true);
+  };
+
+  const setInvalidMessage = (val: string) => {
+    setInvalidMessageState(val);
+    localStorage.setItem(STORAGE_KEYS.invalidMessage, val);
+    localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+    setIsCustomEdited(true);
+  };
+
+  const setSuccessMessage = (val: string) => {
+    setSuccessMessageState(val);
+    localStorage.setItem(STORAGE_KEYS.successMessage, val);
+    localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+    setIsCustomEdited(true);
+  };
+
+  const setNumDigits = (digits: number) => {
+    setNumDigitsState(digits);
+    localStorage.setItem(STORAGE_KEYS.numDigits, String(digits));
+  };
+
+  const setSelectedVoice = (voice: string) => {
+    setSelectedVoiceState(voice);
+    localStorage.setItem(STORAGE_KEYS.voice, voice);
+  };
+
+  const setVerificationMode = (mode: 'manual' | 'auto') => {
+    setVerificationModeState(mode);
+    localStorage.setItem(STORAGE_KEYS.verificationMode, mode);
+  };
+
+  const setMaxAttempts = (attempts: number) => {
+    setMaxAttemptsState(attempts);
+    localStorage.setItem(STORAGE_KEYS.maxAttempts, String(attempts));
+  };
+
+  const handleResetPromptsToDefault = () => {
+    const tpl = DEFAULT_TEMPLATES[numDigits as 4 | 5 | 6] || DEFAULT_TEMPLATES[6];
+    setIntroGreetingState(tpl.introGreeting);
+    setScriptState(tpl.script);
+    setHoldMessageState(tpl.holdMessage);
+    setInvalidMessageState(tpl.invalidMessage);
+    setSuccessMessageState(tpl.successMessage);
+
+    localStorage.removeItem(STORAGE_KEYS.introGreeting);
+    localStorage.removeItem(STORAGE_KEYS.script);
+    localStorage.removeItem(STORAGE_KEYS.holdMessage);
+    localStorage.removeItem(STORAGE_KEYS.invalidMessage);
+    localStorage.removeItem(STORAGE_KEYS.successMessage);
+    localStorage.removeItem(STORAGE_KEYS.isCustomEdited);
+    setIsCustomEdited(false);
+  };
 
   const phoneValidation = validateUsPhoneNumber(rawPhone);
 
   const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const inputValue = e.target.value;
-    const selectionStart = e.target.selectionStart ?? inputValue.length;
-    let localDigitsBeforeCaret = cleanDigits(inputValue.slice(0, selectionStart)).length;
-    if (inputValue.startsWith('+1')) {
-      localDigitsBeforeCaret = Math.max(0, localDigitsBeforeCaret - 1);
-    }
-
-    const formatted = formatUsPhoneDisplay(inputValue);
+    const formatted = formatUsPhoneDisplay(e.target.value);
     setRawPhone(formatted);
-
-    requestAnimationFrame(() => {
-      const input = phoneInputRef.current;
-      if (!input) return;
-      const digits = cleanDigits(formatted);
-      const hasCountryPrefix = formatted.startsWith('+1');
-      const localDigitCount = Math.max(0, digits.length - (hasCountryPrefix ? 1 : 0));
-      const targetDigit = Math.min(localDigitsBeforeCaret, localDigitCount);
-      let seenLocalDigits = 0;
-      let caret = hasCountryPrefix ? 4 : 0;
-      if (targetDigit > 0) {
-        for (let i = hasCountryPrefix ? 4 : 0; i < formatted.length; i++) {
-          if (/\d/.test(formatted[i])) {
-            seenLocalDigits += 1;
-            caret = i + 1;
-            if (seenLocalDigits >= targetDigit) break;
-          }
-        }
-      }
-      input.setSelectionRange(caret, caret);
-    });
   };
 
   const generateRandomCode = (len: number) => {
@@ -158,6 +253,16 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     setNumDigits(digits);
     const newCode = generateRandomCode(digits);
     setExpectedCode(newCode);
+
+    // If user has customized their prompts, DO NOT overwrite them! Keep as last edited.
+    if (!isCustomEdited) {
+      const tpl = DEFAULT_TEMPLATES[digits as 4 | 5 | 6] || DEFAULT_TEMPLATES[6];
+      setIntroGreetingState(tpl.introGreeting);
+      setScriptState(tpl.script);
+      setHoldMessageState(tpl.holdMessage);
+      setInvalidMessageState(tpl.invalidMessage);
+      setSuccessMessageState(tpl.successMessage);
+    }
   };
 
   const handleRandomizeCode = () => {
@@ -309,6 +414,9 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           >
             <MessageSquare className="w-3.5 h-3.5" />
             <span>Spoken Prompts &amp; Hold Audio</span>
+            {isCustomEdited && (
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" title="Custom prompts saved"></span>
+            )}
           </button>
         </div>
 
@@ -324,7 +432,6 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                   🇺🇸
                 </div>
                 <input
-                  ref={phoneInputRef}
                   type="text"
                   value={rawPhone}
                   onChange={handlePhoneChange}
@@ -485,6 +592,30 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
         ) : (
           /* PROMPTS & RETRY FLOW TAB */
           <div className="space-y-3.5">
+            {/* Persistence Status Header */}
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                  Custom Spoken Voice Prompts
+                </span>
+                {isCustomEdited && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-semibold">
+                    Saved &amp; Locked
+                  </span>
+                )}
+              </div>
+
+              {isCustomEdited && (
+                <button
+                  type="button"
+                  onClick={handleResetPromptsToDefault}
+                  className="text-[11px] text-slate-400 hover:text-white underline transition-colors cursor-pointer"
+                >
+                  Reset Defaults
+                </button>
+              )}
+            </div>
+
             {/* Immediate Pickup Greeting */}
             <div>
               <label className="text-xs font-semibold text-slate-300 block mb-1">

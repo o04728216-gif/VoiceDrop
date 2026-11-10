@@ -54,7 +54,7 @@ export const Header: React.FC<HeaderProps> = ({
   const meta = TAB_TITLES[currentTab];
   const isCallLive =
     activeSession &&
-    ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input'].includes(
+    ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
       activeSession.status
     );
 

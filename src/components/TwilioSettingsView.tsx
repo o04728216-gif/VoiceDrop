@@ -38,20 +38,17 @@ export const TwilioSettingsView: React.FC<TwilioSettingsViewProps> = ({
     }
   }, [savedConfig]);
 
-  // Dynamically resolve application URL: prioritize current browser origin if on a public domain,
-  // or use explicit non-localhost domain from server configuration.
-  const appUrl = (() => {
-    if (typeof window !== 'undefined' && window.location.origin) {
-      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-      if (!isLocalHost) {
-        if (serverConfig?.appUrl && !serverConfig.appUrl.includes('localhost') && !serverConfig.appUrl.includes('127.0.0.1')) {
-          return serverConfig.appUrl;
-        }
-        return window.location.origin;
-      }
-    }
-    return serverConfig?.appUrl || (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
-  })();
+  // Auto-detect production origin from the live browser URL (e.g. https://voicedrop.64.95.13.98.sslip.io)
+  // or fall back to serverConfig if valid.
+  const browserOrigin = typeof window !== 'undefined' && window.location.origin ? window.location.origin : '';
+  const isBrowserLocal = !browserOrigin || browserOrigin.includes('localhost') || browserOrigin.includes('127.0.0.1');
+
+  const appUrl = !isBrowserLocal
+    ? browserOrigin
+    : (serverConfig?.appUrl && !serverConfig.appUrl.includes('localhost')
+      ? serverConfig.appUrl
+      : browserOrigin || 'http://localhost:3000');
+
   const outboundWebhook = `${appUrl}/api/twiml/outbound`;
   const gatherWebhook = `${appUrl}/api/twiml/gather`;
   const statusWebhook = `${appUrl}/api/twiml/status`;
@@ -200,9 +197,16 @@ export const TwilioSettingsView: React.FC<TwilioSettingsViewProps> = ({
         {/* Webhooks & Telephony Architecture (5 cols) */}
         <div className="lg:col-span-5 space-y-4">
           <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 shadow-sm">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300 mb-3">
-              Automated Twilio Webhook Endpoints
-            </h3>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                Automated Twilio Webhook Endpoints
+              </h3>
+              {!isBrowserLocal && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-semibold">
+                  Live Host Active
+                </span>
+              )}
+            </div>
 
             <div className="space-y-3">
               <div className="p-3 bg-slate-950 border border-slate-800 rounded-xl">
