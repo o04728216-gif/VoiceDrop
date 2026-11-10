@@ -1,0 +1,6 @@
+{
+  "name": "VoiceDrop Interactive",
+  "description": "Outbound automated interactive voice messaging platform with real-time DTMF keypad capture and live session telemetry.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
