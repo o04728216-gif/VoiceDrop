@@ -10,7 +10,7 @@ import {
   Smartphone,
   Activity,
 } from 'lucide-react';
-import { CallSession, ServerConfig } from '../types/telephony';
+import { CallSession, ServerConfig, TelephonyCarrier } from '../types/telephony';
 
 export type NavTab = 'dispatcher' | 'keypad' | 'history' | 'settings';
 
@@ -25,6 +25,7 @@ interface SidebarProps {
   onToggleMode: (mode: 'live' | 'simulator') => void;
   onOpenSimulator: () => void;
   callsCount: number;
+  activeCarrier?: TelephonyCarrier;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -38,6 +39,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleMode,
   onOpenSimulator,
   callsCount,
+  activeCarrier = 'twilio',
 }) => {
   const isTwilioReady = serverConfig?.isTwilioConfigured;
   const isCallLive =
@@ -70,10 +72,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
     },
     {
       id: 'settings' as NavTab,
-      label: 'Twilio Settings',
+      label: 'Carrier Settings',
       icon: Sliders,
-      badge: isTwilioReady ? 'Connected' : null,
-      badgeColor: 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',
+      badge: activeCarrier.toUpperCase(),
+      badgeColor: 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 font-mono',
     },
   ];
 
@@ -172,13 +174,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button
             type="button"
             onClick={() => onToggleMode('live')}
-            className={`py-1 rounded font-medium transition-all ${
+            className={`py-1 rounded font-medium transition-all truncate px-1 ${
               mode === 'live'
                 ? 'bg-indigo-600 text-white'
                 : 'text-slate-400 hover:text-slate-200'
             }`}
           >
-            Twilio
+            {activeCarrier ? activeCarrier.charAt(0).toUpperCase() + activeCarrier.slice(1) : 'Carrier'}
           </button>
         </div>
 

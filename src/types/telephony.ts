@@ -48,6 +48,7 @@ export interface CallSession {
   confidence?: number;
   duration?: number;
   isSimulated: boolean;
+  carrier?: TelephonyCarrier;
   createdAt: string;
   completedAt?: string;
   events: CallEvent[];
@@ -79,6 +80,43 @@ export interface TwilioConfig {
   phoneNumber: string;
 }
 
+export interface PlivoConfig {
+  authId: string;
+  authToken: string;
+  phoneNumber: string;
+}
+
+export interface TelnyxConfig {
+  apiKey: string;
+  connectionId: string;
+  phoneNumber: string;
+}
+
+export interface SignalWireConfig {
+  spaceUrl: string;
+  projectId: string;
+  apiToken: string;
+  phoneNumber: string;
+}
+
+export interface FonosterConfig {
+  projectId: string;
+  accessKeyId: string;
+  accessKeySecret: string;
+  phoneNumber: string;
+}
+
+export type TelephonyCarrier = 'twilio' | 'plivo' | 'telnyx' | 'signalwire' | 'fonoster';
+
+export interface CarriersConfig {
+  activeCarrier: TelephonyCarrier;
+  twilio?: TwilioConfig;
+  plivo?: PlivoConfig;
+  telnyx?: TelnyxConfig;
+  signalwire?: SignalWireConfig;
+  fonoster?: FonosterConfig;
+}
+
 export interface ServerConfig {
   hasTwilioAccountSid: boolean;
   hasTwilioAuthToken: boolean;
@@ -87,4 +125,5 @@ export interface ServerConfig {
   configuredPhoneNumber: string | null;
   appUrl: string;
   hasGemini: boolean;
+  activeCarrier?: TelephonyCarrier;
 }

@@ -21,6 +21,9 @@ interface PhoneSimulatorModalProps {
   soundEnabled: boolean;
 }
 
+// Global memory across unmounts / tab switches so switching tabs never replays speech
+const globallySpokenDecisions = new Set<string>();
+
 export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   session,
   isOpen,
@@ -42,13 +45,35 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
 
+  // If component mounts and session is ALREADY completed, mark decision as already spoken
+  useEffect(() => {
+    if (session?.id && (session.status === 'completed' || session.operatorDecision === 'approved')) {
+      const decisionKey = `${session.id}-approved`;
+      globallySpokenDecisions.add(decisionKey);
+      lastSpokenDecisionRef.current = decisionKey;
+    }
+  }, []);
+
+  // Cancel any speech when leaving the view / unmounting
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
+
   // Reset state on new call session
   useEffect(() => {
     setEnteredDigits('');
     setIsSubmittingCode(false);
     setAttemptFeedback(null);
     setCurrentPromptText(session?.introGreeting || '');
-    lastSpokenDecisionRef.current = null;
+    if (session?.id) {
+      if (session.status !== 'completed' && session.operatorDecision !== 'approved') {
+        lastSpokenDecisionRef.current = null;
+      }
+    }
     lastSpeakCallTimeRef.current = null;
   }, [session?.id]);
 
@@ -113,10 +138,11 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
 
     if (session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
       const decisionKey = `${session.id}-approved`;
-      if (lastSpokenDecisionRef.current === decisionKey) {
+      if (lastSpokenDecisionRef.current === decisionKey || globallySpokenDecisions.has(decisionKey)) {
         return;
       }
       lastSpokenDecisionRef.current = decisionKey;
+      globallySpokenDecisions.add(decisionKey);
 
       const msg = session.successMessage || 'Code verified successfully. Goodbye.';
       setAttemptFeedback({
@@ -127,10 +153,11 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
       speakText(msg);
     } else if (session.operatorDecision === 'rejected' || (session.codeStatus === 'invalid' && session.attempts)) {
       const decisionKey = `${session.id}-rejected-${session.attempts}`;
-      if (lastSpokenDecisionRef.current === decisionKey) {
+      if (lastSpokenDecisionRef.current === decisionKey || globallySpokenDecisions.has(decisionKey)) {
         return;
       }
       lastSpokenDecisionRef.current = decisionKey;
+      globallySpokenDecisions.add(decisionKey);
 
       const msg = session.invalidMessage || 'That code is incorrect. Please try again.';
       setAttemptFeedback({

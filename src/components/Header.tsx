@@ -8,7 +8,7 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { CallSession, ServerConfig } from '../types/telephony';
+import { CallSession, ServerConfig, TelephonyCarrier } from '../types/telephony';
 import { NavTab } from './Sidebar';
 
 interface HeaderProps {
@@ -20,6 +20,7 @@ interface HeaderProps {
   soundEnabled: boolean;
   onToggleSound: () => void;
   mode: 'live' | 'simulator';
+  activeCarrier?: TelephonyCarrier;
 }
 
 const TAB_TITLES: Record<NavTab, { title: string; subtitle: string }> = {
@@ -36,8 +37,8 @@ const TAB_TITLES: Record<NavTab, { title: string; subtitle: string }> = {
     subtitle: 'Audit captured multi-digit codes, durations, and telephony session history.',
   },
   settings: {
-    title: 'Carrier & Twilio Configuration',
-    subtitle: 'Manage Twilio API credentials, caller ID numbers, and webhooks.',
+    title: 'Carrier & Telephony Configuration',
+    subtitle: 'Manage Twilio, Plivo, Telnyx, SignalWire, and Fonoster API keys and webhooks.',
   },
 };
 
@@ -50,6 +51,7 @@ export const Header: React.FC<HeaderProps> = ({
   soundEnabled,
   onToggleSound,
   mode,
+  activeCarrier = 'twilio',
 }) => {
   const meta = TAB_TITLES[currentTab];
   const isCallLive =
@@ -57,6 +59,9 @@ export const Header: React.FC<HeaderProps> = ({
     ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
       activeSession.status
     );
+
+  const carrierDisplayName =
+    activeCarrier.charAt(0).toUpperCase() + activeCarrier.slice(1);
 
   return (
     <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md px-4 lg:px-8 py-3.5 sticky top-0 z-30 flex items-center justify-between gap-4">
@@ -69,7 +74,7 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           ) : (
             <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              Twilio Carrier
+              {carrierDisplayName} Carrier
             </span>
           )}
         </h1>

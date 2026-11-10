@@ -12,7 +12,7 @@ import { KeypadLabView } from './components/KeypadLabView';
 import { CallHistoryView } from './components/CallHistoryView';
 import { TwilioSettingsView } from './components/TwilioSettingsView';
 import { PhoneSimulatorView } from './components/PhoneSimulatorView';
-import { CallSession, ServerConfig, TwilioConfig } from './types/telephony';
+import { CallSession, ServerConfig, TwilioConfig, CarriersConfig, TelephonyCarrier } from './types/telephony';
 import {
   playDtmfTone,
   startRingbackTone,
@@ -23,6 +23,7 @@ import {
 import { AlertCircle, X, ShieldCheck, Activity, PhoneCall, LayoutGrid } from 'lucide-react';
 
 const STORAGE_KEY_TWILIO = 'voicedrop_twilio_config';
+const STORAGE_KEY_CARRIERS = 'voicedrop_carriers_config';
 const STORAGE_KEY_SOUND = 'voicedrop_sound_enabled';
 const STORAGE_KEY_MODE = 'voicedrop_active_mode';
 
@@ -32,6 +33,27 @@ export default function App() {
   const [activeDigit, setActiveDigit] = useState<string | null>(null);
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [savedTwilioConfig, setSavedTwilioConfig] = useState<TwilioConfig | null>(null);
+
+  const [carriersConfig, setCarriersConfig] = useState<CarriersConfig>(() => {
+    const stored = localStorage.getItem(STORAGE_KEY_CARRIERS);
+    if (stored) {
+      try {
+        return JSON.parse(stored);
+      } catch (e) {}
+    }
+    const legacyTwilio = localStorage.getItem(STORAGE_KEY_TWILIO);
+    let twilio: TwilioConfig | undefined = undefined;
+    if (legacyTwilio) {
+      try {
+        twilio = JSON.parse(legacyTwilio);
+      } catch (e) {}
+    }
+    return {
+      activeCarrier: 'twilio',
+      twilio,
+    };
+  });
+
   const [callsHistory, setCallsHistory] = useState<CallSession[]>([]);
 
   const [soundEnabled, setSoundEnabled] = useState<boolean>(() => {
@@ -108,6 +130,28 @@ export default function App() {
   const handleSaveTwilioConfig = (config: TwilioConfig) => {
     setSavedTwilioConfig(config);
     localStorage.setItem(STORAGE_KEY_TWILIO, JSON.stringify(config));
+    setCarriersConfig((prev) => {
+      const updated = { ...prev, twilio: config };
+      localStorage.setItem(STORAGE_KEY_CARRIERS, JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const handleSaveCarriersConfig = (config: CarriersConfig) => {
+    setCarriersConfig(config);
+    localStorage.setItem(STORAGE_KEY_CARRIERS, JSON.stringify(config));
+    if (config.twilio) {
+      setSavedTwilioConfig(config.twilio);
+      localStorage.setItem(STORAGE_KEY_TWILIO, JSON.stringify(config.twilio));
+    }
+  };
+
+  const handleChangeActiveCarrier = (carrier: TelephonyCarrier) => {
+    setCarriersConfig((prev) => {
+      const updated: CarriersConfig = { ...prev, activeCarrier: carrier };
+      localStorage.setItem(STORAGE_KEY_CARRIERS, JSON.stringify(updated));
+      return updated;
+    });
   };
 
   // SSE Telemetry listener
@@ -189,6 +233,7 @@ export default function App() {
     inputMode: 'dtmf' | 'speech' | 'dtmf speech';
     numDigits: number;
     keypadActions: Record<string, string>;
+    carrier?: TelephonyCarrier;
   }) => {
     try {
       setIsLoading(true);
@@ -197,6 +242,8 @@ export default function App() {
       const payload = {
         ...params,
         mode,
+        carrier: params.carrier || carriersConfig.activeCarrier,
+        carriersConfig,
         customTwilio: savedTwilioConfig,
       };
 
@@ -332,6 +379,7 @@ export default function App() {
         onToggleMode={handleToggleMode}
         onOpenSimulator={handleOpenSimulator}
         callsCount={callsHistory.length}
+        activeCarrier={carriersConfig.activeCarrier}
       />
 
       {/* Main Content Area */}
@@ -346,6 +394,7 @@ export default function App() {
           soundEnabled={soundEnabled}
           onToggleSound={handleToggleSound}
           mode={mode}
+          activeCarrier={carriersConfig.activeCarrier}
         />
 
         {/* Error Banner */}
@@ -479,6 +528,8 @@ export default function App() {
                       mode={mode}
                       hasGemini={Boolean(serverConfig?.hasGemini)}
                       twilioConfig={savedTwilioConfig}
+                      activeCarrier={carriersConfig.activeCarrier}
+                      onChangeActiveCarrier={handleChangeActiveCarrier}
                     />
                   </div>
                 )}
@@ -492,6 +543,8 @@ export default function App() {
                       mode={mode}
                       hasGemini={Boolean(serverConfig?.hasGemini)}
                       twilioConfig={savedTwilioConfig}
+                      activeCarrier={carriersConfig.activeCarrier}
+                      onChangeActiveCarrier={handleChangeActiveCarrier}
                     />
                     <LiveSessionFeed
                       session={activeSession}
@@ -548,6 +601,8 @@ export default function App() {
               serverConfig={serverConfig}
               savedConfig={savedTwilioConfig}
               onSaveConfig={handleSaveTwilioConfig}
+              savedCarriersConfig={carriersConfig}
+              onSaveCarriersConfig={handleSaveCarriersConfig}
             />
           )}
         </main>

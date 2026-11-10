@@ -15,26 +15,26 @@ export function formatUsPhoneDisplay(input: string): string {
 
   let digits = cleanDigits(input);
 
-  // In US NANP, valid area codes CANNOT begin with 0 or 1 ([2-9]XX only).
-  // Therefore, any leading '1' is the country code prefix (+1).
-  // Strip the leading 1 so we work solely with the 10-digit national number.
-  if (digits.startsWith('1')) {
+  // If user cleared everything or just left with non-digits
+  if (!digits) {
+    if (input.trim() === '+' || input.trim() === '+1') return input.trim();
+    return '';
+  }
+
+  // If 11 digits starting with 1, strip country code 1 so we get 10-digit national number
+  if (digits.length >= 11 && digits.startsWith('1')) {
     digits = digits.slice(1);
   }
 
   // Cap at 10 national digits
   const national = digits.slice(0, 10);
 
-  // If no national digits entered yet
-  if (national.length === 0) {
-    if (input === '+' || input.length <= 1) return input;
-    return '+1 (';
-  }
-
+  if (national.length === 0) return '';
   if (national.length <= 3) return `+1 (${national}`;
   if (national.length <= 6) return `+1 (${national.slice(0, 3)}) ${national.slice(3)}`;
   return `+1 (${national.slice(0, 3)}) ${national.slice(3, 6)}-${national.slice(6, 10)}`;
 }
+
 
 /**
  * Validates whether the number is a valid 10-digit North American Numbering Plan (NANP) phone

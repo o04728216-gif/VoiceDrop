@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { VOICE_PROFILES } from '../utils/constants';
 import { formatUsPhoneDisplay, validateUsPhoneNumber } from '../utils/phoneFormat';
-import { TwilioConfig } from '../types/telephony';
+import { TwilioConfig, TelephonyCarrier, CarriersConfig } from '../types/telephony';
 
 interface ControlCenterProps {
   onLaunchCall: (params: {
@@ -37,12 +37,15 @@ interface ControlCenterProps {
     inputMode: 'dtmf' | 'speech' | 'dtmf speech';
     numDigits: number;
     keypadActions: Record<string, string>;
+    carrier?: TelephonyCarrier;
   }) => Promise<void>;
   isLoading: boolean;
   activeCall: boolean;
   mode: 'live' | 'simulator';
   hasGemini: boolean;
   twilioConfig: TwilioConfig | null;
+  activeCarrier?: TelephonyCarrier;
+  onChangeActiveCarrier?: (carrier: TelephonyCarrier) => void;
 }
 
 const STORAGE_PREFIX = 'voicedrop_prompts_';
@@ -89,6 +92,8 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   activeCall,
   mode,
   hasGemini,
+  activeCarrier = 'twilio',
+  onChangeActiveCarrier,
 }) => {
   const [rawPhone, setRawPhone] = useState('+1 (555) 382-9104');
   const [isEnhancing, setIsEnhancing] = useState(false);
@@ -310,6 +315,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
       keypadActions: {
         code: `${numDigits}-Digit Code Collection`,
       },
+      carrier: activeCarrier,
     });
   };
 
@@ -333,9 +339,26 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            <div className="text-[11px] font-medium px-2.5 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700">
-              {mode === 'simulator' ? 'Simulator' : 'Live Carrier'}
-            </div>
+            {mode === 'simulator' ? (
+              <div className="text-[11px] font-medium px-2.5 py-0.5 rounded-md bg-slate-800 text-slate-300 border border-slate-700">
+                Simulator Mode
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5 bg-slate-950 px-2 py-1 rounded-lg border border-slate-800 text-xs">
+                <span className="text-[10px] text-slate-400 font-semibold uppercase">Carrier:</span>
+                <select
+                  value={activeCarrier}
+                  onChange={(e) => onChangeActiveCarrier && onChangeActiveCarrier(e.target.value as TelephonyCarrier)}
+                  className="bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-emerald-400 font-semibold font-mono focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="twilio">Twilio</option>
+                  <option value="plivo">Plivo</option>
+                  <option value="telnyx">Telnyx</option>
+                  <option value="signalwire">SignalWire</option>
+                  <option value="fonoster">Fonoster</option>
+                </select>
+              </div>
+            )}
           </div>
         </div>
 

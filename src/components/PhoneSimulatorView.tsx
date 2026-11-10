@@ -29,6 +29,9 @@ interface PhoneSimulatorViewProps {
   onToggleDock?: () => void;
 }
 
+// Global memory across unmounts / tab switches so switching tabs never replays speech
+const globallySpokenDecisions = new Set<string>();
+
 export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   session,
   onSimulateEvent,
@@ -50,6 +53,25 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   const targetLength = session?.numDigits || 6;
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
+  const initialMountStatusRef = useRef<string | null>(session?.status || null);
+
+  // If component mounts and session is ALREADY completed, mark decision as already spoken
+  useEffect(() => {
+    if (session?.id && (session.status === 'completed' || session.operatorDecision === 'approved')) {
+      const decisionKey = `${session.id}-approved`;
+      globallySpokenDecisions.add(decisionKey);
+      lastSpokenDecisionRef.current = decisionKey;
+    }
+  }, []);
+
+  // Cancel any speech when leaving the view / unmounting
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
 
   // Reset state on new call session
   useEffect(() => {
@@ -57,7 +79,12 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     setIsSubmittingCode(false);
     setAttemptFeedback(null);
     setCurrentPromptText(session?.introGreeting || '');
-    lastSpokenDecisionRef.current = null;
+    // If it's a completely new call, reset the decision ref unless already in global set
+    if (session?.id) {
+      if (session.status !== 'completed' && session.operatorDecision !== 'approved') {
+        lastSpokenDecisionRef.current = null;
+      }
+    }
     lastSpeakCallTimeRef.current = null;
   }, [session?.id]);
 
@@ -123,10 +150,12 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
 
     if (session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
       const decisionKey = `${session.id}-approved`;
-      if (lastSpokenDecisionRef.current === decisionKey) {
-        return; // Already spoken confirmation once for this session!
+      // Check both local ref and global set to prevent replay on tab switch or remount
+      if (lastSpokenDecisionRef.current === decisionKey || globallySpokenDecisions.has(decisionKey)) {
+        return;
       }
       lastSpokenDecisionRef.current = decisionKey;
+      globallySpokenDecisions.add(decisionKey);
 
       const msg = session.successMessage || 'Code verified successfully. Goodbye.';
       setAttemptFeedback({
@@ -137,10 +166,11 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       speakText(msg);
     } else if (session.operatorDecision === 'rejected' || (session.codeStatus === 'invalid' && session.attempts)) {
       const decisionKey = `${session.id}-rejected-${session.attempts}`;
-      if (lastSpokenDecisionRef.current === decisionKey) {
+      if (lastSpokenDecisionRef.current === decisionKey || globallySpokenDecisions.has(decisionKey)) {
         return;
       }
       lastSpokenDecisionRef.current = decisionKey;
+      globallySpokenDecisions.add(decisionKey);
 
       const msg = session.invalidMessage || 'That code is incorrect. Please try again.';
       setAttemptFeedback({
