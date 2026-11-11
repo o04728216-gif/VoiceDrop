@@ -19,17 +19,13 @@ import {
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { CallSession, CallStatus } from '../types/telephony';
-import { KeypadVisualizer } from './KeypadVisualizer';
 
 const celebratedSessions = new Set<string>();
 
 interface LiveSessionFeedProps {
   session: CallSession | null;
-  activeDigit: string | null;
-  soundEnabled: boolean;
   onEndCall: () => void;
   onOpenSimulator: () => void;
-  onSimulateDtmf?: (digit: string) => void;
   onOperatorAction?: (
     action: 'approve' | 'reject' | 'hold' | 'incorrect_prompt' | 'custom_cue',
     customMessage?: string
@@ -38,11 +34,8 @@ interface LiveSessionFeedProps {
 
 export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   session,
-  activeDigit,
-  soundEnabled,
   onEndCall,
   onOpenSimulator,
-  onSimulateDtmf,
   onOperatorAction,
 }) => {
   const [copied, setCopied] = useState(false);
@@ -543,7 +536,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             </div>
           )}
 
-          {/* Event Stream Log (Positioned on top of Keypad Matrix) */}
+          {/* Event Stream Log */}
           <div className="flex-1 flex flex-col bg-slate-950 border border-slate-800 rounded-xl p-4 min-h-[180px]">
             <div className="flex items-center justify-between mb-2.5 pb-2 border-b border-slate-800">
               <div className="flex items-center gap-2">
@@ -601,15 +594,6 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               <div ref={eventsEndRef} />
             </div>
           </div>
-
-          {/* Keypad Matrix visualizer */}
-          <KeypadVisualizer
-            activeDigit={activeDigit || (displayDigits ? displayDigits[displayDigits.length - 1] : null)}
-            keypadActions={{}}
-            soundEnabled={soundEnabled}
-            onKeyPress={onSimulateDtmf}
-            interactive={isCallActive}
-          />
         </div>
       )}
 

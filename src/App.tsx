@@ -30,7 +30,6 @@ const STORAGE_KEY_MODE = 'voicedrop_active_mode';
 export default function App() {
   const [currentTab, setCurrentTab] = useState<NavTab>('dispatcher');
   const [activeSession, setActiveSession] = useState<CallSession | null>(null);
-  const [activeDigit, setActiveDigit] = useState<string | null>(null);
   const [serverConfig, setServerConfig] = useState<ServerConfig | null>(null);
   const [savedTwilioConfig, setSavedTwilioConfig] = useState<TwilioConfig | null>(null);
 
@@ -234,11 +233,9 @@ export default function App() {
         const callEvt = JSON.parse(event.data);
         if (callEvt.type === 'dtmf' && callEvt.data?.digits) {
           const digit = String(callEvt.data.digits);
-          setActiveDigit(digit);
           if (soundEnabledRef.current) {
             playDtmfTone(digit.slice(-1));
           }
-          setTimeout(() => setActiveDigit(null), 1500);
         }
       } catch (err) {
         console.error('SSE event parse error:', err);
@@ -544,8 +541,6 @@ export default function App() {
                   <div className="flex flex-col min-h-[500px]">
                     <LiveSessionFeed
                       session={activeSession}
-                      activeDigit={activeDigit}
-                      soundEnabled={soundEnabled}
                       onEndCall={handleEndCall}
                       onOpenSimulator={handleOpenSimulator}
                       onOperatorAction={handleOperatorAction}
@@ -582,8 +577,6 @@ export default function App() {
                     />
                     <LiveSessionFeed
                       session={activeSession}
-                      activeDigit={activeDigit}
-                      soundEnabled={soundEnabled}
                       onEndCall={handleEndCall}
                       onOpenSimulator={handleOpenSimulator}
                       onOperatorAction={handleOperatorAction}
