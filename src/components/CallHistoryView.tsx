@@ -1,17 +1,9 @@
 import React, { useState } from 'react';
 import {
-  History,
   PhoneCall,
   Search,
-  Filter,
   Download,
-  CheckCircle2,
-  AlertTriangle,
-  Clock,
   Mic,
-  ArrowRight,
-  Eye,
-  Activity,
 } from 'lucide-react';
 import { CallSession } from '../types/telephony';
 
@@ -39,9 +31,14 @@ export const CallHistoryView: React.FC<CallHistoryViewProps> = ({
     if (statusFilter === 'all') return true;
     if (statusFilter === 'completed') return call.status === 'completed';
     if (statusFilter === 'in-progress')
-      return ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input'].includes(
-        call.status
-      );
+      return [
+        'queued',
+        'initiating',
+        'ringing',
+        'in-progress',
+        'collecting-input',
+        'awaiting-operator',
+      ].includes(call.status);
     if (statusFilter === 'failed')
       return ['failed', 'busy', 'no-answer'].includes(call.status);
     return true;
@@ -216,7 +213,9 @@ export const CallHistoryView: React.FC<CallHistoryViewProps> = ({
                       </td>
                       <td className="py-3 px-4">
                         <span className="text-[11px] font-medium text-slate-400">
-                          {call.isSimulated ? 'Simulator' : 'Twilio Carrier'}
+                          {call.isSimulated
+                            ? `Simulator (${(call.carrier || 'twilio').toUpperCase()})`
+                            : `${(call.carrier || 'twilio').charAt(0).toUpperCase()}${(call.carrier || 'twilio').slice(1)} Carrier`}
                         </span>
                       </td>
                       <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">

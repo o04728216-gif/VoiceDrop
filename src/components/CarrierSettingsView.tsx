@@ -6,7 +6,6 @@ import {
   Check,
   CheckCircle,
   Info,
-  Radio,
   Server,
   Globe,
   Lock,
@@ -14,6 +13,7 @@ import {
   EyeOff,
   Zap,
 } from 'lucide-react';
+import { normalizeE164Phone } from '../utils/phoneFormat';
 import {
   ServerConfig,
   TwilioConfig,
@@ -171,15 +171,46 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
   const currentSelectedCarrier = savedCarriersConfig?.activeCarrier || 'twilio';
 
-  const handleSetActiveCarrier = (carrier: TelephonyCarrier) => {
-    const updated: CarriersConfig = {
-      activeCarrier: carrier,
-      twilio,
-      plivo,
-      telnyx,
-      signalwire,
-      fonoster,
+  const buildNormalizedConfig = (activeCarrier: TelephonyCarrier): CarriersConfig => {
+    const normTwilio: TwilioConfig = {
+      ...twilio,
+      phoneNumber: twilio.phoneNumber ? normalizeE164Phone(twilio.phoneNumber) : '',
     };
+    const normPlivo: PlivoConfig = {
+      ...plivo,
+      phoneNumber: plivo.phoneNumber ? normalizeE164Phone(plivo.phoneNumber) : '',
+    };
+    const normTelnyx: TelnyxConfig = {
+      ...telnyx,
+      phoneNumber: telnyx.phoneNumber ? normalizeE164Phone(telnyx.phoneNumber) : '',
+    };
+    const normSignalwire: SignalWireConfig = {
+      ...signalwire,
+      phoneNumber: signalwire.phoneNumber ? normalizeE164Phone(signalwire.phoneNumber) : '',
+    };
+    const normFonoster: FonosterConfig = {
+      ...fonoster,
+      phoneNumber: fonoster.phoneNumber ? normalizeE164Phone(fonoster.phoneNumber) : '',
+    };
+
+    setTwilio(normTwilio);
+    setPlivo(normPlivo);
+    setTelnyx(normTelnyx);
+    setSignalwire(normSignalwire);
+    setFonoster(normFonoster);
+
+    return {
+      activeCarrier,
+      twilio: normTwilio,
+      plivo: normPlivo,
+      telnyx: normTelnyx,
+      signalwire: normSignalwire,
+      fonoster: normFonoster,
+    };
+  };
+
+  const handleSetActiveCarrier = (carrier: TelephonyCarrier) => {
+    const updated = buildNormalizedConfig(carrier);
     onSaveCarriersConfig(updated);
     setSavedSuccess(`Active carrier set to ${carrier.toUpperCase()}`);
     setTimeout(() => setSavedSuccess(null), 2500);
@@ -187,18 +218,11 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
   const handleSaveCurrentCarrier = (e: React.FormEvent) => {
     e.preventDefault();
-    const updated: CarriersConfig = {
-      activeCarrier: currentSelectedCarrier,
-      twilio,
-      plivo,
-      telnyx,
-      signalwire,
-      fonoster,
-    };
+    const updated = buildNormalizedConfig(currentSelectedCarrier);
     onSaveCarriersConfig(updated);
 
-    if (onSaveConfig) {
-      onSaveConfig(twilio);
+    if (onSaveConfig && updated.twilio) {
+      onSaveConfig(updated.twilio);
     }
 
     setSavedSuccess(`${activeCarrierTab.toUpperCase()} credentials saved successfully!`);

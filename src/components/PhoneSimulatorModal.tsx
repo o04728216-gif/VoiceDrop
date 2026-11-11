@@ -23,6 +23,7 @@ interface PhoneSimulatorModalProps {
 
 // Global memory across unmounts / tab switches so switching tabs never replays speech
 const globallySpokenDecisions = new Set<string>();
+const globallySpokenCues = new Set<string>();
 
 export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   session,
@@ -45,16 +46,35 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
 
-  // If component mounts and session is ALREADY completed, mark decision as already spoken
+  // If component mounts and session is ALREADY in a terminal state, mark decisions/cues as already spoken
   useEffect(() => {
-    if (session?.id && (session.status === 'completed' || session.operatorDecision === 'approved')) {
-      const decisionKey = `${session.id}-approved`;
-      globallySpokenDecisions.add(decisionKey);
-      lastSpokenDecisionRef.current = decisionKey;
+    if (session?.id) {
+      if (session.activeCue?.timestamp) {
+        globallySpokenCues.add(`${session.id}-cue-${session.activeCue.timestamp}`);
+      }
+      if (
+        ['completed', 'failed', 'busy', 'no-answer'].includes(session.status) ||
+        session.operatorDecision === 'approved' ||
+        session.codeStatus === 'valid'
+      ) {
+        const decisionKey = `${session.id}-approved`;
+        globallySpokenDecisions.add(decisionKey);
+        lastSpokenDecisionRef.current = decisionKey;
+        if (session.attempts) {
+          globallySpokenDecisions.add(`${session.id}-rejected-${session.attempts}`);
+        }
+      }
     }
   }, []);
 
-  // Cancel any speech when leaving the view / unmounting
+  // Cancel any speech when leaving the view / unmounting or when soundEnabled turns false
+  useEffect(() => {
+    if (!soundEnabled && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+    }
+  }, [soundEnabled]);
+
   useEffect(() => {
     return () => {
       if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
@@ -70,7 +90,15 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
     setAttemptFeedback(null);
     setCurrentPromptText(session?.introGreeting || '');
     if (session?.id) {
-      if (session.status !== 'completed' && session.operatorDecision !== 'approved') {
+      if (
+        ['completed', 'failed', 'busy', 'no-answer'].includes(session.status) ||
+        session.operatorDecision === 'approved' ||
+        session.codeStatus === 'valid'
+      ) {
+        const decisionKey = `${session.id}-approved`;
+        globallySpokenDecisions.add(decisionKey);
+        lastSpokenDecisionRef.current = decisionKey;
+      } else {
         lastSpokenDecisionRef.current = null;
       }
     }
@@ -94,9 +122,19 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
     return () => clearInterval(interval);
   }, [session?.status]);
 
-  // Voice speech synthesis helper with deduplication
+  // Voice speech synthesis helper with deduplication and mute support
   const speakText = (text: string, onEnd?: () => void) => {
-    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      if (onEnd) onEnd();
+      return;
+    }
+
+    if (!soundEnabled) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
+      if (onEnd) onEnd();
+      return;
+    }
 
     const now = Date.now();
     if (
@@ -126,11 +164,16 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
 
   // React to live operator audio cues triggered from the dashboard
   useEffect(() => {
-    if (session?.activeCue?.text) {
+    if (session?.id && session?.activeCue?.text && session?.activeCue?.timestamp) {
+      const cueKey = `${session.id}-cue-${session.activeCue.timestamp}`;
       setCurrentPromptText(session.activeCue.text);
+      if (globallySpokenCues.has(cueKey)) {
+        return;
+      }
+      globallySpokenCues.add(cueKey);
       speakText(session.activeCue.text);
     }
-  }, [session?.activeCue?.timestamp]);
+  }, [session?.id, session?.activeCue?.timestamp]);
 
   // React to operator decisions (Approve / Reject) in real time
   useEffect(() => {
@@ -214,53 +257,62 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
       return;
     }
 
-    const next = enteredDigits + key;
-    setEnteredDigits(next);
-
-    if (next.length >= targetLength) {
-      submitFullCode(next);
-    }
-  };
-
-  const submitFullCode = async (code: string) => {
-    setIsSubmittingCode(true);
-    setAttemptFeedback(null);
-
-    const res = await onSimulateEvent('dtmf', { digits: code });
-
-    if (res?.codeStatus === 'awaiting_operator') {
-      const holdMsg = res.message || session.holdMessage || 'Kindly hold while your information is being processed.';
-      setAttemptFeedback({
-        type: 'waiting',
-        message: `Code [${code}] submitted — On hold for operator review`,
-      });
-      setCurrentPromptText(holdMsg);
-      speakText(holdMsg);
-    } else if (res?.codeStatus === 'invalid') {
-      const msg = res.message || session.invalidMessage || 'That code is incorrect. Please try again.';
-      setAttemptFeedback({
-        type: 'invalid',
-        message: `Attempt ${res.attempts}/${res.maxAttempts || 3}: Invalid Code [${code}]`,
-      });
-      setCurrentPromptText(msg);
-      speakText(msg);
-
-      setTimeout(() => {
-        setEnteredDigits('');
-        setIsSubmittingCode(false);
-      }, 1000);
-    } else if (res?.codeStatus === 'valid') {
-      const msg = res.message || session.successMessage || 'Code verified successfully. Goodbye.';
-      setAttemptFeedback({
-        type: 'valid',
-        message: `Code Verified! Valid [${code}]`,
-      });
-      setCurrentPromptText(msg);
-      const decisionKey = `${session?.id}-approved`;
-      if (lastSpokenDecisionRef.current !== decisionKey) {
-        lastSpokenDecisionRef.current = decisionKey;
-        speakText(msg);
+      if (attemptFeedback?.type === 'invalid') {
+        setAttemptFeedback(null);
       }
+
+      const next = enteredDigits + key;
+      setEnteredDigits(next);
+
+      if (next.length >= targetLength) {
+        submitFullCode(next);
+      }
+    };
+
+    const submitFullCode = async (code: string) => {
+      setIsSubmittingCode(true);
+      setAttemptFeedback(null);
+
+      const res = await onSimulateEvent('dtmf', { digits: code });
+
+      if (res?.codeStatus === 'awaiting_operator') {
+        const holdMsg = res.message || session.holdMessage || 'Kindly hold while your information is being processed.';
+        setAttemptFeedback({
+          type: 'waiting',
+          message: `Code [${code}] submitted — On hold for operator review`,
+        });
+        setCurrentPromptText(holdMsg);
+        speakText(holdMsg);
+      } else if (res?.codeStatus === 'invalid') {
+        const decisionKey = `${session.id}-rejected-${res.attempts || 1}`;
+        globallySpokenDecisions.add(decisionKey);
+        lastSpokenDecisionRef.current = decisionKey;
+
+        const msg = res.message || session.invalidMessage || 'That code is incorrect. Please try again.';
+        setAttemptFeedback({
+          type: 'invalid',
+          message: `Attempt ${res.attempts}/${res.maxAttempts || 3}: Invalid Code [${code}]`,
+        });
+        setCurrentPromptText(msg);
+        speakText(msg);
+
+        setTimeout(() => {
+          setEnteredDigits('');
+          setIsSubmittingCode(false);
+        }, 1000);
+      } else if (res?.codeStatus === 'valid') {
+        const msg = res.message || session.successMessage || 'Code verified successfully. Goodbye.';
+        setAttemptFeedback({
+          type: 'valid',
+          message: `Code Verified! Valid [${code}]`,
+        });
+        setCurrentPromptText(msg);
+        const decisionKey = `${session?.id}-approved`;
+        if (lastSpokenDecisionRef.current !== decisionKey && !globallySpokenDecisions.has(decisionKey)) {
+          lastSpokenDecisionRef.current = decisionKey;
+          globallySpokenDecisions.add(decisionKey);
+          speakText(msg);
+        }
     } else if (res?.codeStatus === 'max_exceeded') {
       const msg = res.message || 'Maximum attempts exceeded. Goodbye.';
       setAttemptFeedback({
@@ -467,7 +519,12 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
               {isRinging && (
                 <div className="flex items-center justify-around">
                   <button
-                    onClick={() => onSimulateEvent('decline')}
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      onSimulateEvent('decline');
+                    }}
                     className="flex flex-col items-center gap-1"
                   >
                     <div className="w-12 h-12 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg shadow-rose-600/30">
@@ -491,7 +548,12 @@ export const PhoneSimulatorModal: React.FC<PhoneSimulatorModalProps> = ({
               {isLive && (
                 <div className="flex justify-center">
                   <button
-                    onClick={() => onSimulateEvent('hangup')}
+                    onClick={() => {
+                      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                        window.speechSynthesis.cancel();
+                      }
+                      onSimulateEvent('hangup');
+                    }}
                     className="w-11 h-11 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-md"
                     title="End Call"
                   >

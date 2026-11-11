@@ -73,6 +73,7 @@ export default function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const prevSessionStatusRef = useRef<{ id: string; status: string } | null>(null);
   const soundEnabledRef = useRef(soundEnabled);
   soundEnabledRef.current = soundEnabled;
 
@@ -117,6 +118,9 @@ export default function App() {
       localStorage.setItem(STORAGE_KEY_SOUND, String(next));
       if (!next) {
         stopRingbackTone();
+        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+          window.speechSynthesis.cancel();
+        }
       }
       return next;
     });
@@ -156,12 +160,24 @@ export default function App() {
 
   // SSE Telemetry listener
   useEffect(() => {
-    if (!activeSession?.id) {
+    const isTerminal =
+      activeSession &&
+      ['completed', 'failed', 'busy', 'no-answer'].includes(activeSession.status);
+
+    if (!activeSession?.id || isTerminal) {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
       }
       stopRingbackTone();
+      if (activeSession?.id) {
+        prevSessionStatusRef.current = {
+          id: activeSession.id,
+          status: activeSession.status,
+        };
+      } else {
+        prevSessionStatusRef.current = null;
+      }
       return;
     }
 
@@ -171,19 +187,35 @@ export default function App() {
     es.addEventListener('session-update', (event) => {
       try {
         const updatedSession: CallSession = JSON.parse(event.data);
+        const prev = prevSessionStatusRef.current;
+        const statusChanged =
+          !prev || prev.id !== updatedSession.id || prev.status !== updatedSession.status;
+
+        prevSessionStatusRef.current = {
+          id: updatedSession.id,
+          status: updatedSession.status,
+        };
+
         setActiveSession(updatedSession);
 
         if (soundEnabledRef.current) {
-          if (updatedSession.status === 'ringing') {
+          if (updatedSession.status === 'ringing' && statusChanged) {
             startRingbackTone();
-          } else if (updatedSession.status === 'in-progress') {
+          } else if (
+            ['in-progress', 'collecting-input'].includes(updatedSession.status) &&
+            statusChanged &&
+            prev?.id === updatedSession.id &&
+            ['queued', 'initiating', 'ringing'].includes(prev.status)
+          ) {
             stopRingbackTone();
             playConnectedChime();
           } else if (
             ['completed', 'failed', 'busy', 'no-answer'].includes(updatedSession.status)
           ) {
             stopRingbackTone();
-            playHangupTone();
+            if (statusChanged && prev?.id === updatedSession.id) {
+              playHangupTone();
+            }
           }
         } else {
           stopRingbackTone();
@@ -204,7 +236,7 @@ export default function App() {
           const digit = String(callEvt.data.digits);
           setActiveDigit(digit);
           if (soundEnabledRef.current) {
-            playDtmfTone(digit);
+            playDtmfTone(digit.slice(-1));
           }
           setTimeout(() => setActiveDigit(null), 1500);
         }
@@ -245,6 +277,7 @@ export default function App() {
         carrier: params.carrier || carriersConfig.activeCarrier,
         carriersConfig,
         customTwilio: savedTwilioConfig,
+        clientOrigin: typeof window !== 'undefined' ? window.location.origin : undefined,
       };
 
       const res = await fetch('/api/call/initiate', {
@@ -292,12 +325,16 @@ export default function App() {
     if (!activeSession) return;
     try {
       stopRingbackTone();
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
       const res = await fetch('/api/call/hangup', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           callId: activeSession.id,
           customTwilio: savedTwilioConfig,
+          carriersConfig,
         }),
       });
       const data = await res.json();
@@ -346,6 +383,8 @@ export default function App() {
           callId: activeSession.id,
           action,
           customMessage,
+          customTwilio: savedTwilioConfig,
+          carriersConfig,
         }),
       });
       const data = await res.json();
@@ -510,11 +549,6 @@ export default function App() {
                       onEndCall={handleEndCall}
                       onOpenSimulator={handleOpenSimulator}
                       onOperatorAction={handleOperatorAction}
-                      onSimulateDtmf={(digit) => {
-                        if (activeSession?.isSimulated) {
-                          handleSimulateEvent('dtmf', { digits: digit });
-                        }
-                      }}
                     />
                   </div>
                 )}
@@ -553,11 +587,6 @@ export default function App() {
                       onEndCall={handleEndCall}
                       onOpenSimulator={handleOpenSimulator}
                       onOperatorAction={handleOperatorAction}
-                      onSimulateDtmf={(digit) => {
-                        if (activeSession?.isSimulated) {
-                          handleSimulateEvent('dtmf', { digits: digit });
-                        }
-                      }}
                     />
                   </div>
                 )}

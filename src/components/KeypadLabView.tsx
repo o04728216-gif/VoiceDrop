@@ -1,12 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
-  Grid3X3,
-  Volume2,
   Trash2,
   Play,
-  Activity,
-  Info,
-  Radio,
   FileCode,
 } from 'lucide-react';
 import { playDtmfTone } from '../utils/audioTones';
@@ -42,13 +37,43 @@ export const KeypadLabView: React.FC<KeypadLabViewProps> = ({ soundEnabled }) =>
   const [activeKey, setActiveKey] = useState<DtmfKeyData | null>(DTMF_KEYS[0]);
   const [isPlayingSeq, setIsPlayingSeq] = useState(false);
 
-  const handleKeyPress = (key: DtmfKeyData) => {
-    setActiveKey(key);
-    setDialedSequence((prev) => (prev.length < 20 ? prev + key.digit : prev));
-    if (soundEnabled) {
-      playDtmfTone(key.digit, 250);
-    }
-  };
+  const handleKeyPress = useCallback(
+    (key: DtmfKeyData) => {
+      setActiveKey(key);
+      setDialedSequence((prev) => (prev.length < 20 ? prev + key.digit : prev));
+      if (soundEnabled) {
+        playDtmfTone(key.digit, 250);
+      }
+    },
+    [soundEnabled]
+  );
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+      ) {
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === 'Backspace') {
+        setDialedSequence((prev) => prev.slice(0, -1));
+        return;
+      }
+
+      const matched = DTMF_KEYS.find((k) => k.digit === e.key);
+      if (matched) {
+        e.preventDefault();
+        handleKeyPress(matched);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleKeyPress]);
 
   const playSequence = async () => {
     if (!dialedSequence || isPlayingSeq) return;

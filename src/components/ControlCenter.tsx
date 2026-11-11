@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Phone,
   Play,
@@ -17,10 +17,11 @@ import {
   UserCheck,
   Cpu,
   PauseCircle,
+  X,
 } from 'lucide-react';
 import { VOICE_PROFILES } from '../utils/constants';
-import { formatUsPhoneDisplay, validateUsPhoneNumber } from '../utils/phoneFormat';
-import { TwilioConfig, TelephonyCarrier, CarriersConfig } from '../types/telephony';
+import { validateUsPhoneNumber } from '../utils/phoneFormat';
+import { TwilioConfig, TelephonyCarrier } from '../types/telephony';
 
 interface ControlCenterProps {
   onLaunchCall: (params: {
@@ -60,6 +61,7 @@ const STORAGE_KEYS = {
   verificationMode: `${STORAGE_PREFIX}verificationMode`,
   maxAttempts: `${STORAGE_PREFIX}maxAttempts`,
   isCustomEdited: `${STORAGE_PREFIX}isCustomEdited`,
+  recipientPhone: `${STORAGE_PREFIX}recipientPhone`,
 };
 
 const DEFAULT_TEMPLATES = {
@@ -95,7 +97,18 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   activeCarrier = 'twilio',
   onChangeActiveCarrier,
 }) => {
-  const [rawPhone, setRawPhone] = useState('+1 (555) 382-9104');
+  const [rawPhone, setRawPhone] = useState<string>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.recipientPhone);
+    if (saved !== null) {
+      // Discard any legacy corrupted value that started with repeated 1s
+      if (/^\+?1{2,}/.test(saved.replace(/\D/g, ''))) {
+        return '';
+      }
+      return saved;
+    }
+    return '';
+  });
+  const phoneInputRef = useRef<HTMLInputElement>(null);
   const [isEnhancing, setIsEnhancing] = useState(false);
   const [activeTab, setActiveTab] = useState<'main' | 'prompts'>('main');
 
@@ -240,10 +253,23 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   };
 
   const phoneValidation = validateUsPhoneNumber(rawPhone);
+  const isExpectedCodeValid =
+    verificationMode !== 'auto' || expectedCode.trim().length === numDigits;
 
   const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const formatted = formatUsPhoneDisplay(e.target.value);
-    setRawPhone(formatted);
+    // Pure zero-interference input: keep exact digits/symbols typed by user without
+    // ever auto-inserting '+1', parentheses, or hyphens during typing.
+    const next = e.target.value.replace(/[^0-9+\-() ]/g, '');
+    setRawPhone(next);
+    localStorage.setItem(STORAGE_KEYS.recipientPhone, next);
+  };
+
+  const handleClearPhone = () => {
+    setRawPhone('');
+    localStorage.setItem(STORAGE_KEYS.recipientPhone, '');
+    requestAnimationFrame(() => {
+      phoneInputRef.current?.focus();
+    });
   };
 
   const generateRandomCode = (len: number) => {
@@ -297,7 +323,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!phoneValidation.isValid) return;
+    if (!phoneValidation.isValid || !isExpectedCodeValid) return;
 
     onLaunchCall({
       to: phoneValidation.e164,
@@ -447,19 +473,37 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
           <>
             {/* 1. Recipient Phone Number */}
             <div>
-              <label className="text-xs font-semibold text-slate-300 block mb-1">
-                Recipient Phone Number (US) <span className="text-rose-400">*</span>
-              </label>
-              <div className="relative">
-                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-sm">
-                  🇺🇸
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-slate-300">
+                  Recipient Phone Number (US) <span className="text-rose-400">*</span>
+                </label>
+                {mode === 'simulator' && !rawPhone && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRawPhone('5553829104');
+                      localStorage.setItem(STORAGE_KEYS.recipientPhone, '5553829104');
+                    }}
+                    className="text-[11px] text-indigo-400 hover:text-indigo-300 font-medium cursor-pointer"
+                  >
+                    Fill Demo Number
+                  </button>
+                )}
+              </div>
+              <div className="relative flex items-center">
+                <div className="absolute inset-y-0 left-0 pl-3 pr-2.5 flex items-center gap-1.5 pointer-events-none border-r border-slate-800/90 select-none">
+                  <span className="text-sm leading-none">🇺🇸</span>
+                  <span className="text-[11px] font-mono font-semibold text-slate-400">US</span>
                 </div>
                 <input
-                  type="text"
+                  ref={phoneInputRef}
+                  type="tel"
+                  inputMode="tel"
+                  autoComplete="off"
                   value={rawPhone}
                   onChange={handlePhoneChange}
-                  placeholder="+1 (555) 000-0000"
-                  className={`w-full pl-9 pr-24 py-2 bg-slate-950 border rounded-lg text-sm font-mono text-white placeholder-slate-600 focus:outline-none transition-all ${
+                  placeholder="Enter 10-digit number (e.g. 2125550199)"
+                  className={`w-full pl-[4.1rem] pr-28 py-2 bg-slate-950 border rounded-lg text-sm font-mono text-white placeholder-slate-600 focus:outline-none transition-all ${
                     phoneValidation.isValid
                       ? 'border-emerald-500/50 focus:border-emerald-400'
                       : rawPhone.length > 0
@@ -467,25 +511,41 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                       : 'border-slate-800 focus:border-indigo-500'
                   }`}
                 />
-                <div className="absolute inset-y-0 right-0 pr-3 flex items-center pointer-events-none text-xs">
-                  {phoneValidation.isValid ? (
-                    <span className="flex items-center gap-1 text-emerald-400 font-semibold font-mono text-[11px]">
-                      <CheckCircle className="w-3.5 h-3.5" />
-                      <span>Valid</span>
-                    </span>
-                  ) : rawPhone.length > 0 ? (
-                    <span className="text-rose-400 text-[11px] font-medium flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5" />
-                      <span>10 Digits</span>
-                    </span>
-                  ) : (
-                    <Phone className="w-3.5 h-3.5 text-slate-600" />
+                <div className="absolute inset-y-0 right-0 pr-2.5 flex items-center gap-1.5 text-xs">
+                  {rawPhone.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleClearPhone}
+                      className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-slate-800 transition-colors cursor-pointer"
+                      title="Clear phone number"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
                   )}
+                  <div className="pointer-events-none flex items-center">
+                    {phoneValidation.isValid ? (
+                      <span className="flex items-center gap-1 text-emerald-400 font-semibold font-mono text-[11px]">
+                        <CheckCircle className="w-3.5 h-3.5" />
+                        <span>Valid</span>
+                      </span>
+                    ) : rawPhone.length > 0 ? (
+                      <span className="text-rose-400 text-[11px] font-medium flex items-center gap-1">
+                        <AlertCircle className="w-3.5 h-3.5" />
+                        <span>Check #</span>
+                      </span>
+                    ) : (
+                      <Phone className="w-3.5 h-3.5 text-slate-600" />
+                    )}
+                  </div>
                 </div>
               </div>
-              {!phoneValidation.isValid && rawPhone.length > 0 && (
+              {phoneValidation.isValid ? (
+                <p className="text-[11px] text-emerald-400/90 font-mono mt-1">
+                  Target E.164: {phoneValidation.e164} • +1 {phoneValidation.formattedNational}
+                </p>
+              ) : rawPhone.length > 0 ? (
                 <p className="text-[11px] text-rose-400 mt-1">{phoneValidation.error}</p>
-              )}
+              ) : null}
             </div>
 
             {/* 2. Expected Digit Length Selection */}
@@ -569,6 +629,11 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                     {expectedCode.length}/{numDigits} digits
                   </span>
                 </div>
+                {!isExpectedCodeValid && (
+                  <p className="text-[11px] text-amber-400">
+                    Preset code must be {numDigits} digits to match the expected length.
+                  </p>
+                )}
               </div>
             )}
 
@@ -746,9 +811,9 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
         <div className="pt-2">
           <button
             type="submit"
-            disabled={!phoneValidation.isValid || isLoading || activeCall}
+            disabled={!phoneValidation.isValid || !isExpectedCodeValid || isLoading || activeCall}
             className={`w-full py-3 px-4 rounded-lg font-bold text-xs tracking-wider uppercase flex items-center justify-center gap-2 shadow-md transition-all select-none ${
-              !phoneValidation.isValid || activeCall
+              !phoneValidation.isValid || !isExpectedCodeValid || activeCall
                 ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
                 : 'bg-indigo-600 hover:bg-indigo-500 text-white cursor-pointer active:scale-[0.99]'
             }`}

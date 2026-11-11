@@ -31,6 +31,9 @@ interface PhoneSimulatorViewProps {
 
 // Global memory across unmounts / tab switches so switching tabs never replays speech
 const globallySpokenDecisions = new Set<string>();
+const globallySpokenCues = new Set<string>();
+
+const TERMINAL_STATUSES = ['completed', 'failed', 'busy', 'no-answer'];
 
 export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   session,
@@ -53,16 +56,16 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   const targetLength = session?.numDigits || 6;
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
-  const initialMountStatusRef = useRef<string | null>(session?.status || null);
+  const soundEnabledRef = useRef(soundEnabled);
+  soundEnabledRef.current = soundEnabled;
 
-  // If component mounts and session is ALREADY completed, mark decision as already spoken
+  // Cancel any active speech immediately if user mutes audio
   useEffect(() => {
-    if (session?.id && (session.status === 'completed' || session.operatorDecision === 'approved')) {
-      const decisionKey = `${session.id}-approved`;
-      globallySpokenDecisions.add(decisionKey);
-      lastSpokenDecisionRef.current = decisionKey;
+    if (!soundEnabled && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      setIsSpeaking(false);
     }
-  }, []);
+  }, [soundEnabled]);
 
   // Cancel any speech when leaving the view / unmounting
   useEffect(() => {
@@ -73,19 +76,31 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     };
   }, []);
 
-  // Reset state on new call session
+  // Reset state on new call session & guard already-finished sessions from replaying audio
   useEffect(() => {
     setEnteredDigits('');
     setIsSubmittingCode(false);
     setAttemptFeedback(null);
     setCurrentPromptText(session?.introGreeting || '');
-    // If it's a completely new call, reset the decision ref unless already in global set
+    lastSpeakCallTimeRef.current = null;
+
     if (session?.id) {
-      if (session.status !== 'completed' && session.operatorDecision !== 'approved') {
+      const isTerminal = TERMINAL_STATUSES.includes(session.status);
+      if (isTerminal || session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
+        const decisionKey = `${session.id}-approved`;
+        globallySpokenDecisions.add(decisionKey);
+        lastSpokenDecisionRef.current = decisionKey;
+      } else {
         lastSpokenDecisionRef.current = null;
       }
+
+      if (isTerminal && session.attempts) {
+        globallySpokenDecisions.add(`${session.id}-rejected-${session.attempts}`);
+      }
+      if (isTerminal && session.activeCue?.timestamp) {
+        globallySpokenCues.add(`${session.id}-cue-${session.activeCue.timestamp}`);
+      }
     }
-    lastSpeakCallTimeRef.current = null;
   }, [session?.id]);
 
   useEffect(() => {
@@ -105,9 +120,17 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     return () => clearInterval(interval);
   }, [session?.status]);
 
-  // Voice speech synthesis helper with deduplication guard
+  // Voice speech synthesis helper with deduplication & mute guard
   const speakText = (text: string, onEnd?: () => void) => {
-    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      if (onEnd) onEnd();
+      return;
+    }
+
+    if (!soundEnabledRef.current) {
+      if (onEnd) onEnd();
+      return;
+    }
 
     const now = Date.now();
     if (
@@ -115,7 +138,6 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       lastSpeakCallTimeRef.current.text === text &&
       now - lastSpeakCallTimeRef.current.time < 2000
     ) {
-      // Prevent repeating the same message twice in quick succession
       return;
     }
     lastSpeakCallTimeRef.current = { text, time: now };
@@ -136,13 +158,18 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     window.speechSynthesis.speak(utterance);
   };
 
-  // React to live operator audio cues triggered from the dashboard
+  // React to live operator audio cues triggered from the dashboard (strictly once per cue)
   useEffect(() => {
-    if (session?.activeCue?.text) {
-      setCurrentPromptText(session.activeCue.text);
-      speakText(session.activeCue.text);
-    }
-  }, [session?.activeCue?.timestamp]);
+    if (!session?.id || !session?.activeCue?.text || !session?.activeCue?.timestamp) return;
+    if (TERMINAL_STATUSES.includes(session.status)) return;
+
+    const cueKey = `${session.id}-cue-${session.activeCue.timestamp}`;
+    if (globallySpokenCues.has(cueKey)) return;
+    globallySpokenCues.add(cueKey);
+
+    setCurrentPromptText(session.activeCue.text);
+    speakText(session.activeCue.text);
+  }, [session?.id, session?.activeCue?.timestamp, session?.status]);
 
   // React to operator decisions (Approve / Reject) in real time - strictly once per event
   useEffect(() => {
@@ -150,7 +177,6 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
 
     if (session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
       const decisionKey = `${session.id}-approved`;
-      // Check both local ref and global set to prevent replay on tab switch or remount
       if (lastSpokenDecisionRef.current === decisionKey || globallySpokenDecisions.has(decisionKey)) {
         return;
       }
@@ -178,13 +204,15 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
         message: `Attempt ${session.attempts || 1}: Invalid Code [${session.lastInvalidDigits || ''}]`,
       });
       setCurrentPromptText(msg);
-      speakText(msg);
+      if (!TERMINAL_STATUSES.includes(session.status)) {
+        speakText(msg);
+      }
       setTimeout(() => {
         setEnteredDigits('');
         setIsSubmittingCode(false);
       }, 1000);
     }
-  }, [session?.id, session?.operatorDecision, session?.codeStatus, session?.attempts]);
+  }, [session?.id, session?.operatorDecision, session?.codeStatus, session?.attempts, session?.status]);
 
   // Speak greeting and prompt when answered
   const handleAnswerCall = async () => {
@@ -225,6 +253,10 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       return;
     }
 
+    if (attemptFeedback?.type === 'invalid') {
+      setAttemptFeedback(null);
+    }
+
     const next = enteredDigits + key;
     setEnteredDigits(next);
 
@@ -249,6 +281,9 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       speakText(holdMsg);
     } else if (res?.codeStatus === 'invalid') {
       const msg = res.message || session?.invalidMessage || 'That code is incorrect. Please try again.';
+      const rejKey = `${session?.id}-rejected-${res.attempts}`;
+      lastSpokenDecisionRef.current = rejKey;
+      globallySpokenDecisions.add(rejKey);
       setAttemptFeedback({
         type: 'invalid',
         message: `Attempt ${res.attempts}/${res.maxAttempts || 3}: Invalid Code [${code}]`,
@@ -268,8 +303,9 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       });
       setCurrentPromptText(msg);
       const decisionKey = `${session?.id}-approved`;
-      if (lastSpokenDecisionRef.current !== decisionKey) {
+      if (lastSpokenDecisionRef.current !== decisionKey && !globallySpokenDecisions.has(decisionKey)) {
         lastSpokenDecisionRef.current = decisionKey;
+        globallySpokenDecisions.add(decisionKey);
         speakText(msg);
       }
     } else if (res?.codeStatus === 'max_exceeded') {
@@ -540,8 +576,13 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                   {isRinging && (
                     <div className="flex items-center justify-around">
                       <button
-                        onClick={() => onSimulateEvent('decline')}
-                        className="flex flex-col items-center gap-1"
+                        onClick={() => {
+                          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                            window.speechSynthesis.cancel();
+                          }
+                          onSimulateEvent('decline');
+                        }}
+                        className="flex flex-col items-center gap-1 cursor-pointer"
                       >
                         <div className="w-10 h-10 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg shadow-rose-600/30">
                           <PhoneOff className="w-4 h-4" />
@@ -551,7 +592,7 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
 
                       <button
                         onClick={handleAnswerCall}
-                        className="flex flex-col items-center gap-1"
+                        className="flex flex-col items-center gap-1 cursor-pointer"
                       >
                         <div className="w-10 h-10 rounded-full bg-emerald-500 hover:bg-emerald-400 text-white flex items-center justify-center shadow-lg shadow-emerald-500/40 animate-bounce">
                           <Phone className="w-4 h-4" />
@@ -564,8 +605,13 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                   {isLive && (
                     <div className="flex justify-center">
                       <button
-                        onClick={() => onSimulateEvent('hangup')}
-                        className="w-9 h-9 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-md"
+                        onClick={() => {
+                          if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                            window.speechSynthesis.cancel();
+                          }
+                          onSimulateEvent('hangup');
+                        }}
+                        className="w-9 h-9 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-md cursor-pointer"
                         title="End Call"
                       >
                         <PhoneOff className="w-4 h-4" />

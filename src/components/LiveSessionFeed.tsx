@@ -16,12 +16,12 @@ import {
   RotateCcw,
   PauseCircle,
   Send,
-  MessageSquare,
-  Sparkles,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { CallSession, CallStatus } from '../types/telephony';
 import { KeypadVisualizer } from './KeypadVisualizer';
+
+const celebratedSessions = new Set<string>();
 
 interface LiveSessionFeedProps {
   session: CallSession | null;
@@ -51,9 +51,21 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const [isSendingCue, setIsSendingCue] = useState(false);
   const eventsEndRef = useRef<HTMLDivElement>(null);
 
-  // Trigger celebration confetti when multi-digit code is verified valid
+  // Pre-register already-completed sessions on mount/load so historical records don't fire confetti
   useEffect(() => {
-    if (session?.codeStatus === 'valid' || session?.capturedDigits) {
+    if (
+      session?.id &&
+      (session.status === 'completed' || session.codeStatus === 'valid')
+    ) {
+      celebratedSessions.add(session.id);
+    }
+  }, [session?.id]);
+
+  // Trigger celebration confetti once when multi-digit code transitions to valid
+  useEffect(() => {
+    if (!session?.id) return;
+    if (session.codeStatus === 'valid' && !celebratedSessions.has(session.id)) {
+      celebratedSessions.add(session.id);
       try {
         confetti({
           particleCount: 45,
@@ -65,7 +77,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
         // Fallback
       }
     }
-  }, [session?.codeStatus, session?.capturedDigits]);
+  }, [session?.id, session?.codeStatus]);
 
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -134,10 +146,15 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
           </span>
         );
       case 'completed':
-        return (
+        return session?.codeStatus === 'valid' ? (
           <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-bold">
             <CheckCircle2 className="w-3.5 h-3.5" />
             Verified &amp; Completed
+          </span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-slate-800 text-slate-300 border border-slate-700">
+            <PhoneOff className="w-3.5 h-3.5 text-slate-400" />
+            Call Ended
           </span>
         );
       case 'failed':
@@ -176,9 +193,31 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const captured = session?.capturedDigits || '';
   const displayDigits = pendingCode || captured || session?.lastInvalidDigits || '';
 
-  const isAwaitingOperator = session?.status === 'awaiting-operator' || Boolean(pendingCode);
+  const isAwaitingOperator = session?.status === 'awaiting-operator';
   const isValidState = session?.codeStatus === 'valid';
   const isInvalidState = session?.codeStatus === 'invalid' && Boolean(session?.attempts);
+
+  const carrierXmlLabel =
+    session?.carrier === 'plivo'
+      ? 'Plivo XML'
+      : session?.carrier === 'telnyx'
+      ? 'TeXML'
+      : session?.carrier === 'signalwire'
+      ? 'LAML'
+      : session?.carrier === 'fonoster'
+      ? 'Voice XML'
+      : 'TwiML';
+
+  const carrierGatherPath =
+    session?.carrier === 'plivo'
+      ? '/api/plivo/gather'
+      : session?.carrier === 'telnyx'
+      ? '/api/telnyx/gather'
+      : session?.carrier === 'signalwire'
+      ? '/api/signalwire/gather'
+      : session?.carrier === 'fonoster'
+      ? '/api/fonoster/gather'
+      : '/api/twiml/gather';
 
   return (
     <div className="flex flex-col h-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
@@ -201,7 +240,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             </div>
             <p className="text-xs text-slate-400">
               {session
-                ? `Target: ${session.to} &bull; Mode: ${
+                ? `Target: ${session.to} • Mode: ${
                     session.verificationMode === 'manual'
                       ? 'Manual Operator Authority (You Control)'
                       : 'Auto Match'
@@ -527,7 +566,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                   className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 transition-colors"
                 >
                   <FileCode className="w-3 h-3 text-indigo-400" />
-                  <span>TwiML</span>
+                  <span>{carrierXmlLabel}</span>
                 </button>
               </div>
             </div>
@@ -574,27 +613,43 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
         </div>
       )}
 
-      {/* TwiML XML Modal */}
+      {/* Carrier Voice XML Modal */}
       {showTwimlModal && session && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
           <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-4 shadow-xl">
             <div className="flex items-center justify-between mb-2 pb-2 border-b border-slate-800">
-              <h3 className="text-xs font-bold text-white uppercase">Generated TwiML XML</h3>
+              <h3 className="text-xs font-bold text-white uppercase">
+                Generated {carrierXmlLabel} ({(session.carrier || 'twilio').toUpperCase()})
+              </h3>
               <button
                 onClick={() => setShowTwimlModal(false)}
-                className="text-xs px-2 py-1 bg-slate-800 text-slate-300 rounded"
+                className="text-xs px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded"
               >
                 Close
               </button>
             </div>
             <pre className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] font-mono text-cyan-300 overflow-x-auto leading-relaxed">
-{`<?xml version="1.0" encoding="UTF-8"?>
+              {session.carrier === 'plivo'
+                ? `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <!-- 1. Immediate message played right when phone answers -->
+  <Speak>${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
+
+  <!-- 2. Code collection prompt -->
+  <GetDigits action="${carrierGatherPath}?callId=${session.id}" method="POST" numDigits="${session.numDigits}" timeout="15" finishOnKey="#">
+    <Speak>${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
+  </GetDigits>
+
+  <Speak>We did not receive your code. Goodbye.</Speak>
+  <Hangup/>
+</Response>`
+                : `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <!-- 1. Immediate message played right when phone answers -->
   <Say voice="${session.voice}">${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
 
   <!-- 2. Code collection prompt -->
-  <Gather input="dtmf" numDigits="${session.numDigits}" action="/api/twiml/gather?callId=${session.id}" method="POST" timeout="15" finishOnKey="#">
+  <Gather input="dtmf" numDigits="${session.numDigits}" action="${carrierGatherPath}?callId=${session.id}" method="POST" timeout="15" finishOnKey="#">
     <Say voice="${session.voice}">${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
   </Gather>
 

@@ -49,6 +49,7 @@ export interface CallSession {
   duration?: number;
   isSimulated: boolean;
   carrier?: TelephonyCarrier;
+  providerCallSid?: string;
   createdAt: string;
   completedAt?: string;
   events: CallEvent[];

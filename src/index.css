@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+@theme {
+  --color-slate-750: #293548;
+  --color-slate-850: #172033;
+}
+
 @layer base {
   body {
     background-color: #090d16;
