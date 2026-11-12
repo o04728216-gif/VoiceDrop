@@ -244,7 +244,11 @@ export const CallHistoryView: React.FC<CallHistoryViewProps> = ({
                           ) : call.answeredBy === 'human' ? (
                             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/25">
                               <UserCheck className="w-3 h-3 text-emerald-400" />
-                              <span>Human Answered</span>
+                              <span>
+                                {call.humanPickedUpAfterVoicemail
+                                  ? 'Human Answered (After VM)'
+                                  : 'Human Answered'}
+                              </span>
                             </span>
                           ) : (
                             <span className="text-[10px] text-slate-500 font-mono">
@@ -368,7 +372,9 @@ export const CallHistoryView: React.FC<CallHistoryViewProps> = ({
                 {inspectSession.answeredBy === 'human' && (
                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
                     <UserCheck className="w-3 h-3" />
-                    <span>Human</span>
+                    <span>
+                      {inspectSession.humanPickedUpAfterVoicemail ? 'Human (After VM)' : 'Human'}
+                    </span>
                   </span>
                 )}
               </div>

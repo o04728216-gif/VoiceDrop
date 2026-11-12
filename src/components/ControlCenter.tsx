@@ -716,7 +716,9 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                       Auto-End on Voicemail
                     </span>
                     <span className="text-[10px] text-slate-400">
-                      {autoHangupOnVoicemail ? 'Hangs up if machine' : 'Alert only (stay on line)'}
+                      {autoHangupOnVoicemail
+                        ? 'Hangs up if machine'
+                        : 'Silent on VM (plays if human picks up)'}
                     </span>
                   </div>
                   <input

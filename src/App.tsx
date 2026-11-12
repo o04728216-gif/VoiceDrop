@@ -431,7 +431,13 @@ export default function App() {
   };
 
   const handleOperatorAction = async (
-    action: 'approve' | 'reject' | 'hold' | 'incorrect_prompt' | 'custom_cue',
+    action:
+      | 'approve'
+      | 'reject'
+      | 'hold'
+      | 'incorrect_prompt'
+      | 'custom_cue'
+      | 'start_human_greeting',
     customMessage?: string
   ) => {
     if (!activeSession) return null;

@@ -20,6 +20,7 @@ import {
   MicOff,
   Voicemail,
   Send,
+  UserCheck,
 } from 'lucide-react';
 import { CallSession } from '../types/telephony';
 import { playDtmfTone } from '../utils/audioTones';
@@ -35,6 +36,7 @@ interface PhoneSimulatorViewProps {
 }
 
 // Global memory across unmounts / tab switches so switching tabs never replays speech
+const globallySpokenGreetings = new Set<string>();
 const globallySpokenDecisions = new Set<string>();
 const globallySpokenCues = new Set<string>();
 
@@ -410,11 +412,14 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     setEnteredDigits('');
     setIsSubmittingCode(false);
     setAttemptFeedback(null);
-    setCurrentPromptText(session?.introGreeting || '');
+    setCurrentPromptText('');
     lastSpeakCallTimeRef.current = null;
 
     if (session?.id) {
       const isTerminal = TERMINAL_STATUSES.includes(session.status);
+      if (isTerminal) {
+        globallySpokenGreetings.add(session.id);
+      }
       if (isTerminal || session.operatorDecision === 'approved' || session.codeStatus === 'valid') {
         const decisionKey = `${session.id}-approved`;
         globallySpokenDecisions.add(decisionKey);
@@ -549,39 +554,66 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     }
   }, [session?.id, session?.operatorDecision, session?.codeStatus, session?.attempts, session?.status]);
 
-  // Speak greeting and prompt when answered by human
+  // Automatically play immediate pickup greeting -> code prompt strictly ONCE when a Live Human is confirmed
+  // (Handles direct human pickup AND human picking up the phone after a voicemail machine answered!)
+  useEffect(() => {
+    if (!session?.id) return;
+    if (TERMINAL_STATUSES.includes(session.status)) return;
+    if (
+      session.promptsStarted &&
+      session.answeredBy === 'human' &&
+      !globallySpokenGreetings.has(session.id)
+    ) {
+      globallySpokenGreetings.add(session.id);
+      setCurrentPromptText(session.introGreeting);
+      speakText(session.introGreeting, () => {
+        setCurrentPromptText(session.script);
+        speakText(session.script);
+      });
+    }
+  }, [session?.id, session?.promptsStarted, session?.answeredBy, session?.status]);
+
+  // Direct Live Human answers the call: listen, record, and play greeting + script immediately
   const handleAnswerCall = async () => {
     if (session?.id && session.recordCall !== false) {
       await startSimulatorCallRecording(session.id, false);
     }
+    if (session?.id) {
+      globallySpokenGreetings.add(session.id);
+    }
     await onSimulateEvent('answer');
 
     if (session) {
-      // Step 1: Speak immediate greeting upon pickup
       setCurrentPromptText(session.introGreeting);
       speakText(session.introGreeting, () => {
-        // Step 2: Speak code collection prompt
         setCurrentPromptText(session.script);
         speakText(session.script);
       });
     }
   };
 
-  // Simulate automated voicemail service answering the call
+  // Voicemail Machine answers the call: listen & record from 0:00, NEVER play bot greetings to voicemail
   const handleVoicemailAnswer = async () => {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+
     if (session?.id && session.recordCall !== false) {
       await startSimulatorCallRecording(session.id, false);
     }
     const res = await onSimulateEvent('voicemail');
-    const vmGreeting = `Your call has been forwarded to an automated voice messaging system for ${
-      session?.to || 'the subscriber'
-    }. At the tone, please record your message.`;
-    setCurrentPromptText(vmGreeting);
+    setCurrentPromptText(
+      '[Voicemail Machine Answered] Bot prompts muted — silently listening & recording for live human pickup...'
+    );
     if (res?.session?.status === 'no-answer') {
       await stopAndUploadMicRecording(session?.id);
-    } else {
-      speakText(vmGreeting);
     }
+  };
+
+  // Live Human picks up the handset AFTER Voicemail Machine initially answered
+  const handleHumanPickupAfterVoicemail = async () => {
+    await onSimulateEvent('human_pickup');
   };
 
   const formatTimer = (seconds: number) => {
@@ -597,6 +629,11 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       playDtmfTone(key, 200);
     }
     recordDtmfIntoMix(key);
+
+    // If Voicemail answered first and a live human picks up and presses a key, immediately wake greeting
+    if (session?.answeredBy === 'voicemail' && !session?.promptsStarted) {
+      void onSimulateEvent('human_pickup');
+    }
 
     if (key === '#') {
       if (enteredDigits.length >= targetLength) {
@@ -805,19 +842,45 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                   </div>
                 </div>
 
-                {/* Prompt playback banner (displays pickup greeting, code prompt, hold message, or operator cue) */}
+                {/* Prompt playback / Silent Voicemail Screening banner */}
                 {isLive && (
-                  <div className="my-1.5 p-2 rounded-xl bg-slate-900 border border-slate-800 text-left">
+                  <div
+                    className={`my-1.5 p-2 rounded-xl border text-left ${
+                      session.answeredBy === 'voicemail'
+                        ? 'bg-orange-950/35 border-orange-500/40'
+                        : 'bg-slate-900 border-slate-800'
+                    }`}
+                  >
                     <div className="flex items-center justify-between text-[9px] text-slate-400 mb-0.5">
-                      <span className="flex items-center gap-1 text-indigo-300 font-medium">
-                        <Volume2 className="w-2.5 h-2.5 text-cyan-400 animate-bounce" />
-                        <span>{isSpeaking ? 'Playing Voice...' : 'Line Connected'}</span>
-                      </span>
+                      {session.answeredBy === 'voicemail' ? (
+                        <span className="flex items-center gap-1 text-orange-300 font-semibold">
+                          <Voicemail className="w-2.5 h-2.5 text-orange-400" />
+                          <span>Voicemail Screening • Bot Audio Muted</span>
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1 text-indigo-300 font-medium">
+                          <Volume2 className="w-2.5 h-2.5 text-cyan-400 animate-bounce" />
+                          <span>{isSpeaking ? 'Playing Voice...' : 'Human Line Active'}</span>
+                        </span>
+                      )}
                       <span className="font-mono text-slate-500">{session.voice}</span>
                     </div>
                     <p className="text-[11px] text-slate-200 line-clamp-2 leading-tight font-medium">
-                      "{currentPromptText || session.introGreeting}"
+                      {session.answeredBy === 'voicemail'
+                        ? 'Silent listen & recording active. Say "Hello?" below or tap Human Picks Up to start greeting.'
+                        : `"${currentPromptText || session.introGreeting}"`}
                     </p>
+
+                    {session.answeredBy === 'voicemail' && (
+                      <button
+                        type="button"
+                        onClick={handleHumanPickupAfterVoicemail}
+                        className="mt-1.5 w-full py-1 px-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-[10px] font-bold flex items-center justify-center gap-1 transition-all cursor-pointer shadow-sm"
+                      >
+                        <UserCheck className="w-3 h-3" />
+                        <span>Human Picks Up Phone (Start Greeting)</span>
+                      </button>
+                    )}
                   </div>
                 )}
 

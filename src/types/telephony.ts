@@ -35,6 +35,9 @@ export interface CallSession {
   answeredBy?: 'human' | 'voicemail' | 'fax' | 'unknown';
   amdRawResult?: string;
   autoHangupOnVoicemail?: boolean;
+  promptsStarted?: boolean;
+  humanPickedUpAfterVoicemail?: boolean;
+  answeredAt?: string;
   recordCall?: boolean;
   recordingUrl?: string;
   recordingDuration?: number;
