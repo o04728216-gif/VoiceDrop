@@ -103,13 +103,24 @@ export default function App() {
     try {
       const res = await fetch('/api/calls');
       if (res.ok) {
-        const data = await res.json();
+        const data: CallSession[] = await res.json();
         setCallsHistory(data);
+        setActiveSession((prev) => {
+          if (!prev) return prev;
+          const fresher = data.find((c) => c.id === prev.id);
+          return fresher ? fresher : prev;
+        });
       }
     } catch (err) {
       console.error('Error fetching call history:', err);
     }
   };
+
+  useEffect(() => {
+    if (currentTab === 'history') {
+      void loadCallHistory();
+    }
+  }, [currentTab]);
 
   const handleToggleSound = () => {
     setSoundEnabled((prev) => {
@@ -157,26 +168,39 @@ export default function App() {
     });
   };
 
-  // SSE Telemetry listener
-  useEffect(() => {
-    const isTerminal =
-      activeSession &&
-      ['completed', 'failed', 'busy', 'no-answer'].includes(activeSession.status);
+  const handleRecordingSaved = (updatedSession?: CallSession) => {
+    if (updatedSession) {
+      setActiveSession((prev) =>
+        prev && prev.id === updatedSession.id ? updatedSession : prev
+      );
+    }
+    void loadCallHistory();
+  };
 
-    if (!activeSession?.id || isTerminal) {
+  // SSE Telemetry listener (continuous per callId, stays open until recording finalizes)
+  useEffect(() => {
+    if (!activeSession?.id) {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
       }
       stopRingbackTone();
-      if (activeSession?.id) {
-        prevSessionStatusRef.current = {
-          id: activeSession.id,
-          status: activeSession.status,
-        };
-      } else {
-        prevSessionStatusRef.current = null;
-      }
+      prevSessionStatusRef.current = null;
+      return;
+    }
+
+    const initiallyTerminal = ['completed', 'failed', 'busy', 'no-answer'].includes(
+      activeSession.status
+    );
+    const initiallyFinalizing =
+      activeSession.recordingStatus === 'recording' && !activeSession.recordingUrl;
+
+    if (initiallyTerminal && !initiallyFinalizing) {
+      stopRingbackTone();
+      prevSessionStatusRef.current = {
+        id: activeSession.id,
+        status: activeSession.status,
+      };
       return;
     }
 
@@ -196,6 +220,15 @@ export default function App() {
         };
 
         setActiveSession(updatedSession);
+        setCallsHistory((prevList) => {
+          const exists = prevList.some((c) => c.id === updatedSession.id);
+          if (!exists) return [updatedSession, ...prevList];
+          return prevList.map((c) => (c.id === updatedSession.id ? updatedSession : c));
+        });
+
+        const updatedTerminal = ['completed', 'failed', 'busy', 'no-answer'].includes(
+          updatedSession.status
+        );
 
         if (soundEnabledRef.current) {
           if (updatedSession.status === 'ringing' && statusChanged) {
@@ -208,9 +241,7 @@ export default function App() {
           ) {
             stopRingbackTone();
             playConnectedChime();
-          } else if (
-            ['completed', 'failed', 'busy', 'no-answer'].includes(updatedSession.status)
-          ) {
+          } else if (updatedTerminal) {
             stopRingbackTone();
             if (statusChanged && prev?.id === updatedSession.id) {
               playHangupTone();
@@ -220,8 +251,19 @@ export default function App() {
           stopRingbackTone();
         }
 
-        if (['completed', 'failed', 'busy', 'no-answer'].includes(updatedSession.status)) {
-          loadCallHistory();
+        if (updatedTerminal || updatedSession.recordingStatus === 'completed') {
+          void loadCallHistory();
+        }
+
+        // Close SSE only once call has ended AND recording is no longer finalizing
+        if (
+          updatedTerminal &&
+          (Boolean(updatedSession.recordingUrl) || updatedSession.recordingStatus !== 'recording')
+        ) {
+          es.close();
+          if (eventSourceRef.current === es) {
+            eventSourceRef.current = null;
+          }
         }
       } catch (err) {
         console.error('SSE session parse error:', err);
@@ -244,9 +286,28 @@ export default function App() {
 
     return () => {
       es.close();
+      if (eventSourceRef.current === es) {
+        eventSourceRef.current = null;
+      }
       stopRingbackTone();
     };
   }, [activeSession?.id]);
+
+  // Rapid post-call polling fallback so recordingUrl appears immediately after call completion
+  useEffect(() => {
+    const isTerminal =
+      activeSession &&
+      ['completed', 'failed', 'busy', 'no-answer'].includes(activeSession.status);
+
+    if (!isTerminal || !activeSession?.id || activeSession.recordingUrl) {
+      return;
+    }
+
+    const timers = [450, 1200, 2400, 4200, 7000, 10500].map((ms) =>
+      setTimeout(() => void loadCallHistory(), ms)
+    );
+    return () => timers.forEach((t) => clearTimeout(t));
+  }, [activeSession?.id, activeSession?.status, Boolean(activeSession?.recordingUrl)]);
 
   const handleLaunchCall = async (params: {
     to: string;
@@ -263,6 +324,8 @@ export default function App() {
     numDigits: number;
     keypadActions: Record<string, string>;
     carrier?: TelephonyCarrier;
+    autoHangupOnVoicemail?: boolean;
+    recordCall?: boolean;
   }) => {
     try {
       setIsLoading(true);
@@ -591,6 +654,7 @@ export default function App() {
                   <PhoneSimulatorView
                     session={activeSession}
                     onSimulateEvent={handleSimulateEvent}
+                    onRecordingSaved={handleRecordingSaved}
                     soundEnabled={soundEnabled}
                     isDocked={true}
                     onToggleDock={() => {
@@ -610,6 +674,7 @@ export default function App() {
           {currentTab === 'history' && (
             <CallHistoryView
               calls={callsHistory}
+              onRefresh={loadCallHistory}
               onSelectCall={(call) => {
                 setActiveSession(call);
                 setCurrentTab('dispatcher');
@@ -635,6 +700,7 @@ export default function App() {
         <PhoneSimulatorView
           session={activeSession}
           onSimulateEvent={handleSimulateEvent}
+          onRecordingSaved={handleRecordingSaved}
           soundEnabled={soundEnabled}
           isDocked={false}
           onClose={() => setIsPhoneModalOpen(false)}

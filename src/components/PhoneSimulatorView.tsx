@@ -16,6 +16,10 @@ import {
   Clock,
   Wifi,
   Battery,
+  Mic,
+  MicOff,
+  Voicemail,
+  Send,
 } from 'lucide-react';
 import { CallSession } from '../types/telephony';
 import { playDtmfTone } from '../utils/audioTones';
@@ -23,6 +27,7 @@ import { playDtmfTone } from '../utils/audioTones';
 interface PhoneSimulatorViewProps {
   session: CallSession | null;
   onSimulateEvent: (action: string, payload?: any) => Promise<any>;
+  onRecordingSaved?: (updatedSession?: CallSession) => void;
   soundEnabled: boolean;
   isDocked?: boolean;
   onClose?: () => void;
@@ -38,6 +43,7 @@ const TERMINAL_STATUSES = ['completed', 'failed', 'busy', 'no-answer'];
 export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   session,
   onSimulateEvent,
+  onRecordingSaved,
   soundEnabled,
   isDocked = true,
   onClose,
@@ -52,12 +58,335 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     type: 'valid' | 'invalid' | 'waiting' | 'max';
     message: string;
   } | null>(null);
+  const [isMicRecording, setIsMicRecording] = useState(false);
+  const [simulatedSpeechInput, setSimulatedSpeechInput] = useState('');
 
   const targetLength = session?.numDigits || 6;
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
   const soundEnabledRef = useRef(soundEnabled);
   soundEnabledRef.current = soundEnabled;
+
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const mixCtxRef = useRef<AudioContext | null>(null);
+  const mixDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const activeRecordingCallIdRef = useRef<string | null>(null);
+  const uploadingLockRef = useRef<Promise<void> | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordStartTimeRef = useRef<number>(0);
+  const speechRecRef = useRef<any>(null);
+
+  const playToneIntoRecordingMix = (freqA: number, freqB?: number, durationMs = 160) => {
+    const ctx = mixCtxRef.current;
+    const dest = mixDestRef.current;
+    if (!ctx || !dest || ctx.state === 'closed') return;
+    try {
+      if (ctx.state === 'suspended') {
+        void ctx.resume().catch(() => {});
+      }
+      const now = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.14, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + durationMs / 1000);
+      gain.connect(dest);
+
+      const osc1 = ctx.createOscillator();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(freqA, now);
+      osc1.connect(gain);
+      osc1.start(now);
+      osc1.stop(now + durationMs / 1000);
+
+      if (freqB) {
+        const osc2 = ctx.createOscillator();
+        osc2.type = 'sine';
+        osc2.frequency.setValueAtTime(freqB, now);
+        osc2.connect(gain);
+        osc2.start(now);
+        osc2.stop(now + durationMs / 1000);
+      }
+    } catch {
+      // Ignore Web Audio synthesis error
+    }
+  };
+
+  const recordDtmfIntoMix = (key: string) => {
+    const dtmfMap: Record<string, [number, number]> = {
+      '1': [697, 1209],
+      '2': [697, 1336],
+      '3': [697, 1477],
+      '4': [770, 1209],
+      '5': [770, 1336],
+      '6': [770, 1477],
+      '7': [852, 1209],
+      '8': [852, 1336],
+      '9': [852, 1477],
+      '*': [941, 1209],
+      '0': [941, 1336],
+      '#': [941, 1477],
+    };
+    const pair = dtmfMap[key];
+    if (pair) {
+      playToneIntoRecordingMix(pair[0], pair[1], 180);
+    }
+  };
+
+  const pickBestRecorderOptions = (): MediaRecorderOptions => {
+    if (typeof MediaRecorder === 'undefined') return {};
+    const preferredTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/mp4',
+    ];
+    for (const mimeType of preferredTypes) {
+      if (MediaRecorder.isTypeSupported(mimeType)) {
+        return { mimeType, audioBitsPerSecond: 32000 };
+      }
+    }
+    return { audioBitsPerSecond: 32000 };
+  };
+
+  const startSimulatorCallRecording = async (callId: string, requestMic: boolean) => {
+    if (!callId || typeof window === 'undefined' || typeof MediaRecorder === 'undefined') {
+      return;
+    }
+
+    // If already recording this call and user didn't newly request mic upgrade, keep current recorder
+    if (
+      mediaRecorderRef.current &&
+      mediaRecorderRef.current.state === 'recording' &&
+      activeRecordingCallIdRef.current === callId &&
+      (!requestMic || isMicRecording)
+    ) {
+      return;
+    }
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+
+      let ctx = mixCtxRef.current;
+      let dest = mixDestRef.current;
+      if (!ctx || ctx.state === 'closed' || !dest) {
+        ctx = new AudioCtx({ sampleRate: 24000 });
+        dest = ctx.createMediaStreamDestination();
+        mixCtxRef.current = ctx;
+        mixDestRef.current = dest;
+
+        // Subtle continuous carrier-floor oscillator (-65 dB) so MediaRecorder always produces continuous valid audio frames
+        const carrierOsc = ctx.createOscillator();
+        const carrierGain = ctx.createGain();
+        carrierOsc.frequency.value = 180;
+        carrierGain.gain.value = 0.0004;
+        carrierOsc.connect(carrierGain);
+        carrierGain.connect(dest);
+        carrierOsc.start();
+      }
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+
+      // Attach high-quality mono microphone if requested or already granted
+      let shouldAttachMic = requestMic;
+      if (!shouldAttachMic && navigator.permissions?.query) {
+        try {
+          const perm = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+          if (perm.state === 'granted') {
+            shouldAttachMic = true;
+          }
+        } catch {}
+      }
+
+      if (shouldAttachMic && navigator.mediaDevices?.getUserMedia && !mediaStreamRef.current) {
+        try {
+          const micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              channelCount: 1,
+              sampleRate: 48000,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          mediaStreamRef.current = micStream;
+          const micSource = ctx.createMediaStreamSource(micStream);
+          micSource.connect(dest);
+          setIsMicRecording(true);
+
+          const SpeechRec =
+            (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+          if (SpeechRec && !speechRecRef.current) {
+            const recognition = new SpeechRec();
+            recognition.continuous = true;
+            recognition.interimResults = false;
+            recognition.lang = 'en-US';
+            recognition.onresult = (event: any) => {
+              for (let i = event.resultIndex; i < event.results.length; i++) {
+                if (event.results[i].isFinal) {
+                  const transcript = event.results[i][0]?.transcript?.trim();
+                  const conf = event.results[i][0]?.confidence || 0.94;
+                  if (transcript) {
+                    void onSimulateEvent('speech', { speech: transcript, confidence: conf });
+                  }
+                }
+              }
+            };
+            recognition.onerror = () => {};
+            try {
+              recognition.start();
+              speechRecRef.current = recognition;
+            } catch {}
+          }
+        } catch (micErr) {
+          if (requestMic) {
+            console.error('Microphone permission error:', micErr);
+          }
+          setIsMicRecording(false);
+        }
+      }
+
+      if (!mediaRecorderRef.current || mediaRecorderRef.current.state === 'inactive') {
+        recordedChunksRef.current = [];
+        recordStartTimeRef.current = Date.now();
+        activeRecordingCallIdRef.current = callId;
+
+        const recorder = new MediaRecorder(dest.stream, pickBestRecorderOptions());
+        recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) {
+            recordedChunksRef.current.push(e.data);
+          }
+        };
+        recorder.start(200);
+        mediaRecorderRef.current = recorder;
+
+        // Play clean pickup connection chime into recording
+        playToneIntoRecordingMix(523.25, 659.25, 140);
+      }
+    } catch (err) {
+      console.error('Simulator call recorder error:', err);
+    }
+  };
+
+  const stopAndUploadMicRecording = async (targetCallId?: string) => {
+    if (uploadingLockRef.current) {
+      return uploadingLockRef.current;
+    }
+
+    const job = (async () => {
+      if (speechRecRef.current) {
+        try {
+          speechRecRef.current.stop();
+        } catch {}
+        speechRecRef.current = null;
+      }
+
+      const callIdToSave = targetCallId || activeRecordingCallIdRef.current || session?.id;
+      const recorder = mediaRecorderRef.current;
+
+      if (recorder && recorder.state !== 'inactive') {
+        await new Promise<void>((resolve) => {
+          recorder.onstop = async () => {
+            try {
+              if (callIdToSave && recordedChunksRef.current.length > 0) {
+                const mimeType = recorder.mimeType || 'audio/webm';
+                const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+                const durationSec = Math.max(
+                  1,
+                  Math.round((Date.now() - recordStartTimeRef.current) / 1000)
+                );
+                const dataUrl = await new Promise<string | null>((resRead) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () =>
+                    resRead(typeof reader.result === 'string' ? reader.result : null);
+                  reader.onerror = () => resRead(null);
+                  reader.readAsDataURL(blob);
+                });
+
+                if (dataUrl) {
+                  try {
+                    const upRes = await fetch(
+                      `/api/calls/${encodeURIComponent(callIdToSave)}/recording-upload`,
+                      {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          audioBase64: dataUrl,
+                          mimeType,
+                          duration: durationSec,
+                        }),
+                      }
+                    );
+                    if (upRes.ok) {
+                      const upJson = await upRes.json();
+                      onRecordingSaved?.(upJson.session);
+                    }
+                  } catch (err) {
+                    console.error('Upload simulator recording failed:', err);
+                  }
+                }
+              }
+            } finally {
+              resolve();
+            }
+          };
+          try {
+            recorder.requestData();
+          } catch {}
+          recorder.stop();
+        });
+      }
+
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        mediaStreamRef.current = null;
+      }
+      if (mixCtxRef.current && mixCtxRef.current.state !== 'closed') {
+        await mixCtxRef.current.close().catch(() => {});
+      }
+      mixCtxRef.current = null;
+      mixDestRef.current = null;
+      mediaRecorderRef.current = null;
+      activeRecordingCallIdRef.current = null;
+      recordedChunksRef.current = [];
+      setIsMicRecording(false);
+    })();
+
+    uploadingLockRef.current = job;
+    try {
+      await job;
+    } finally {
+      uploadingLockRef.current = null;
+    }
+  };
+
+  const toggleMicRecording = async () => {
+    if (isMicRecording) {
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
+        mediaStreamRef.current = null;
+      }
+      if (speechRecRef.current) {
+        try {
+          speechRecRef.current.stop();
+        } catch {}
+        speechRecRef.current = null;
+      }
+      setIsMicRecording(false);
+      return;
+    }
+    if (!session?.id) return;
+    await startSimulatorCallRecording(session.id, true);
+  };
+
+  const handleSendSimulatedSpeech = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!simulatedSpeechInput.trim()) return;
+    const text = simulatedSpeechInput.trim();
+    setSimulatedSpeechInput('');
+    await onSimulateEvent('speech', { speech: text, confidence: 0.98 });
+  };
 
   // Cancel any active speech immediately if user mutes audio
   useEffect(() => {
@@ -111,14 +440,20 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
         session.status === 'collecting-input' ||
         session.status === 'awaiting-operator')
     ) {
+      if (session.isSimulated && session.recordCall !== false) {
+        void startSimulatorCallRecording(session.id, false);
+      }
       interval = setInterval(() => {
         setCallDuration((prev) => prev + 1);
       }, 1000);
     } else {
       setCallDuration(0);
+      if (mediaRecorderRef.current || activeRecordingCallIdRef.current) {
+        void stopAndUploadMicRecording(activeRecordingCallIdRef.current || session?.id);
+      }
     }
     return () => clearInterval(interval);
-  }, [session?.status]);
+  }, [session?.id, session?.status]);
 
   // Voice speech synthesis helper with deduplication & mute guard
   const speakText = (text: string, onEnd?: () => void) => {
@@ -214,8 +549,11 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     }
   }, [session?.id, session?.operatorDecision, session?.codeStatus, session?.attempts, session?.status]);
 
-  // Speak greeting and prompt when answered
+  // Speak greeting and prompt when answered by human
   const handleAnswerCall = async () => {
+    if (session?.id && session.recordCall !== false) {
+      await startSimulatorCallRecording(session.id, false);
+    }
     await onSimulateEvent('answer');
 
     if (session) {
@@ -226,6 +564,23 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
         setCurrentPromptText(session.script);
         speakText(session.script);
       });
+    }
+  };
+
+  // Simulate automated voicemail service answering the call
+  const handleVoicemailAnswer = async () => {
+    if (session?.id && session.recordCall !== false) {
+      await startSimulatorCallRecording(session.id, false);
+    }
+    const res = await onSimulateEvent('voicemail');
+    const vmGreeting = `Your call has been forwarded to an automated voice messaging system for ${
+      session?.to || 'the subscriber'
+    }. At the tone, please record your message.`;
+    setCurrentPromptText(vmGreeting);
+    if (res?.session?.status === 'no-answer') {
+      await stopAndUploadMicRecording(session?.id);
+    } else {
+      speakText(vmGreeting);
     }
   };
 
@@ -241,10 +596,11 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     if (soundEnabled) {
       playDtmfTone(key, 200);
     }
+    recordDtmfIntoMix(key);
 
     if (key === '#') {
-      if (enteredDigits.length > 0) {
-        submitFullCode(enteredDigits);
+      if (enteredDigits.length >= targetLength) {
+        submitFullCode(enteredDigits.slice(0, targetLength));
       }
       return;
     }
@@ -308,6 +664,7 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
         globallySpokenDecisions.add(decisionKey);
         speakText(msg);
       }
+      void stopAndUploadMicRecording(session?.id);
     } else if (res?.codeStatus === 'max_exceeded') {
       const msg = res.message || 'Maximum attempts exceeded. Goodbye.';
       setAttemptFeedback({
@@ -316,6 +673,7 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       });
       setCurrentPromptText(msg);
       speakText(msg);
+      void stopAndUploadMicRecording(session?.id);
     } else {
       setIsSubmittingCode(false);
     }
@@ -556,22 +914,64 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                       ))}
                     </div>
 
-                    {/* Backspace row */}
-                    <div className="flex justify-center mt-1">
+                    {/* Backspace + Mic Voice Recording Controls */}
+                    <div className="flex items-center justify-center gap-1.5 mt-1">
                       <button
                         type="button"
                         onClick={handleDeleteDigit}
                         disabled={enteredDigits.length === 0 || isSubmittingCode}
-                        className="flex items-center gap-1 px-2.5 py-0.5 rounded bg-slate-850 text-slate-300 hover:text-white border border-slate-700 text-[11px] disabled:opacity-30"
+                        className="flex items-center gap-1 px-2 py-0.5 rounded bg-slate-850 text-slate-300 hover:text-white border border-slate-700 text-[10px] disabled:opacity-30 cursor-pointer"
                       >
                         <Delete className="w-3 h-3" />
                         <span>Delete</span>
                       </button>
+
+                      <button
+                        type="button"
+                        onClick={toggleMicRecording}
+                        className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[10px] font-semibold transition-all cursor-pointer ${
+                          isMicRecording
+                            ? 'bg-rose-600/20 border-rose-500 text-rose-300 animate-pulse'
+                            : 'bg-cyan-950/50 border-cyan-500/40 text-cyan-300 hover:bg-cyan-900/40'
+                        }`}
+                        title="Record real microphone audio & transcribe voice into Call History"
+                      >
+                        {isMicRecording ? (
+                          <>
+                            <MicOff className="w-3 h-3 text-rose-400" />
+                            <span>Stop &amp; Save Mic</span>
+                          </>
+                        ) : (
+                          <>
+                            <Mic className="w-3 h-3 text-cyan-400" />
+                            <span>Record Voice</span>
+                          </>
+                        )}
+                      </button>
                     </div>
+
+                    {/* Quick Simulated Caller Talk Input */}
+                    <form onSubmit={handleSendSimulatedSpeech} className="mt-1.5 flex items-center gap-1">
+                      <input
+                        type="text"
+                        value={simulatedSpeechInput}
+                        onChange={(e) => setSimulatedSpeechInput(e.target.value)}
+                        placeholder="Speak / talk on line..."
+                        className="flex-1 px-2 py-1 rounded bg-slate-900 border border-slate-800 text-[10px] text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500"
+                      />
+                      <button
+                        type="submit"
+                        disabled={!simulatedSpeechInput.trim()}
+                        className="px-2 py-1 rounded bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-800 disabled:text-slate-600 text-white text-[10px] font-semibold flex items-center gap-1 cursor-pointer"
+                        title="Send spoken words to call stream"
+                      >
+                        <Send className="w-2.5 h-2.5" />
+                      </button>
+                    </form>
                   </div>
                 )}
 
-                {/* Answer / Decline / Hangup Buttons */}
+                {/* Answer / Voicemail / Decline / Hangup Buttons */}
                 <div className="pt-1.5 pb-1">
                   {isRinging && (
                     <div className="flex items-center justify-around">
@@ -584,17 +984,28 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                         }}
                         className="flex flex-col items-center gap-1 cursor-pointer"
                       >
-                        <div className="w-10 h-10 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg shadow-rose-600/30">
+                        <div className="w-9 h-9 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-lg shadow-rose-600/30">
                           <PhoneOff className="w-4 h-4" />
                         </div>
                         <span className="text-[10px] text-slate-400">Decline</span>
                       </button>
 
                       <button
+                        onClick={handleVoicemailAnswer}
+                        className="flex flex-col items-center gap-1 cursor-pointer"
+                        title="Simulate Voicemail Service Answering"
+                      >
+                        <div className="w-9 h-9 rounded-full bg-orange-600 hover:bg-orange-500 text-white flex items-center justify-center shadow-lg shadow-orange-600/30">
+                          <Voicemail className="w-4 h-4" />
+                        </div>
+                        <span className="text-[10px] text-orange-300 font-medium">Voicemail</span>
+                      </button>
+
+                      <button
                         onClick={handleAnswerCall}
                         className="flex flex-col items-center gap-1 cursor-pointer"
                       >
-                        <div className="w-10 h-10 rounded-full bg-emerald-500 hover:bg-emerald-400 text-white flex items-center justify-center shadow-lg shadow-emerald-500/40 animate-bounce">
+                        <div className="w-9 h-9 rounded-full bg-emerald-500 hover:bg-emerald-400 text-white flex items-center justify-center shadow-lg shadow-emerald-500/40 animate-bounce">
                           <Phone className="w-4 h-4" />
                         </div>
                         <span className="text-[10px] text-emerald-400 font-semibold">Answer</span>
@@ -605,11 +1016,12 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                   {isLive && (
                     <div className="flex justify-center">
                       <button
-                        onClick={() => {
+                        onClick={async () => {
                           if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
                             window.speechSynthesis.cancel();
                           }
-                          onSimulateEvent('hangup');
+                          await stopAndUploadMicRecording(session.id);
+                          await onSimulateEvent('hangup');
                         }}
                         className="w-9 h-9 rounded-full bg-rose-600 hover:bg-rose-500 text-white flex items-center justify-center shadow-md cursor-pointer"
                         title="End Call"

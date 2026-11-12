@@ -11,10 +11,17 @@ export type CallStatus =
   | 'failed'
   | 'no-answer';
 
+export interface SpeechTranscriptEntry {
+  id: string;
+  text: string;
+  confidence?: number;
+  timestamp: string;
+}
+
 export interface CallEvent {
   id: string;
   timestamp: string;
-  type: 'system' | 'call-state' | 'playback' | 'gather' | 'dtmf' | 'speech' | 'error';
+  type: 'system' | 'call-state' | 'playback' | 'gather' | 'dtmf' | 'speech' | 'amd' | 'recording' | 'error';
   title: string;
   description: string;
   data?: any;
@@ -25,6 +32,15 @@ export interface CallSession {
   to: string;
   from: string;
   status: CallStatus;
+  answeredBy?: 'human' | 'voicemail' | 'fax' | 'unknown';
+  amdRawResult?: string;
+  autoHangupOnVoicemail?: boolean;
+  recordCall?: boolean;
+  recordingUrl?: string;
+  recordingDuration?: number;
+  recordingSizeBytes?: number;
+  recordingStatus?: 'recording' | 'completed' | 'failed';
+  speechTranscripts?: SpeechTranscriptEntry[];
   introGreeting: string;
   script: string;
   verificationMode: 'manual' | 'auto';

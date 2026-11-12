@@ -3,9 +3,13 @@ import express, { Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import twilio from 'twilio';
 import { GoogleGenAI } from '@google/genai';
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,8 +19,8 @@ const PORT = process.env.PORT || 3000;
 const isProd = process.env.NODE_ENV === 'production';
 
 app.set('trust proxy', true);
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '15mb' }));
+app.use(express.urlencoded({ extended: true, limit: '15mb' }));
 
 function isLocalUrl(urlOrHost: string): boolean {
   const lower = urlOrHost.toLowerCase();
@@ -83,11 +87,30 @@ export function getPublicBaseUrl(req?: Request, fallbackUrl?: string): string {
   return `http://localhost:${PORT}`;
 }
 
+export interface SpeechTranscriptEntry {
+  id: string;
+  text: string;
+  confidence?: number;
+  timestamp: string;
+}
+
 export interface CallSession {
   id: string;
   to: string;
   from: string;
   status: 'queued' | 'initiating' | 'ringing' | 'in-progress' | 'collecting-input' | 'awaiting-operator' | 'completed' | 'busy' | 'failed' | 'no-answer';
+  answeredBy?: 'human' | 'voicemail' | 'fax' | 'unknown';
+  amdRawResult?: string;
+  autoHangupOnVoicemail?: boolean;
+  recordCall?: boolean;
+  recordingUrl?: string;
+  providerRecordingUrl?: string;
+  recordingSid?: string;
+  recordingDuration?: number;
+  recordingSizeBytes?: number;
+  recordingStatus?: 'recording' | 'completed' | 'failed';
+  localRecordingExt?: string;
+  speechTranscripts?: SpeechTranscriptEntry[];
   introGreeting: string;
   script: string;
   verificationMode: 'manual' | 'auto';
@@ -120,17 +143,67 @@ export interface CallSession {
   events: Array<{
     id: string;
     timestamp: string;
-    type: 'system' | 'call-state' | 'playback' | 'gather' | 'dtmf' | 'speech' | 'error';
+    type: 'system' | 'call-state' | 'playback' | 'gather' | 'dtmf' | 'speech' | 'amd' | 'recording' | 'error';
     title: string;
     description: string;
     data?: any;
   }>;
 }
 
-// In-memory sessions storage + /tmp file cache for resilience across restarts / worker processes
+// Persistent /tmp storage for sessions, recordings, and server-only carrier auth headers
 const SESSION_CACHE_FILE = '/tmp/voicedrop-sessions.json';
+const CREDENTIALS_CACHE_FILE = '/tmp/voicedrop-credentials.json';
+const RECORDINGS_DIR = '/tmp/voicedrop-recordings';
+
+try {
+  fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+} catch {
+  // Ignore if already exists
+}
+
+interface StoredCallCredentials {
+  carrier: string;
+  authHeader?: string;
+  twilioSid?: string;
+  twilioToken?: string;
+  plivoId?: string;
+  plivoToken?: string;
+  telnyxKey?: string;
+  swSpace?: string;
+  swProject?: string;
+  swToken?: string;
+}
+
 const sessions = new Map<string, CallSession>();
 const providerSidToCallId = new Map<string, string>();
+const callCredentialsMap = new Map<string, StoredCallCredentials>();
+
+function saveCallCredentials(callId: string, creds: StoredCallCredentials) {
+  callCredentialsMap.set(callId, creds);
+  try {
+    const entries = Object.fromEntries(Array.from(callCredentialsMap.entries()).slice(-50));
+    fs.writeFileSync(CREDENTIALS_CACHE_FILE, JSON.stringify(entries), { encoding: 'utf8', mode: 0o600 });
+  } catch {
+    // Ignore disk cache errors
+  }
+}
+
+function getCallCredentials(callId: string): StoredCallCredentials | undefined {
+  if (callCredentialsMap.has(callId)) return callCredentialsMap.get(callId);
+  try {
+    if (fs.existsSync(CREDENTIALS_CACHE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(CREDENTIALS_CACHE_FILE, 'utf8'));
+      if (raw && typeof raw === 'object') {
+        for (const [k, v] of Object.entries(raw)) {
+          callCredentialsMap.set(k, v as StoredCallCredentials);
+        }
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+  return callCredentialsMap.get(callId);
+}
 
 function persistSessionsToDisk() {
   try {
@@ -275,20 +348,47 @@ app.get('/api/call/events/:callId', (req: Request, res: Response) => {
   });
 });
 
-// Get session details
+// Get session details (auto-reconciles cached recordings on disk)
+function reconcileSessionRecordingState(s: CallSession): CallSession {
+  const cached = findCachedRecordingPath(s.id);
+  if (cached) {
+    try {
+      const stat = fs.statSync(cached.filePath);
+      if (stat.size > 0) {
+        s.recordingSizeBytes = stat.size;
+        s.recordingStatus = 'completed';
+        if (!s.recordingUrl) {
+          s.recordingUrl = `/api/calls/${encodeURIComponent(s.id)}/recording?v=${stat.size}`;
+        }
+      }
+    } catch {
+      // Ignore stat error
+    }
+  } else if (
+    s.recordingStatus === 'recording' &&
+    ['completed', 'failed', 'busy', 'no-answer'].includes(s.status) &&
+    s.completedAt &&
+    Date.now() - new Date(s.completedAt).getTime() > 10000
+  ) {
+    // Never leave completed calls stuck in 'recording' state
+    s.recordingStatus = undefined;
+  }
+  return s;
+}
+
 app.get('/api/calls/:callId', (req: Request, res: Response) => {
   const session = getSessionById(req.params.callId);
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
   }
-  res.json(session);
+  res.json(reconcileSessionRecordingState(session));
 });
 
 // List recent calls
 app.get('/api/calls', (req: Request, res: Response) => {
-  const list = Array.from(sessions.values()).sort(
-    (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-  );
+  const list = Array.from(sessions.values())
+    .map((s) => reconcileSessionRecordingState(s))
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json(list.slice(0, 25));
 });
 
@@ -306,9 +406,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       successMessage = 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
       maxAttempts = 3,
       voice = 'Polly.Joanna',
-      inputMode = 'dtmf',
       numDigits = 6,
       keypadActions = {},
+      autoHangupOnVoicemail = false,
+      recordCall = true,
       mode = 'auto', // 'live' | 'simulator' | 'auto'
       customTwilio,
     } = req.body;
@@ -395,12 +496,16 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
     const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const appBaseUrl = getPublicBaseUrl(req);
+    const shouldRecord = recordCall !== false;
 
     const newSession: CallSession = {
       id: callId,
       to: formattedTo,
       from: carrierPhone,
       status: 'queued',
+      autoHangupOnVoicemail: Boolean(autoHangupOnVoicemail),
+      recordCall: shouldRecord,
+      speechTranscripts: [],
       introGreeting: introGreeting.trim(),
       script: message.trim(),
       verificationMode: verificationMode === 'auto' ? 'auto' : 'manual',
@@ -412,7 +517,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       attempts: 0,
       codeStatus: 'pending',
       voice,
-      inputMode: 'dtmf',
+      inputMode: 'dtmf speech',
       numDigits: Number(numDigits) || (expectedCode ? expectedCode.trim().length : 6),
       keypadActions: keypadActions || {},
       isSimulated: useSimulator,
@@ -426,9 +531,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
     addSessionEvent(newSession, {
       type: 'system',
-      title: 'Call Session Created',
+      title: 'Call Session Created (AMD + Voice Listener + Recording Active)',
       description: `Target: ${formattedTo}. Control: ${newSession.verificationMode === 'manual' ? 'Manual Operator Verification' : 'Automatic Match'}. Digits: ${newSession.numDigits}. Carrier: ${carrier.toUpperCase()} (${useSimulator ? 'Simulator' : 'Live PSTN'})`,
-      data: { to: formattedTo, voice, numDigits: newSession.numDigits, verificationMode: newSession.verificationMode, carrier },
+      data: { to: formattedTo, voice, numDigits: newSession.numDigits, verificationMode: newSession.verificationMode, carrier, recordCall: shouldRecord },
     });
 
     if (useSimulator) {
@@ -451,7 +556,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           addSessionEvent(s, {
             type: 'call-state',
             title: 'Ringing Recipient Phone',
-            description: 'Destination terminal is ringing. Waiting for recipient to answer...',
+            description: 'Destination terminal is ringing. Waiting for human or voicemail answer...',
           });
         }
       }, 1800);
@@ -461,32 +566,56 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         callId,
         session: newSession,
         mode: 'simulator',
-        message: 'Simulator call initialized and ringing. Open the Interactive Phone Mockup to accept!',
+        message: 'Simulator call initialized and ringing. Answer or send to Voicemail on the Phone Simulator!',
       });
     }
 
     // LIVE PSTN CARRIER DISPATCH
-
     try {
       if (carrier === 'twilio') {
+        saveCallCredentials(callId, {
+          carrier: 'twilio',
+          authHeader: `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')}`,
+          twilioSid: twilioAccountSid,
+          twilioToken: twilioAuthToken,
+        });
+
         const client = twilio(twilioAccountSid, twilioAuthToken);
         const outboundUrl = `${appBaseUrl}/api/twiml/outbound?callId=${encodeURIComponent(callId)}`;
         const statusCallbackUrl = `${appBaseUrl}/api/twiml/status?callId=${encodeURIComponent(callId)}`;
+        const amdCallbackUrl = `${appBaseUrl}/api/twiml/amd?callId=${encodeURIComponent(callId)}`;
+        const recordingCallbackUrl = `${appBaseUrl}/api/twiml/recording?callId=${encodeURIComponent(callId)}`;
 
         addSessionEvent(newSession, {
           type: 'system',
           title: 'Dispatching Twilio API Request',
-          description: `Calling Twilio Programmable Voice endpoint with webhook: ${outboundUrl}`,
+          description: `Calling Twilio Programmable Voice with Async Voicemail Detection (AMD) & Call Recording enabled: ${outboundUrl}`,
         });
 
-        const call = await client.calls.create({
+        const createParams: any = {
           to: formattedTo,
           from: twilioPhone,
           url: outboundUrl,
           statusCallback: statusCallbackUrl,
           statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
           statusCallbackMethod: 'POST',
-        });
+          machineDetection: 'Enable',
+          asyncAmd: 'true',
+          asyncAmdStatusCallback: amdCallbackUrl,
+          asyncAmdStatusCallbackMethod: 'POST',
+        };
+
+        if (shouldRecord) {
+          createParams.record = true;
+          createParams.recordingChannels = 'mono';
+          createParams.trim = 'trim-silence';
+          createParams.recordingStatusCallback = recordingCallbackUrl;
+          createParams.recordingStatusCallbackEvent = ['in-progress', 'completed', 'absent'];
+          createParams.recordingStatusCallbackMethod = 'POST';
+          newSession.recordingStatus = 'recording';
+        }
+
+        const call = await client.calls.create(createParams);
 
         newSession.providerCallSid = call.sid;
         providerSidToCallId.set(call.sid, callId);
@@ -495,7 +624,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         addSessionEvent(newSession, {
           type: 'call-state',
           title: 'Twilio Call Dispatched',
-          description: `Twilio Call SID: ${call.sid}. Carrier status: ${call.status}.`,
+          description: `Twilio Call SID: ${call.sid}. Voicemail detection & full-call audio recording active.`,
           data: { callSid: call.sid, status: call.status },
         });
 
@@ -509,19 +638,28 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           message: `Live Twilio call placed to ${formattedTo}!`,
         });
       } else if (carrier === 'plivo') {
+        const plivoBasic = `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`;
+        saveCallCredentials(callId, {
+          carrier: 'plivo',
+          authHeader: plivoBasic,
+          plivoId: plivoAuthId,
+          plivoToken: plivoAuthToken,
+        });
+
         const answerUrl = `${appBaseUrl}/api/plivo/outbound?callId=${encodeURIComponent(callId)}`;
         const statusUrl = `${appBaseUrl}/api/plivo/status?callId=${encodeURIComponent(callId)}`;
+        const amdUrl = `${appBaseUrl}/api/plivo/amd?callId=${encodeURIComponent(callId)}`;
 
         addSessionEvent(newSession, {
           type: 'system',
           title: 'Dispatching Plivo Voice API Request',
-          description: `Calling Plivo endpoint with Answer URL: ${answerUrl}`,
+          description: `Calling Plivo endpoint with AMD & Recording active: ${answerUrl}`,
         });
 
         const plivoRes = await fetch(`https://api.plivo.com/v1/Account/${plivoAuthId}/Call/`, {
           method: 'POST',
           headers: {
-            Authorization: `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`,
+            Authorization: plivoBasic,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({
@@ -531,6 +669,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
             answer_method: 'POST',
             hangup_url: statusUrl,
             hangup_method: 'POST',
+            machine_detection: 'true',
+            machine_detection_time: 5000,
+            machine_detection_url: amdUrl,
+            machine_detection_method: 'POST',
           }),
         });
 
@@ -541,13 +683,14 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         const callSid = plivoData.request_uuid || plivoData.call_uuid || callId;
         newSession.providerCallSid = callSid;
+        if (shouldRecord) newSession.recordingStatus = 'recording';
         providerSidToCallId.set(callSid, callId);
         persistSessionsToDisk();
 
         addSessionEvent(newSession, {
           type: 'call-state',
           title: 'Plivo Call Dispatched',
-          description: `Plivo Request UUID: ${callSid}. Call queued on Plivo carrier network.`,
+          description: `Plivo Request UUID: ${callSid}. Call queued with AMD & Recording.`,
           data: { callSid },
         });
 
@@ -561,14 +704,43 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           message: `Live Plivo call placed to ${formattedTo}!`,
         });
       } else if (carrier === 'telnyx') {
+        saveCallCredentials(callId, {
+          carrier: 'telnyx',
+          authHeader: `Bearer ${telnyxApiKey}`,
+          telnyxKey: telnyxApiKey,
+        });
+
         const texmlUrl = `${appBaseUrl}/api/telnyx/texml?callId=${encodeURIComponent(callId)}`;
         const statusUrl = `${appBaseUrl}/api/telnyx/status?callId=${encodeURIComponent(callId)}`;
+        const amdUrl = `${appBaseUrl}/api/telnyx/amd?callId=${encodeURIComponent(callId)}`;
+        const recUrl = `${appBaseUrl}/api/telnyx/recording?callId=${encodeURIComponent(callId)}`;
 
         addSessionEvent(newSession, {
           type: 'system',
           title: 'Dispatching Telnyx TeXML Call',
-          description: `Calling Telnyx TeXML endpoint with webhook: ${texmlUrl}`,
+          description: `Calling Telnyx TeXML endpoint with AMD & Recording: ${texmlUrl}`,
         });
+
+        const telnyxPayload: any = {
+          to: formattedTo,
+          from: telnyxPhone,
+          url: texmlUrl,
+          status_callback: statusUrl,
+          connection_id: telnyxConnectionId,
+          answering_machine_detection: 'detect',
+          async_amd: true,
+          async_amd_status_callback: amdUrl,
+          async_amd_status_callback_method: 'POST',
+        };
+
+        if (shouldRecord) {
+          telnyxPayload.record = 'record-from-answer';
+          telnyxPayload.recording_channels = 'single';
+          telnyxPayload.recording_format = 'wav';
+          telnyxPayload.recording_status_callback = recUrl;
+          telnyxPayload.recording_status_callback_method = 'POST';
+          newSession.recordingStatus = 'recording';
+        }
 
         const telnyxRes = await fetch('https://api.telnyx.com/v2/texml/calls', {
           method: 'POST',
@@ -576,13 +748,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
             Authorization: `Bearer ${telnyxApiKey}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            to: formattedTo,
-            from: telnyxPhone,
-            url: texmlUrl,
-            status_callback: statusUrl,
-            connection_id: telnyxConnectionId,
-          }),
+          body: JSON.stringify(telnyxPayload),
         });
 
         const telnyxData: any = await telnyxRes.json();
@@ -613,28 +779,55 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         });
       } else if (carrier === 'signalwire') {
         const cleanSpace = (signalwireSpaceUrl || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+        const swBasic = `Basic ${Buffer.from(`${signalwireProjectId}:${signalwireApiToken}`).toString('base64')}`;
+        saveCallCredentials(callId, {
+          carrier: 'signalwire',
+          authHeader: swBasic,
+          swSpace: cleanSpace,
+          swProject: signalwireProjectId,
+          swToken: signalwireApiToken,
+        });
+
         const lamlUrl = `${appBaseUrl}/api/signalwire/laml?callId=${encodeURIComponent(callId)}`;
         const statusUrl = `${appBaseUrl}/api/signalwire/status?callId=${encodeURIComponent(callId)}`;
+        const amdUrl = `${appBaseUrl}/api/signalwire/amd?callId=${encodeURIComponent(callId)}`;
+        const recUrl = `${appBaseUrl}/api/signalwire/recording?callId=${encodeURIComponent(callId)}`;
 
         addSessionEvent(newSession, {
           type: 'system',
           title: 'Dispatching SignalWire Compatibility Call',
-          description: `Calling SignalWire Space [${cleanSpace}] with LAML webhook: ${lamlUrl}`,
+          description: `Calling SignalWire Space [${cleanSpace}] with AMD & Recording: ${lamlUrl}`,
         });
+
+        const swParams: Record<string, string> = {
+          To: formattedTo,
+          From: signalwirePhone || '',
+          Url: lamlUrl,
+          StatusCallback: statusUrl,
+          MachineDetection: 'Enable',
+          AsyncAmd: 'true',
+          AsyncAmdStatusCallback: amdUrl,
+          AsyncAmdStatusCallbackMethod: 'POST',
+        };
+
+        if (shouldRecord) {
+          swParams.Record = 'true';
+          swParams.RecordingChannels = 'mono';
+          swParams.Trim = 'trim-silence';
+          swParams.RecordingStatusCallback = recUrl;
+          swParams.RecordingStatusCallbackEvent = 'in-progress completed absent';
+          swParams.RecordingStatusCallbackMethod = 'POST';
+          newSession.recordingStatus = 'recording';
+        }
 
         const swUrl = `https://${cleanSpace}/api/laml/2010-04-01/Accounts/${signalwireProjectId}/Calls.json`;
         const swRes = await fetch(swUrl, {
           method: 'POST',
           headers: {
-            Authorization: `Basic ${Buffer.from(`${signalwireProjectId}:${signalwireApiToken}`).toString('base64')}`,
+            Authorization: swBasic,
             'Content-Type': 'application/x-www-form-urlencoded',
           },
-          body: new URLSearchParams({
-            To: formattedTo,
-            From: signalwirePhone || '',
-            Url: lamlUrl,
-            StatusCallback: statusUrl,
-          }).toString(),
+          body: new URLSearchParams(swParams).toString(),
         });
 
         const swData: any = await swRes.json();
@@ -738,7 +931,7 @@ function findSession(req: Request): CallSession | undefined {
     if (found) return found;
   }
 
-  // Fallback: if carrier webhook omitted query params, match most recent active session for recipient phone
+  // Fallback: if carrier webhook omitted query params, match most recent session for recipient phone
   const rawTo = req.body?.To || req.body?.Called || req.query?.To;
   if (typeof rawTo === 'string' && rawTo.trim()) {
     const normTo = normalizeCallerId(rawTo);
@@ -752,9 +945,681 @@ function findSession(req: Request): CallSession | undefined {
       )
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
     if (activeByPhone) return activeByPhone;
+
+    // Secondary fallback for post-hangup status/recording callbacks arriving right after call completion
+    const recentCompletedByPhone = Array.from(sessions.values())
+      .filter(
+        (s) =>
+          s.to === normTo &&
+          Date.now() - new Date(s.createdAt).getTime() < 15 * 60 * 1000
+      )
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+    if (recentCompletedByPhone) return recentCompletedByPhone;
   }
 
   return undefined;
+}
+
+// -------------------------------------------------------------
+// AMD, SPEECH TRANSCRIPTION & RECORDING HELPERS
+// -------------------------------------------------------------
+const VOICEMAIL_SPEECH_REGEX =
+  /\b(voicemail|leave a message|after the tone|after the beep|not available|cannot take your call|can't take your call|mailbox is full|please record your message|at the tone please|forwarded to an automated voice)\b/i;
+
+function parseAnsweredBy(
+  raw?: string,
+  plivoMachine?: string
+): 'human' | 'voicemail' | 'fax' | 'unknown' | undefined {
+  if (plivoMachine !== undefined && String(plivoMachine).trim() !== '') {
+    const m = String(plivoMachine).toLowerCase().trim();
+    if (m === 'true' || m === 'machine') return 'voicemail';
+    if (m === 'false' || m === 'human') return 'human';
+  }
+  if (!raw) return undefined;
+  const v = String(raw).toLowerCase().trim();
+  if (!v) return undefined;
+  if (v === 'human') return 'human';
+  if (
+    v.startsWith('machine') ||
+    v === 'voicemail' ||
+    v === 'answering_machine'
+  ) {
+    return 'voicemail';
+  }
+  if (v === 'fax' || v === 'fax_machine') return 'fax';
+  if (v === 'unknown' || v === 'not_sure') return 'unknown';
+  return undefined;
+}
+
+async function terminateCarrierCall(
+  session: CallSession,
+  customTwilio?: any,
+  carriersConfig: any = {}
+) {
+  if (session.isSimulated) return;
+  try {
+    const carrier = session.carrier || 'twilio';
+    const providerSid = session.providerCallSid || session.id;
+    const savedCreds = getCallCredentials(session.id);
+
+    if (carrier === 'twilio') {
+      const accountSid =
+        carriersConfig.twilio?.accountSid ||
+        customTwilio?.accountSid ||
+        savedCreds?.twilioSid ||
+        process.env.TWILIO_ACCOUNT_SID;
+      const authToken =
+        carriersConfig.twilio?.authToken ||
+        customTwilio?.authToken ||
+        savedCreds?.twilioToken ||
+        process.env.TWILIO_AUTH_TOKEN;
+      if (accountSid && authToken && providerSid.startsWith('CA')) {
+        const client = twilio(accountSid, authToken);
+        // Stop active call recording first so Twilio flushes the audio file immediately on hangup
+        await client
+          .calls(providerSid)
+          .recordings('Twilio.CURRENT')
+          .update({ status: 'stopped' })
+          .catch(() => {});
+        await client.calls(providerSid).update({ status: 'completed' });
+      }
+    } else if (carrier === 'plivo') {
+      const plivoAuthId =
+        carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
+      const plivoAuthToken =
+        carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+      if (plivoAuthId && plivoAuthToken && !providerSid.startsWith('call_')) {
+        const plivoAuth = `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`;
+        await fetch(
+          `https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/Record/`,
+          { method: 'DELETE', headers: { Authorization: plivoAuth } }
+        ).catch(() => {});
+        await fetch(
+          `https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/`,
+          {
+            method: 'DELETE',
+            headers: { Authorization: plivoAuth },
+          }
+        );
+      }
+    } else if (carrier === 'telnyx') {
+      const telnyxApiKey =
+        carriersConfig.telnyx?.apiKey || savedCreds?.telnyxKey || process.env.TELNYX_API_KEY;
+      if (telnyxApiKey && !providerSid.startsWith('call_')) {
+        await fetch(
+          `https://api.telnyx.com/v2/calls/${encodeURIComponent(providerSid)}/actions/hangup`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${telnyxApiKey}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({}),
+          }
+        );
+      }
+    } else if (carrier === 'signalwire') {
+      const spaceUrl =
+        carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
+      const projectId =
+        carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
+      const apiToken =
+        carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+      if (spaceUrl && projectId && apiToken && !providerSid.startsWith('call_')) {
+        const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+        await fetch(
+          `https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Calls/${encodeURIComponent(providerSid)}.json`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Basic ${Buffer.from(`${projectId}:${apiToken}`).toString('base64')}`,
+              'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: new URLSearchParams({ Status: 'completed' }).toString(),
+          }
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Error terminating carrier call:', err);
+  }
+}
+
+async function applyAmdResult(
+  session: CallSession,
+  answeredBy: 'human' | 'voicemail' | 'fax' | 'unknown',
+  rawLabel: string
+) {
+  const prev = session.answeredBy;
+  // Don't downgrade a confirmed voicemail or human to 'unknown'
+  if (answeredBy === 'unknown' && (prev === 'voicemail' || prev === 'human')) {
+    return;
+  }
+  session.answeredBy = answeredBy;
+  session.amdRawResult = rawLabel;
+
+  if (prev !== answeredBy) {
+    if (answeredBy === 'voicemail') {
+      addSessionEvent(session, {
+        type: 'amd',
+        title: 'Voicemail / Answering Machine Answered',
+        description: `Answering Machine Detection identified an automated voicemail service (${rawLabel}).`,
+        data: { answeredBy, rawLabel },
+      });
+
+      if (session.autoHangupOnVoicemail && !['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {
+        session.status = 'no-answer';
+        session.pendingDigits = undefined;
+        session.activeCue = undefined;
+        session.completedAt = new Date().toISOString();
+        addSessionEvent(session, {
+          type: 'call-state',
+          title: 'Auto-Ended Call: Voicemail Answered',
+          description: 'Auto-hangup on voicemail is enabled. Terminated outbound call automatically.',
+        });
+        await terminateCarrierCall(session);
+        void finalizeCallRecording(session);
+      }
+    } else if (answeredBy === 'human') {
+      addSessionEvent(session, {
+        type: 'amd',
+        title: 'Live Human Answered Confirmed',
+        description: `Carrier AMD confirmed a live person answered the phone (${rawLabel}).`,
+        data: { answeredBy, rawLabel },
+      });
+    } else if (answeredBy === 'fax') {
+      addSessionEvent(session, {
+        type: 'amd',
+        title: 'Fax Tone Detected',
+        description: `Carrier AMD detected a fax machine (${rawLabel}).`,
+        data: { answeredBy, rawLabel },
+      });
+    } else {
+      persistSessionsToDisk();
+      broadcastEvent(session.id, 'session-update', session);
+    }
+  }
+}
+
+function appendSpeechTranscript(
+  session: CallSession,
+  text: string,
+  confidence?: number,
+  contextLabel?: string
+) {
+  const cleaned = text.trim();
+  if (!cleaned) return;
+
+  if (!Array.isArray(session.speechTranscripts)) {
+    session.speechTranscripts = [];
+  }
+
+  const entry: SpeechTranscriptEntry = {
+    id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    text: cleaned,
+    confidence,
+    timestamp: new Date().toISOString(),
+  };
+
+  session.speechTranscripts.push(entry);
+  session.capturedSpeech = session.speechTranscripts.map((t) => t.text).join(' | ');
+  if (confidence !== undefined && !Number.isNaN(confidence)) {
+    session.confidence = confidence;
+  }
+
+  const confSuffix =
+    confidence !== undefined && !Number.isNaN(confidence)
+      ? ` (Confidence: ${Math.round(confidence * 100)}%)`
+      : '';
+
+  addSessionEvent(session, {
+    type: 'speech',
+    title: `Caller Spoke${contextLabel ? ` (${contextLabel})` : ''}: "${cleaned}"`,
+    description: `Live voice recognition captured spoken audio${confSuffix}.`,
+    data: { speech: cleaned, confidence },
+  });
+
+  if (session.answeredBy !== 'voicemail' && VOICEMAIL_SPEECH_REGEX.test(cleaned)) {
+    void applyAmdResult(session, 'voicemail', 'voicemail_greeting_speech');
+  }
+}
+
+function findCachedRecordingPath(callId: string): { filePath: string; mimeType: string } | null {
+  const candidates: Array<{ ext: string; mime: string }> = [
+    { ext: 'mp3', mime: 'audio/mpeg' },
+    { ext: 'webm', mime: 'audio/webm' },
+    { ext: 'wav', mime: 'audio/wav' },
+    { ext: 'ogg', mime: 'audio/ogg' },
+    { ext: 'mp4', mime: 'audio/mp4' },
+  ];
+  const safeId = callId.replace(/[^a-zA-Z0-9_-]/g, '');
+  for (const c of candidates) {
+    const p = path.join(RECORDINGS_DIR, `${safeId}.${c.ext}`);
+    if (fs.existsSync(p) && fs.statSync(p).size > 0) {
+      return { filePath: p, mimeType: c.mime };
+    }
+  }
+  return null;
+}
+
+function buildRecordingCandidateUrls(rawUrl: string, carrier?: string): string[] {
+  const trimmed = rawUrl.trim();
+  if (carrier === 'twilio' || carrier === 'signalwire') {
+    const base = trimmed.replace(/\.(json|xml|mp3|wav)(\?.*)?$/i, '');
+    // Prefer lossless 16-bit PCM .wav first (available immediately on hangup & highest source fidelity for ffmpeg!)
+    const wavUrl =
+      carrier === 'twilio' ? `${base}.wav?RequestedChannels=1` : `${base}.wav`;
+    const mp3Url =
+      carrier === 'twilio' ? `${base}.mp3?RequestedChannels=1` : `${base}.mp3`;
+    return [wavUrl, mp3Url];
+  }
+  return [trimmed];
+}
+
+function resolveCarrierAuthHeader(session: CallSession): string | undefined {
+  const saved = getCallCredentials(session.id);
+  if (saved?.authHeader) return saved.authHeader;
+
+  const carrier = session.carrier || 'twilio';
+  if (carrier === 'twilio' && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    return `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`;
+  }
+  if (carrier === 'plivo' && process.env.PLIVO_AUTH_ID && process.env.PLIVO_AUTH_TOKEN) {
+    return `Basic ${Buffer.from(`${process.env.PLIVO_AUTH_ID}:${process.env.PLIVO_AUTH_TOKEN}`).toString('base64')}`;
+  }
+  if (carrier === 'telnyx' && process.env.TELNYX_API_KEY) {
+    return `Bearer ${process.env.TELNYX_API_KEY}`;
+  }
+  if (carrier === 'signalwire' && process.env.SIGNALWIRE_PROJECT_ID && process.env.SIGNALWIRE_API_TOKEN) {
+    return `Basic ${Buffer.from(`${process.env.SIGNALWIRE_PROJECT_ID}:${process.env.SIGNALWIRE_API_TOKEN}`).toString('base64')}`;
+  }
+  return undefined;
+}
+
+// Transcode raw carrier WAV/WebM/MP3 into compact (~180-200 KB/min), 24kHz wideband voice-enhanced MP3
+async function transcodeToCompactHdMp3(
+  rawBuffer: Buffer,
+  inputExt: string,
+  outMp3Path: string
+): Promise<{ ok: boolean; durationSec?: number }> {
+  const tmpInput = `${outMp3Path}.tmp_${Date.now()}.${inputExt}`;
+  const tmpOutput = `${outMp3Path}.out_${Date.now()}.mp3`;
+  try {
+    fs.writeFileSync(tmpInput, rawBuffer);
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-i',
+        tmpInput,
+        '-vn',
+        '-af',
+        'highpass=f=80,lowpass=f=11000,equalizer=f=2800:t=q:w=1.2:g=2.5,dynaudnorm=f=150:g=11,silenceremove=start_periods=1:start_silence=0.35:start_threshold=-52dB',
+        '-ar',
+        '24000',
+        '-ac',
+        '1',
+        '-c:a',
+        'libmp3lame',
+        '-b:a',
+        '28k',
+        tmpOutput,
+      ],
+      { timeout: 12000 }
+    );
+
+    if (fs.existsSync(tmpOutput) && fs.statSync(tmpOutput).size > 0) {
+      fs.renameSync(tmpOutput, outMp3Path);
+      const bytes = fs.statSync(outMp3Path).size;
+      // 28 kbps = 3500 bytes/sec
+      const estDuration = Math.max(1, Math.round(bytes / 3500));
+      return { ok: true, durationSec: estDuration };
+    }
+    return { ok: false };
+  } catch (err) {
+    console.error('ffmpeg HD voice compression fallback:', err);
+    return { ok: false };
+  } finally {
+    try {
+      if (fs.existsSync(tmpInput)) fs.unlinkSync(tmpInput);
+      if (fs.existsSync(tmpOutput)) fs.unlinkSync(tmpOutput);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+}
+
+const inFlightDownloads = new Map<string, Promise<string | null>>();
+const inFlightFinalizers = new Map<string, Promise<void>>();
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function markRecordingCompleted(
+  session: CallSession,
+  filePath: string,
+  ext: string,
+  durationHint?: number
+) {
+  const stat = fs.statSync(filePath);
+  // Remove any older non-matching extension files for the same callId so findCachedRecordingPath picks the new HD mp3
+  const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+  for (const otherExt of ['wav', 'webm', 'ogg', 'mp4', 'mp3']) {
+    if (otherExt !== ext) {
+      const stale = path.join(RECORDINGS_DIR, `${safeId}.${otherExt}`);
+      if (fs.existsSync(stale)) {
+        try {
+          fs.unlinkSync(stale);
+        } catch {}
+      }
+    }
+  }
+
+  session.localRecordingExt = ext;
+  session.recordingSizeBytes = stat.size;
+  if (durationHint && (!session.recordingDuration || session.recordingDuration <= 0)) {
+    session.recordingDuration = durationHint;
+  }
+  session.recordingStatus = 'completed';
+  session.recordingUrl = `/api/calls/${encodeURIComponent(session.id)}/recording?v=${stat.size}`;
+
+  const alreadyLogged = session.events.some((e) => e.type === 'recording');
+  if (!alreadyLogged) {
+    const kb = Math.max(1, Math.round(stat.size / 1024));
+    addSessionEvent(session, {
+      type: 'recording',
+      title: `HD Call Recording Ready (${kb} KB)`,
+      description: `High-clarity 24kHz voice recording saved${
+        session.recordingDuration ? ` (${session.recordingDuration}s, ${kb} KB)` : ` (${kb} KB)`
+      }. Ready for instant playback.`,
+      data: {
+        recordingUrl: session.recordingUrl,
+        duration: session.recordingDuration,
+        sizeBytes: stat.size,
+      },
+    });
+  } else {
+    persistSessionsToDisk();
+    broadcastEvent(session.id, 'session-update', session);
+  }
+}
+
+async function downloadAndCacheRecording(session: CallSession, rawUrl: string): Promise<string | null> {
+  if (inFlightDownloads.has(session.id)) {
+    return inFlightDownloads.get(session.id)!;
+  }
+
+  const job = (async (): Promise<string | null> => {
+    try {
+      const candidateUrls = buildRecordingCandidateUrls(rawUrl, session.carrier);
+      const authHeader = resolveCarrierAuthHeader(session);
+      const retryDelays = [0, 450, 1000, 1800];
+
+      let downloadedBuf: Buffer | null = null;
+      let contentType = '';
+
+      for (const delay of retryDelays) {
+        if (delay > 0) await sleep(delay);
+
+        for (const downloadUrl of candidateUrls) {
+          const headers: Record<string, string> = {};
+          if (
+            authHeader &&
+            (downloadUrl.includes('twilio.com') ||
+              downloadUrl.includes('signalwire.com') ||
+              downloadUrl.includes('plivo.com'))
+          ) {
+            headers.Authorization = authHeader;
+          }
+
+          try {
+            const res = await fetch(downloadUrl, { headers });
+            if (res.ok) {
+              const arrayBuf = await res.arrayBuffer();
+              if (arrayBuf.byteLength > 128) {
+                downloadedBuf = Buffer.from(arrayBuf);
+                contentType = (res.headers.get('content-type') || '').toLowerCase();
+                break;
+              }
+            }
+          } catch {
+            // Try next candidate or retry tick
+          }
+        }
+
+        if (downloadedBuf) break;
+      }
+
+      if (!downloadedBuf) {
+        console.error(`Recording download exhausted retries for ${session.id}`);
+        return null;
+      }
+
+      const rawExt = contentType.includes('wav')
+        ? 'wav'
+        : contentType.includes('webm')
+        ? 'webm'
+        : contentType.includes('ogg')
+        ? 'ogg'
+        : 'mp3';
+
+      const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+      const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
+
+      const transcoded = await transcodeToCompactHdMp3(downloadedBuf, rawExt, mp3OutPath);
+      if (transcoded.ok) {
+        markRecordingCompleted(session, mp3OutPath, 'mp3', transcoded.durationSec);
+        return mp3OutPath;
+      }
+
+      // Fallback: save raw buffer directly if ffmpeg failed
+      const fallbackPath = path.join(RECORDINGS_DIR, `${safeId}.${rawExt}`);
+      fs.writeFileSync(fallbackPath, downloadedBuf);
+      markRecordingCompleted(session, fallbackPath, rawExt);
+      return fallbackPath;
+    } catch (err) {
+      console.error('Error caching carrier recording:', err);
+      return null;
+    } finally {
+      inFlightDownloads.delete(session.id);
+    }
+  })();
+
+  inFlightDownloads.set(session.id, job);
+  return job;
+}
+
+// Actively stops/fetches/finalizes call recording immediately upon call completion so UI never hangs on 'Recording...'
+async function finalizeCallRecording(
+  session: CallSession,
+  customTwilio?: any,
+  carriersConfig: any = {}
+): Promise<void> {
+  if (session.recordCall === false) {
+    if (session.recordingStatus === 'recording') {
+      session.recordingStatus = undefined;
+      persistSessionsToDisk();
+      broadcastEvent(session.id, 'session-update', session);
+    }
+    return;
+  }
+
+  // Already cached and finalized
+  const existing = findCachedRecordingPath(session.id);
+  if (existing) {
+    const ext = path.extname(existing.filePath).replace('.', '') || 'mp3';
+    markRecordingCompleted(session, existing.filePath, ext, session.recordingDuration);
+    return;
+  }
+
+  if (inFlightFinalizers.has(session.id)) {
+    return inFlightFinalizers.get(session.id)!;
+  }
+
+  const task = (async () => {
+    try {
+      // 1. SIMULATOR CALLS: Wait briefly for browser auto-upload, then clear if none (e.g. declined before answer)
+      if (session.isSimulated) {
+        for (const waitMs of [200, 500, 900, 1400]) {
+          await sleep(waitMs);
+          const simCached = findCachedRecordingPath(session.id);
+          if (simCached) {
+            const ext = path.extname(simCached.filePath).replace('.', '') || 'mp3';
+            markRecordingCompleted(session, simCached.filePath, ext, session.recordingDuration);
+            return;
+          }
+        }
+        if (session.recordingStatus === 'recording' && !session.recordingUrl) {
+          session.recordingStatus = undefined;
+          persistSessionsToDisk();
+          broadcastEvent(session.id, 'session-update', session);
+        }
+        return;
+      }
+
+      // 2. LIVE CARRIER CALLS: Actively poll carrier REST API right after call ends
+      const carrier = session.carrier || 'twilio';
+      const providerSid = session.providerCallSid || '';
+      const savedCreds = getCallCredentials(session.id);
+
+      const wasNeverAnswered =
+        ['busy', 'no-answer', 'failed'].includes(session.status) &&
+        !session.answeredBy &&
+        (!session.duration || session.duration === 0);
+
+      const pollDelays = wasNeverAnswered
+        ? [350]
+        : [150, 600, 1200, 2200, 3500, 5200];
+
+      for (const delayMs of pollDelays) {
+        await sleep(delayMs);
+
+        const nowCached = findCachedRecordingPath(session.id);
+        if (nowCached) {
+          const ext = path.extname(nowCached.filePath).replace('.', '') || 'mp3';
+          markRecordingCompleted(session, nowCached.filePath, ext, session.recordingDuration);
+          return;
+        }
+
+        if (session.providerRecordingUrl) {
+          const saved = await downloadAndCacheRecording(session, session.providerRecordingUrl);
+          if (saved) return;
+        }
+
+        if (carrier === 'twilio' && providerSid.startsWith('CA')) {
+          const sid =
+            carriersConfig.twilio?.accountSid ||
+            customTwilio?.accountSid ||
+            savedCreds?.twilioSid ||
+            process.env.TWILIO_ACCOUNT_SID;
+          const token =
+            carriersConfig.twilio?.authToken ||
+            customTwilio?.authToken ||
+            savedCreds?.twilioToken ||
+            process.env.TWILIO_AUTH_TOKEN;
+
+          if (sid && token) {
+            try {
+              const client = twilio(sid, token);
+              const list = await client.recordings.list({ callSid: providerSid, limit: 5 });
+              if (list.length > 0) {
+                const rec = list[0];
+                session.recordingSid = rec.sid;
+                if (rec.duration && rec.duration !== '-1') {
+                  const parsedDur = parseInt(rec.duration, 10);
+                  if (!Number.isNaN(parsedDur) && parsedDur > 0) {
+                    session.recordingDuration = parsedDur;
+                  }
+                }
+
+                if ((rec.status as string) === 'in-progress') {
+                  await client
+                    .calls(providerSid)
+                    .recordings(rec.sid)
+                    .update({ status: 'stopped' })
+                    .catch(() => {});
+                  continue;
+                }
+
+                if ((rec.status as string) === 'completed') {
+                  const wavUrl = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Recordings/${rec.sid}.wav?RequestedChannels=1`;
+                  session.providerRecordingUrl = wavUrl;
+                  const saved = await downloadAndCacheRecording(session, wavUrl);
+                  if (saved) return;
+                }
+              }
+            } catch (err) {
+              console.error('Twilio active recording poll error:', err);
+            }
+          }
+        } else if (carrier === 'signalwire' && providerSid && !providerSid.startsWith('call_')) {
+          const spaceUrl =
+            carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
+          const projectId =
+            carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
+          const apiToken =
+            carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+          if (spaceUrl && projectId && apiToken) {
+            try {
+              const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
+              const swAuth = `Basic ${Buffer.from(`${projectId}:${apiToken}`).toString('base64')}`;
+              const r = await fetch(
+                `https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Calls/${encodeURIComponent(providerSid)}/Recordings.json`,
+                { headers: { Authorization: swAuth } }
+              );
+              if (r.ok) {
+                const data: any = await r.json();
+                const rec = data?.recordings?.[0];
+                if (rec?.sid && (!rec.status || rec.status === 'completed')) {
+                  const wavUrl = `https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Recordings/${rec.sid}.wav`;
+                  session.providerRecordingUrl = wavUrl;
+                  const saved = await downloadAndCacheRecording(session, wavUrl);
+                  if (saved) return;
+                }
+              }
+            } catch {}
+          }
+        } else if (carrier === 'plivo' && providerSid && !providerSid.startsWith('call_')) {
+          const plivoId =
+            carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
+          const plivoToken =
+            carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+          if (plivoId && plivoToken) {
+            try {
+              const plivoAuth = `Basic ${Buffer.from(`${plivoId}:${plivoToken}`).toString('base64')}`;
+              const r = await fetch(
+                `https://api.plivo.com/v1/Account/${plivoId}/Recording/?call_uuid=${encodeURIComponent(providerSid)}&limit=5`,
+                { headers: { Authorization: plivoAuth } }
+              );
+              if (r.ok) {
+                const data: any = await r.json();
+                const rec = data?.objects?.[0];
+                if (rec?.recording_url) {
+                  session.providerRecordingUrl = rec.recording_url;
+                  if (rec.recording_duration_ms) {
+                    session.recordingDuration = Math.max(1, Math.round(Number(rec.recording_duration_ms) / 1000));
+                  }
+                  const saved = await downloadAndCacheRecording(session, rec.recording_url);
+                  if (saved) return;
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // If no recording exists after polling completed (e.g. unanswered/0s call), clear stuck 'recording' badge!
+      if (!findCachedRecordingPath(session.id) && session.recordingStatus === 'recording') {
+        session.recordingStatus = undefined;
+        persistSessionsToDisk();
+        broadcastEvent(session.id, 'session-update', session);
+      }
+    } finally {
+      inFlightFinalizers.delete(session.id);
+    }
+  })();
+
+  inFlightFinalizers.set(session.id, task);
+  return task;
 }
 
 // -------------------------------------------------------------
@@ -798,6 +1663,22 @@ const XML_STATUS_ROUTES = [
   '/api/fonoster/status',
 ];
 
+const XML_AMD_ROUTES = [
+  '/api/twiml/amd',
+  '/api/telnyx/amd',
+  '/api/signalwire/amd',
+  '/api/fonoster/amd',
+  '/api/plivo/amd',
+];
+
+const XML_RECORDING_ROUTES = [
+  '/api/twiml/recording',
+  '/api/telnyx/recording',
+  '/api/signalwire/recording',
+  '/api/fonoster/recording',
+  '/api/plivo/recording',
+];
+
 // 1. XML Outbound Webhook - Recipient Answered
 app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
@@ -817,11 +1698,24 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
     providerSidToCallId.set(incomingSid.trim(), session.id);
   }
 
+  // Check if AnsweredBy was already included on outbound callback
+  const rawAnsweredBy = req.body?.AnsweredBy || req.query?.AnsweredBy;
+  const parsedAmd = parseAnsweredBy(rawAnsweredBy);
+  if (parsedAmd) {
+    void applyAmdResult(session, parsedAmd, String(rawAnsweredBy));
+    if (parsedAmd === 'voicemail' && session.autoHangupOnVoicemail) {
+      twiml.hangup();
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    }
+  }
+
   session.status = 'in-progress';
   addSessionEvent(session, {
     type: 'call-state',
     title: 'Recipient Answered Call',
-    description: `Call connected with ${session.to}. Playing immediate pickup greeting.`,
+    description: `Call connected with ${session.to}. Playing immediate pickup greeting & listening for voice/DTMF.`,
   });
 
   addSessionEvent(session, {
@@ -839,7 +1733,8 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   const gather = twiml.gather({
     action: gatherActionUrl,
     method: 'POST',
-    input: ['dtmf'],
+    input: ['dtmf', 'speech'],
+    speechTimeout: 'auto',
     numDigits: session.numDigits || 6,
     finishOnKey: '#',
     timeout: 25,
@@ -850,7 +1745,8 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   const gatherSecondChance = twiml.gather({
     action: gatherActionUrl,
     method: 'POST',
-    input: ['dtmf'],
+    input: ['dtmf', 'speech'],
+    speechTimeout: 'auto',
     numDigits: session.numDigits || 6,
     finishOnKey: '#',
     timeout: 20,
@@ -866,15 +1762,15 @@ app.all(XML_OUTBOUND_ROUTES, (req: Request, res: Response) => {
   session.status = 'collecting-input';
   addSessionEvent(session, {
     type: 'gather',
-    title: `Listening for ${session.numDigits}-Digit Code`,
-    description: `Gather verb active. Expecting ${session.numDigits} digits.`,
+    title: `Listening for ${session.numDigits}-Digit Code & Live Voice`,
+    description: `Gather verb active for keypad digits (${session.numDigits}) and caller speech.`,
   });
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// 1b. Live Operator Cue during Gather - Speaks operator cue and resumes listening for DTMF
+// 1b. Live Operator Cue during Gather - Speaks operator cue and resumes listening for DTMF & Speech
 app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
   const twiml = new twilio.twiml.VoiceResponse();
@@ -899,7 +1795,8 @@ app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
   const gather = twiml.gather({
     action: gatherActionUrl,
     method: 'POST',
-    input: ['dtmf'],
+    input: ['dtmf', 'speech'],
+    speechTimeout: 'auto',
     numDigits: session.numDigits || 6,
     finishOnKey: '#',
     timeout: 25,
@@ -915,134 +1812,228 @@ app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
   res.send(twiml.toString());
 });
 
-// 2. XML Gather Callback - DTMF Code Entered
+// 2. XML Gather Callback - Captures Speech AND/OR Keypad Digits
+//    CRITICAL RULE: ONLY play holdMessage ("Kindly hold while your information is being processed.")
+//    AFTER the full keypad code has been inputted by the user!
 app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
-  const digits = req.body.Digits || req.query.Digits;
+  const rawDigitsParam = req.body.Digits ?? req.query.Digits;
+  const speechParam = req.body.SpeechResult || req.body.Speech || req.query.SpeechResult;
+  const confidenceParam = req.body.Confidence ? parseFloat(req.body.Confidence) : undefined;
   const twiml = new twilio.twiml.VoiceResponse();
   const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
   const matchedWaitBase = XML_WAIT_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/wait-operator';
   const matchedGatherBase = XML_GATHER_ROUTES.find((r) => req.path.includes(r.split('/')[2])) || '/api/twiml/gather';
 
-  if (session && digits) {
-    const rawDigits = String(digits).trim();
+  if (!session) {
+    twiml.say({ voice: 'Polly.Joanna' }, 'Thank you. Goodbye.');
+    twiml.hangup();
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
 
-    // 1. MANUAL OPERATOR REVIEW MODE (Default)
-    if (session.verificationMode === 'manual') {
-      session.pendingDigits = rawDigits;
-      session.codeStatus = 'awaiting_operator';
-      session.status = 'awaiting-operator';
-      session.operatorDecision = 'pending';
+  const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
+  const expectedLen = session.numDigits || 6;
 
+  // Record any spoken words uttered by the caller
+  if (typeof speechParam === 'string' && speechParam.trim()) {
+    appendSpeechTranscript(session, speechParam, confidenceParam);
+  }
+
+  const rawDigits = rawDigitsParam ? String(rawDigitsParam).replace(/\D/g, '') : '';
+
+  // Case A: Caller ONLY spoke (no keypad digits pressed yet) -> DO NOT play holdMessage! Keep listening for keypad code & speech
+  if (!rawDigits) {
+    session.status = 'collecting-input';
+    persistSessionsToDisk();
+
+    const gatherContinue = twiml.gather({
+      action: gatherActionUrl,
+      method: 'POST',
+      input: ['dtmf', 'speech'],
+      speechTimeout: 'auto',
+      numDigits: expectedLen,
+      finishOnKey: '#',
+      timeout: 25,
+    });
+    gatherContinue.pause({ length: 1 });
+
+    const gatherReminder = twiml.gather({
+      action: gatherActionUrl,
+      method: 'POST',
+      input: ['dtmf', 'speech'],
+      speechTimeout: 'auto',
+      numDigits: expectedLen,
+      finishOnKey: '#',
+      timeout: 20,
+    });
+    gatherReminder.say({ voice: session.voice as any }, session.script);
+
+    twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
+    twiml.hangup();
+
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Case B: Caller started typing digits, but paused before entering all expected digits -> DO NOT play holdMessage yet!
+  if (rawDigits.length < expectedLen) {
+    session.status = 'collecting-input';
+    addSessionEvent(session, {
+      type: 'dtmf',
+      title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
+      description: `Caller entered ${rawDigits.length} of ${expectedLen} digits. Prompting for full ${expectedLen}-digit code before placing on hold.`,
+      data: { partialDigits: rawDigits, expectedLen },
+    });
+
+    const gatherFull = twiml.gather({
+      action: gatherActionUrl,
+      method: 'POST',
+      input: ['dtmf', 'speech'],
+      speechTimeout: 'auto',
+      numDigits: expectedLen,
+      finishOnKey: '#',
+      timeout: 25,
+    });
+    gatherFull.say(
+      { voice: session.voice as any },
+      `We received ${rawDigits.length} digits. Please enter your full ${expectedLen}-digit code on your keypad now, followed by the pound sign.`
+    );
+
+    twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
+    twiml.hangup();
+
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // Case C: Full keypad code HAS been inputted by user!
+  const enteredCode = rawDigits.slice(0, expectedLen);
+
+  // 1. MANUAL OPERATOR REVIEW MODE (Default) -> NOW play "Kindly hold while your information is being processed."
+  if (session.verificationMode === 'manual') {
+    session.pendingDigits = enteredCode;
+    session.codeStatus = 'awaiting_operator';
+    session.status = 'awaiting-operator';
+    session.operatorDecision = 'pending';
+
+    addSessionEvent(session, {
+      type: 'dtmf',
+      title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
+      description: `Recipient inputted ${enteredCode.length}-digit code. Playing post-code hold message while operator reviews.`,
+      data: { digits: enteredCode, verificationMode: 'manual' },
+    });
+
+    const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
+    const waitUrl = `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`;
+    session.waitPollCount = 0;
+    persistSessionsToDisk();
+
+    twiml.say({ voice: session.voice as any }, holdPrompt);
+    const holdGather = twiml.gather({
+      action: waitUrl,
+      method: 'POST',
+      input: ['speech'],
+      speechTimeout: 'auto',
+      timeout: 2,
+    });
+    holdGather.pause({ length: 2 });
+    twiml.redirect({ method: 'POST' }, waitUrl);
+
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
+  // 2. AUTOMATIC CODE MATCH MODE
+  const isValid = !session.expectedCode || enteredCode === session.expectedCode.trim();
+
+  if (!isValid) {
+    session.attempts = (session.attempts || 0) + 1;
+    session.lastInvalidDigits = enteredCode;
+    session.codeStatus = 'invalid';
+
+    const maxAttempts = session.maxAttempts || 3;
+
+    if (session.attempts < maxAttempts) {
       addSessionEvent(session, {
-        type: 'dtmf',
-        title: `Code Received: [${rawDigits}] — Awaiting Operator Decision`,
-        description: `Recipient entered ${rawDigits.length}-digit code. Playing hold message while dashboard operator reviews.`,
-        data: { digits: rawDigits, verificationMode: 'manual' },
+        type: 'error',
+        title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${enteredCode}]`,
+        description: `Entered code "${enteredCode}" does not match expected "${session.expectedCode}". Playing retry voice prompt.`,
+        data: { entered: enteredCode, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
       });
 
-      const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
-      session.waitPollCount = 0;
-      persistSessionsToDisk();
-      twiml.say({ voice: session.voice as any }, holdPrompt);
-      twiml.pause({ length: 2 });
-      twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
+      twiml.say({ voice: session.voice as any }, session.invalidMessage || 'That code is incorrect. Please try again.');
+
+      const gatherRetry = twiml.gather({
+        action: gatherActionUrl,
+        method: 'POST',
+        input: ['dtmf', 'speech'],
+        speechTimeout: 'auto',
+        numDigits: expectedLen,
+        finishOnKey: '#',
+        timeout: 20,
+      });
+      gatherRetry.say({ voice: session.voice as any }, `Please enter your ${expectedLen}-digit code now, followed by the pound sign.`);
+
+      twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
+      twiml.hangup();
+
+      session.status = 'collecting-input';
+      res.type('text/xml');
+      return res.send(twiml.toString());
+    } else {
+      session.status = 'failed';
+      session.codeStatus = 'max_exceeded';
+      session.completedAt = new Date().toISOString();
+
+      addSessionEvent(session, {
+        type: 'error',
+        title: 'Verification Failed: Maximum Attempts Exceeded',
+        description: `Recipient entered incorrect code ${session.attempts} times. Terminating call.`,
+        data: { attempts: session.attempts, maxAttempts },
+      });
+
+      twiml.say({ voice: session.voice as any }, 'Maximum incorrect attempts exceeded. Goodbye.');
+      twiml.hangup();
+      void finalizeCallRecording(session);
 
       res.type('text/xml');
       return res.send(twiml.toString());
     }
-
-    // 2. AUTOMATIC CODE MATCH MODE
-    const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
-    const isValid = !session.expectedCode || rawDigits === session.expectedCode.trim();
-
-    if (!isValid) {
-      session.attempts = (session.attempts || 0) + 1;
-      session.lastInvalidDigits = rawDigits;
-      session.codeStatus = 'invalid';
-
-      const maxAttempts = session.maxAttempts || 3;
-
-      if (session.attempts < maxAttempts) {
-        addSessionEvent(session, {
-          type: 'error',
-          title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${rawDigits}]`,
-          description: `Entered code "${rawDigits}" does not match expected "${session.expectedCode}". Playing retry voice prompt.`,
-          data: { entered: rawDigits, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
-        });
-
-        twiml.say({ voice: session.voice as any }, session.invalidMessage || 'That code is incorrect. Please try again.');
-
-        const gatherRetry = twiml.gather({
-          action: gatherActionUrl,
-          method: 'POST',
-          input: ['dtmf'],
-          numDigits: session.numDigits || 6,
-          finishOnKey: '#',
-          timeout: 15,
-        });
-        gatherRetry.say({ voice: session.voice as any }, `Please enter your ${session.numDigits}-digit code now, followed by the pound sign.`);
-
-        twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
-        twiml.hangup();
-
-        session.status = 'collecting-input';
-        res.type('text/xml');
-        return res.send(twiml.toString());
-      } else {
-        session.status = 'failed';
-        session.codeStatus = 'max_exceeded';
-        session.completedAt = new Date().toISOString();
-
-        addSessionEvent(session, {
-          type: 'error',
-          title: 'Verification Failed: Maximum Attempts Exceeded',
-          description: `Recipient entered incorrect code ${session.attempts} times. Terminating call.`,
-          data: { attempts: session.attempts, maxAttempts },
-        });
-
-        twiml.say({ voice: session.voice as any }, 'Maximum incorrect attempts exceeded. Goodbye.');
-        twiml.hangup();
-
-        res.type('text/xml');
-        return res.send(twiml.toString());
-      }
-    }
-
-    // AUTO VALID
-    session.capturedDigits = rawDigits;
-    session.codeStatus = 'valid';
-    session.status = 'completed';
-    session.completedAt = new Date().toISOString();
-
-    addSessionEvent(session, {
-      type: 'dtmf',
-      title: `Code Verified Valid: [${rawDigits}]`,
-      description: `Recipient entered valid ${rawDigits.length}-digit code [${rawDigits}]. Playing confirmation message.`,
-      data: { digits: rawDigits, expected: session.expectedCode },
-    });
-
-    const confMsg = session.successMessage || 'Thank you. Your code has been verified successfully. Goodbye.';
-    twiml.say({ voice: session.voice as any }, confMsg);
-    twiml.hangup();
-
-    addSessionEvent(session, {
-      type: 'playback',
-      title: 'Confirmation Voice Prompt Played',
-      description: `Playing synthetic voice (${session.voice}): "${confMsg}"`,
-      data: { message: confMsg },
-    });
-  } else {
-    twiml.say({ voice: 'Polly.Joanna' }, 'Thank you. Goodbye.');
-    twiml.hangup();
   }
+
+  // AUTO VALID
+  session.capturedDigits = enteredCode;
+  session.codeStatus = 'valid';
+  session.status = 'completed';
+  session.completedAt = new Date().toISOString();
+
+  addSessionEvent(session, {
+    type: 'dtmf',
+    title: `Code Verified Valid: [${enteredCode}]`,
+    description: `Recipient entered valid ${enteredCode.length}-digit code [${enteredCode}]. Playing confirmation message.`,
+    data: { digits: enteredCode, expected: session.expectedCode },
+  });
+
+  const confMsg = session.successMessage || 'Thank you. Your code has been verified successfully. Goodbye.';
+  twiml.say({ voice: session.voice as any }, confMsg);
+  twiml.hangup();
+
+  addSessionEvent(session, {
+    type: 'playback',
+    title: 'Confirmation Voice Prompt Played',
+    description: `Playing synthetic voice (${session.voice}): "${confMsg}"`,
+    data: { message: confMsg },
+  });
+
+  void finalizeCallRecording(session);
 
   res.type('text/xml');
   res.send(twiml.toString());
 });
 
-// 3. XML Wait Operator Loop
+// 3. XML Wait Operator Loop (Listens for Caller Speech while Polling Operator Decision)
 app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
   const twiml = new twilio.twiml.VoiceResponse();
@@ -1058,14 +2049,43 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
     return res.send(twiml.toString());
   }
 
+  // Capture any speech spoken by caller while waiting on hold
+  const holdSpeech = req.body?.SpeechResult || req.query?.SpeechResult;
+  const holdConfidence = req.body?.Confidence ? parseFloat(req.body.Confidence) : undefined;
+  if (typeof holdSpeech === 'string' && holdSpeech.trim()) {
+    appendSpeechTranscript(session, holdSpeech, holdConfidence, 'On Hold');
+  }
+
+  const waitUrl = `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`;
+  const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
+
+  // Safety guard: never stay in hold loop if no keypad code has been submitted yet
+  if (
+    !session.pendingDigits &&
+    !session.capturedDigits &&
+    session.operatorDecision !== 'approved' &&
+    session.operatorDecision !== 'rejected'
+  ) {
+    twiml.redirect({ method: 'POST' }, gatherActionUrl);
+    res.type('text/xml');
+    return res.send(twiml.toString());
+  }
+
   // 1. Spoken cue from operator
   if (session.activeCue) {
     const cueMsg = session.activeCue.text;
     session.activeCue = undefined;
     persistSessionsToDisk();
     twiml.say({ voice: session.voice as any }, cueMsg);
-    twiml.pause({ length: 2 });
-    twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
+    const cueListen = twiml.gather({
+      action: waitUrl,
+      method: 'POST',
+      input: ['speech'],
+      speechTimeout: 'auto',
+      timeout: 2,
+    });
+    cueListen.pause({ length: 2 });
+    twiml.redirect({ method: 'POST' }, waitUrl);
     res.type('text/xml');
     return res.send(twiml.toString());
   }
@@ -1088,6 +2108,8 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
       description: `Playing synthetic voice: "${confMsg}"`,
     });
 
+    void finalizeCallRecording(session);
+
     res.type('text/xml');
     return res.send(twiml.toString());
   }
@@ -1098,14 +2120,14 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
     session.status = 'collecting-input';
     persistSessionsToDisk();
 
-    const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
     const retryMsg = session.invalidMessage || 'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
     twiml.say({ voice: session.voice as any }, retryMsg);
 
     const gatherRetry = twiml.gather({
       action: gatherActionUrl,
       method: 'POST',
-      input: ['dtmf'],
+      input: ['dtmf', 'speech'],
+      speechTimeout: 'auto',
       numDigits: session.numDigits || 6,
       finishOnKey: '#',
       timeout: 25,
@@ -1119,14 +2141,21 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
     return res.send(twiml.toString());
   }
 
-  // 4. Fast 2-second hold poll loop (speaks comfort reminder once every ~12s)
+  // 4. Fast 2-second hold poll loop with active speech listening
   session.waitPollCount = (session.waitPollCount || 0) + 1;
   persistSessionsToDisk();
   if (session.waitPollCount % 6 === 0) {
     twiml.say({ voice: session.voice as any }, 'Thank you for your patience. Please continue to hold.');
   }
-  twiml.pause({ length: 2 });
-  twiml.redirect({ method: 'POST' }, `${appBaseUrl}${matchedWaitBase}?callId=${encodeURIComponent(session.id)}`);
+  const waitGather = twiml.gather({
+    action: waitUrl,
+    method: 'POST',
+    input: ['speech'],
+    speechTimeout: 'auto',
+    timeout: 2,
+  });
+  waitGather.pause({ length: 2 });
+  twiml.redirect({ method: 'POST' }, waitUrl);
 
   res.type('text/xml');
   res.send(twiml.toString());
@@ -1139,6 +2168,11 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
   if (session) {
     const callStatus = req.body.CallStatus || req.body.call_status;
     const duration = req.body.CallDuration ? parseInt(req.body.CallDuration, 10) : undefined;
+    const rawAnsweredBy = req.body.AnsweredBy || req.body.machine_detection_result;
+    const parsedAmd = parseAnsweredBy(rawAnsweredBy);
+    if (parsedAmd) {
+      void applyAmdResult(session, parsedAmd, String(rawAnsweredBy));
+    }
 
     if (duration !== undefined) session.duration = duration;
 
@@ -1171,6 +2205,7 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
         description: `Session finished. Duration: ${duration || 0} seconds.`,
         data: { duration },
       });
+      void finalizeCallRecording(session);
     } else if (['busy', 'no-answer', 'failed', 'canceled'].includes(callStatus)) {
       session.status = (callStatus === 'canceled' ? 'completed' : callStatus) as any;
       session.pendingDigits = undefined;
@@ -1181,10 +2216,219 @@ app.all(XML_STATUS_ROUTES, (req: Request, res: Response) => {
         title: `Call Ended (${callStatus})`,
         description: `Carrier returned status: ${callStatus}.`,
       });
+      void finalizeCallRecording(session);
     }
   }
 
   res.sendStatus(200);
+});
+
+// 5. Answering Machine Detection (AMD) Callback (Twilio, Plivo, Telnyx, SignalWire)
+app.all(XML_AMD_ROUTES, async (req: Request, res: Response) => {
+  const session = findSession(req);
+  if (session) {
+    const rawAnsweredBy =
+      req.body?.AnsweredBy ||
+      req.body?.machine_detection_result ||
+      req.body?.data?.payload?.result ||
+      req.query?.AnsweredBy;
+    const plivoMachine = req.body?.Machine ?? req.query?.Machine;
+    const parsed = parseAnsweredBy(rawAnsweredBy, plivoMachine);
+    if (parsed) {
+      await applyAmdResult(
+        session,
+        parsed,
+        String(rawAnsweredBy || (plivoMachine === 'true' ? 'plivo_machine' : 'plivo_human'))
+      );
+    }
+  }
+  res.sendStatus(200);
+});
+
+// 6. Call Recording Status Callback (Twilio, Plivo, Telnyx, SignalWire)
+app.all(XML_RECORDING_ROUTES, async (req: Request, res: Response) => {
+  const session = findSession(req);
+  if (session) {
+    const recUrl =
+      req.body?.RecordingUrl ||
+      req.body?.RecordUrl ||
+      req.body?.recording_urls?.wav ||
+      req.body?.recording_urls?.mp3 ||
+      req.body?.data?.payload?.recording_urls?.wav ||
+      req.body?.data?.payload?.recording_urls?.mp3 ||
+      req.query?.RecordingUrl;
+    const recSid = req.body?.RecordingSid || req.body?.RecordingID || req.body?.recording_id;
+    const recStatus = (req.body?.RecordingStatus || req.body?.status || '').toLowerCase();
+    const recDurationRaw = req.body?.RecordingDuration || req.body?.Duration;
+    const recDuration = recDurationRaw ? parseInt(String(recDurationRaw), 10) : undefined;
+
+    if (recSid) session.recordingSid = String(recSid);
+    if (recDuration !== undefined && !Number.isNaN(recDuration) && recDuration > 0) {
+      session.recordingDuration = recDuration;
+    }
+
+    if (recStatus === 'absent' || recStatus === 'failed') {
+      if (!findCachedRecordingPath(session.id)) {
+        session.recordingStatus = undefined;
+        persistSessionsToDisk();
+        broadcastEvent(session.id, 'session-update', session);
+      }
+    } else if (recStatus === 'in-progress') {
+      if (!findCachedRecordingPath(session.id) && !['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {
+        session.recordingStatus = 'recording';
+        persistSessionsToDisk();
+        broadcastEvent(session.id, 'session-update', session);
+      }
+    } else if (recUrl && (recStatus === 'completed' || !recStatus || req.body?.RecordUrl)) {
+      session.providerRecordingUrl = String(recUrl);
+      await downloadAndCacheRecording(session, String(recUrl));
+    }
+  }
+  res.sendStatus(200);
+});
+
+// 7. Stream / Proxy Call Audio Recording for Instant Playback in Call History
+app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
+  const session = getSessionById(req.params.callId);
+  const safeId = req.params.callId;
+
+  // 1. Serve cached local file with full HTTP byte-range support
+  let cached = findCachedRecordingPath(safeId);
+
+  // 2. If not cached yet, try downloading from providerRecordingUrl or querying Twilio Recordings API
+  if (!cached && session) {
+    let remoteUrl = session.providerRecordingUrl;
+
+    if (!remoteUrl && session.carrier === 'twilio' && session.providerCallSid?.startsWith('CA')) {
+      try {
+        const creds = getCallCredentials(session.id);
+        const sid = creds?.twilioSid || process.env.TWILIO_ACCOUNT_SID;
+        const token = creds?.twilioToken || process.env.TWILIO_AUTH_TOKEN;
+        if (sid && token) {
+          const client = twilio(sid, token);
+          const list = await client.recordings.list({ callSid: session.providerCallSid, limit: 1 });
+          if (list.length > 0) {
+            remoteUrl = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Recordings/${list[0].sid}.wav?RequestedChannels=1`;
+            session.providerRecordingUrl = remoteUrl;
+            session.recordingSid = list[0].sid;
+            if (list[0].duration) session.recordingDuration = parseInt(list[0].duration, 10) || undefined;
+          }
+        }
+      } catch (err) {
+        console.error('Error looking up Twilio recording:', err);
+      }
+    }
+
+    if (remoteUrl) {
+      await downloadAndCacheRecording(session, remoteUrl);
+      cached = findCachedRecordingPath(session.id);
+    }
+  }
+
+  if (!cached) {
+    return res.status(404).json({ error: 'Call recording not available yet.' });
+  }
+
+  const stat = fs.statSync(cached.filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (req.query.download === '1') {
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="voicedrop-${safeId}${path.extname(cached.filePath)}"`
+    );
+  }
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunkSize = end - start + 1;
+    const stream = fs.createReadStream(cached.filePath, { start, end });
+    res.writeHead(206, {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': cached.mimeType,
+    });
+    stream.pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': fileSize,
+      'Accept-Ranges': 'bytes',
+      'Content-Type': cached.mimeType,
+    });
+    fs.createReadStream(cached.filePath).pipe(res);
+  }
+});
+
+// 8. Upload Browser Simulator Call / Microphone Recording (transcoded via ffmpeg to compact HD MP3)
+app.post('/api/calls/:callId/recording-upload', async (req: Request, res: Response) => {
+  const session = getSessionById(req.params.callId);
+  if (!session) {
+    return res.status(404).json({ error: 'Call session not found' });
+  }
+
+  const { audioBase64, mimeType = 'audio/webm', duration } = req.body || {};
+  if (!audioBase64 || typeof audioBase64 !== 'string') {
+    if (session.recordingStatus === 'recording' && !findCachedRecordingPath(session.id)) {
+      session.recordingStatus = undefined;
+      persistSessionsToDisk();
+      broadcastEvent(session.id, 'session-update', session);
+    }
+    return res.json({ success: true, cleared: true, session });
+  }
+
+  try {
+    const cleanBase64 = audioBase64.includes(',') ? audioBase64.split(',')[1] : audioBase64;
+    const buffer = Buffer.from(cleanBase64, 'base64');
+    if (buffer.length === 0) {
+      if (session.recordingStatus === 'recording' && !findCachedRecordingPath(session.id)) {
+        session.recordingStatus = undefined;
+        persistSessionsToDisk();
+        broadcastEvent(session.id, 'session-update', session);
+      }
+      return res.json({ success: true, cleared: true, session });
+    }
+
+    const lowerMime = String(mimeType).toLowerCase();
+    const rawExt = lowerMime.includes('mp4')
+      ? 'mp4'
+      : lowerMime.includes('ogg')
+      ? 'ogg'
+      : lowerMime.includes('wav')
+      ? 'wav'
+      : lowerMime.includes('mpeg') || lowerMime.includes('mp3')
+      ? 'mp3'
+      : 'webm';
+
+    const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
+    const hintDuration = typeof duration === 'number' && duration > 0 ? Math.round(duration) : undefined;
+    if (hintDuration) {
+      session.recordingDuration = hintDuration;
+    }
+
+    const transcoded = await transcodeToCompactHdMp3(buffer, rawExt, mp3OutPath);
+    if (transcoded.ok) {
+      markRecordingCompleted(session, mp3OutPath, 'mp3', hintDuration || transcoded.durationSec);
+    } else {
+      const outPath = path.join(RECORDINGS_DIR, `${safeId}.${rawExt}`);
+      fs.writeFileSync(outPath, buffer);
+      markRecordingCompleted(session, outPath, rawExt, hintDuration);
+    }
+
+    return res.json({
+      success: true,
+      session,
+      recordingUrl: session.recordingUrl,
+      recordingSizeBytes: session.recordingSizeBytes,
+    });
+  } catch (err: any) {
+    console.error('Simulator recording upload error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to save recording' });
+  }
 });
 
 // -------------------------------------------------------------
@@ -1204,6 +2448,17 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
 </Response>`);
   }
 
+  const plivoMachine = req.body?.Machine ?? req.query?.Machine;
+  const parsedAmd = parseAnsweredBy(undefined, plivoMachine);
+  if (parsedAmd) {
+    void applyAmdResult(session, parsedAmd, plivoMachine === 'true' ? 'plivo_machine' : 'plivo_human');
+    if (parsedAmd === 'voicemail' && session.autoHangupOnVoicemail) {
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>`);
+    }
+  }
+
   session.status = 'in-progress';
   addSessionEvent(session, {
     type: 'call-state',
@@ -1221,17 +2476,23 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
   session.status = 'collecting-input';
   addSessionEvent(session, {
     type: 'gather',
-    title: `Listening for ${session.numDigits}-Digit Code (Plivo)`,
-    description: `Plivo GetDigits active. Expecting ${session.numDigits} digits.`,
+    title: `Listening for ${session.numDigits}-Digit Code & Voice (Plivo)`,
+    description: `Plivo GetInput active for ${session.numDigits} digits & speech.`,
   });
 
   const gatherUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
+  const recCallbackUrl = `${appBaseUrl}/api/plivo/recording?callId=${encodeURIComponent(session.id)}`;
+  const recordTag =
+    session.recordCall !== false
+      ? `  <Record recordSession="true" fileFormat="wav" redirect="false" callbackUrl="${escapeXml(recCallbackUrl)}" callbackMethod="POST" />\n`
+      : '';
+
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak>${escapeXml(session.introGreeting)}</Speak>
-  <GetDigits action="${escapeXml(gatherUrl)}" method="POST" numDigits="${session.numDigits || 6}" finishOnKey="#" timeout="15">
+${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
     <Speak>${escapeXml(session.script)}</Speak>
-  </GetDigits>
+  </GetInput>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
   <Hangup />
 </Response>`;
@@ -1240,120 +2501,161 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
   res.send(xml);
 });
 
-// 2. Plivo Gather Callback
+// 2. Plivo Gather Callback (Strict post-code hold message rule + live speech capture)
 app.all('/api/plivo/gather', (req: Request, res: Response) => {
   const session = findSession(req);
-  const digits = req.body.Digits || req.query.Digits;
+  const digitsParam = req.body.Digits || req.query.Digits;
+  const speechParam = req.body.Speech || req.query.Speech;
   const appBaseUrl = getPublicBaseUrl(req, session?.publicBaseUrl);
 
-  if (session && digits) {
-    const rawDigits = String(digits).trim();
+  if (!session) {
+    res.type('text/xml');
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Speak>Thank you. Goodbye.</Speak><Hangup /></Response>`);
+  }
 
-    // 1. MANUAL OPERATOR REVIEW MODE
-    if (session.verificationMode === 'manual') {
-      session.pendingDigits = rawDigits;
-      session.codeStatus = 'awaiting_operator';
-      session.status = 'awaiting-operator';
-      session.operatorDecision = 'pending';
+  if (typeof speechParam === 'string' && speechParam.trim()) {
+    appendSpeechTranscript(session, speechParam);
+  }
 
-      addSessionEvent(session, {
-        type: 'dtmf',
-        title: `Code Received: [${rawDigits}] — Awaiting Operator Decision`,
-        description: `Caller entered ${rawDigits.length}-digit code. Playing hold message while dashboard operator reviews.`,
-        data: { digits: rawDigits, verificationMode: 'manual' },
-      });
+  const expectedLen = session.numDigits || 6;
+  const rawDigits = digitsParam ? String(digitsParam).replace(/\D/g, '') : '';
+  const gatherRetryUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
 
-      const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
-      const waitUrl = `${appBaseUrl}/api/plivo/wait-operator?callId=${encodeURIComponent(session.id)}`;
-      const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Speak>${escapeXml(holdPrompt)}</Speak>
-  <Wait length="4" />
-  <Redirect method="POST">${escapeXml(waitUrl)}</Redirect>
-</Response>`;
-      res.type('text/xml');
-      return res.send(xml);
-    }
-
-    // 2. AUTO MATCH MODE
-    const isValid = !session.expectedCode || rawDigits === session.expectedCode.trim();
-    if (!isValid) {
-      session.attempts = (session.attempts || 0) + 1;
-      session.lastInvalidDigits = rawDigits;
-      session.codeStatus = 'invalid';
-      const maxAttempts = session.maxAttempts || 3;
-
-      if (session.attempts < maxAttempts) {
-        addSessionEvent(session, {
-          type: 'error',
-          title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${rawDigits}]`,
-          description: `Entered code "${rawDigits}" does not match expected "${session.expectedCode}". Prompting retry.`,
-          data: { entered: rawDigits, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
-        });
-
-        const gatherRetryUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Speak>${escapeXml(session.invalidMessage || 'That code is incorrect. Please try again.')}</Speak>
-  <GetDigits action="${escapeXml(gatherRetryUrl)}" method="POST" numDigits="${session.numDigits || 6}" finishOnKey="#" timeout="15">
-    <Speak>Please enter your ${session.numDigits}-digit code now, followed by the pound sign.</Speak>
-  </GetDigits>
-  <Speak>We did not receive your code. Goodbye.</Speak>
-  <Hangup />
-</Response>`;
-        session.status = 'collecting-input';
-        res.type('text/xml');
-        return res.send(xml);
-      } else {
-        session.status = 'failed';
-        session.codeStatus = 'max_exceeded';
-        session.completedAt = new Date().toISOString();
-
-        addSessionEvent(session, {
-          type: 'error',
-          title: 'Verification Failed: Maximum Attempts Exceeded',
-          description: `Recipient entered incorrect code ${session.attempts} times. Terminating call.`,
-        });
-
-        const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Speak>Maximum incorrect attempts exceeded. Goodbye.</Speak>
-  <Hangup />
-</Response>`;
-        res.type('text/xml');
-        return res.send(xml);
-      }
-    }
-
-    // AUTO VALID
-    session.capturedDigits = rawDigits;
-    session.codeStatus = 'valid';
-    session.status = 'completed';
-    session.completedAt = new Date().toISOString();
-
-    addSessionEvent(session, {
-      type: 'dtmf',
-      title: `Code Verified Valid: [${rawDigits}]`,
-      description: `Recipient entered valid code [${rawDigits}]. Playing confirmation message.`,
-    });
-
-    const confMsg = session.successMessage || 'Thank you. Your code has been verified successfully. Goodbye.';
+  // Speech-only (no keypad digits yet) -> DO NOT play holdMessage
+  if (!rawDigits) {
+    session.status = 'collecting-input';
+    persistSessionsToDisk();
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak>${escapeXml(confMsg)}</Speak>
+  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
+    <Wait length="1" />
+  </GetInput>
+  <Speak>We did not receive your code. Goodbye.</Speak>
   <Hangup />
 </Response>`;
     res.type('text/xml');
     return res.send(xml);
   }
 
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  // Partial keypad digits -> DO NOT play holdMessage yet
+  if (rawDigits.length < expectedLen) {
+    session.status = 'collecting-input';
+    addSessionEvent(session, {
+      type: 'dtmf',
+      title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
+      description: `Caller entered ${rawDigits.length} of ${expectedLen} digits. Requesting full code before hold.`,
+    });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Speak>Thank you. Goodbye.</Speak>
+  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="25">
+    <Speak>We received ${rawDigits.length} digits. Please enter your full ${expectedLen}-digit code now, followed by the pound sign.</Speak>
+  </GetInput>
+  <Speak>We did not receive your code. Goodbye.</Speak>
   <Hangup />
 </Response>`;
+    res.type('text/xml');
+    return res.send(xml);
+  }
+
+  const enteredCode = rawDigits.slice(0, expectedLen);
+
+  // 1. MANUAL OPERATOR REVIEW MODE -> Play holdMessage ONLY now after full code input
+  if (session.verificationMode === 'manual') {
+    session.pendingDigits = enteredCode;
+    session.codeStatus = 'awaiting_operator';
+    session.status = 'awaiting-operator';
+    session.operatorDecision = 'pending';
+
+    addSessionEvent(session, {
+      type: 'dtmf',
+      title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
+      description: `Caller entered ${enteredCode.length}-digit code. Playing post-code hold message while dashboard operator reviews.`,
+      data: { digits: enteredCode, verificationMode: 'manual' },
+    });
+
+    const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
+    const waitUrl = `${appBaseUrl}/api/plivo/wait-operator?callId=${encodeURIComponent(session.id)}`;
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>${escapeXml(holdPrompt)}</Speak>
+  <Wait length="2" />
+  <Redirect method="POST">${escapeXml(waitUrl)}</Redirect>
+</Response>`;
+    res.type('text/xml');
+    return res.send(xml);
+  }
+
+  // 2. AUTO MATCH MODE
+  const isValid = !session.expectedCode || enteredCode === session.expectedCode.trim();
+  if (!isValid) {
+    session.attempts = (session.attempts || 0) + 1;
+    session.lastInvalidDigits = enteredCode;
+    session.codeStatus = 'invalid';
+    const maxAttempts = session.maxAttempts || 3;
+
+    if (session.attempts < maxAttempts) {
+      addSessionEvent(session, {
+        type: 'error',
+        title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${enteredCode}]`,
+        description: `Entered code "${enteredCode}" does not match expected "${session.expectedCode}". Prompting retry.`,
+        data: { entered: enteredCode, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
+      });
+
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>${escapeXml(session.invalidMessage || 'That code is incorrect. Please try again.')}</Speak>
+  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="20">
+    <Speak>Please enter your ${expectedLen}-digit code now, followed by the pound sign.</Speak>
+  </GetInput>
+  <Speak>We did not receive your code. Goodbye.</Speak>
+  <Hangup />
+</Response>`;
+      session.status = 'collecting-input';
+      res.type('text/xml');
+      return res.send(xml);
+    } else {
+      session.status = 'failed';
+      session.codeStatus = 'max_exceeded';
+      session.completedAt = new Date().toISOString();
+
+      addSessionEvent(session, {
+        type: 'error',
+        title: 'Verification Failed: Maximum Attempts Exceeded',
+        description: `Recipient entered incorrect code ${session.attempts} times. Terminating call.`,
+      });
+
+      const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>Maximum incorrect attempts exceeded. Goodbye.</Speak>
+  <Hangup />
+</Response>`;
+      void finalizeCallRecording(session);
+      res.type('text/xml');
+      return res.send(xml);
+    }
+  }
+
+  // AUTO VALID
+  session.capturedDigits = enteredCode;
+  session.codeStatus = 'valid';
+  session.status = 'completed';
+  session.completedAt = new Date().toISOString();
+
+  addSessionEvent(session, {
+    type: 'dtmf',
+    title: `Code Verified Valid: [${enteredCode}]`,
+    description: `Recipient entered valid code [${enteredCode}]. Playing confirmation message.`,
+  });
+
+  const confMsg = session.successMessage || 'Thank you. Your code has been verified successfully. Goodbye.';
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Speak>${escapeXml(confMsg)}</Speak>
+  <Hangup />
+</Response>`;
+  void finalizeCallRecording(session);
   res.type('text/xml');
-  res.send(xml);
+  return res.send(xml);
 });
 
 // 3. Plivo Wait Operator Loop
@@ -1370,6 +2672,10 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
 </Response>`);
   }
 
+  if (typeof req.body?.Speech === 'string' && req.body.Speech.trim()) {
+    appendSpeechTranscript(session, req.body.Speech, undefined, 'On Hold');
+  }
+
   // 1. Spoken cue from operator
   if (session.activeCue) {
     const cueMsg = session.activeCue.text;
@@ -1378,7 +2684,7 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(cueMsg)}</Speak>
-  <Wait length="3" />
+  <Wait length="2" />
   <Redirect method="POST">${escapeXml(waitUrl)}</Redirect>
 </Response>`;
     res.type('text/xml');
@@ -1405,6 +2711,7 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
   <Speak>${escapeXml(confMsg)}</Speak>
   <Hangup />
 </Response>`;
+    void finalizeCallRecording(session);
     res.type('text/xml');
     return res.send(xml);
   }
@@ -1419,9 +2726,9 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(retryMsg)}</Speak>
-  <GetDigits action="${escapeXml(gatherUrl)}" method="POST" numDigits="${session.numDigits || 6}" finishOnKey="#" timeout="15">
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="20">
     <Speak>Please enter your ${session.numDigits}-digit code now, followed by the pound sign.</Speak>
-  </GetDigits>
+  </GetInput>
   <Speak>We did not receive your code. Goodbye.</Speak>
   <Hangup />
 </Response>`;
@@ -1439,7 +2746,9 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
       : '';
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-${comfortLine}  <Wait length="2" />
+${comfortLine}  <GetInput action="${escapeXml(waitUrl)}" method="POST" inputType="speech" executionTimeout="2" speechEndTimeout="auto">
+    <Wait length="2" />
+  </GetInput>
   <Redirect method="POST">${escapeXml(waitUrl)}</Redirect>
 </Response>`;
   res.type('text/xml');
@@ -1462,6 +2771,11 @@ app.all('/api/plivo/status', (req: Request, res: Response) => {
         title: 'Call Completed (Plivo)',
         description: `Session finished. Duration: ${duration || 0} seconds.`,
       });
+      void finalizeCallRecording(session);
+    } else if (['busy', 'failed', 'no-answer', 'cancel'].includes(String(callStatus).toLowerCase())) {
+      session.status = 'failed';
+      session.completedAt = new Date().toISOString();
+      void finalizeCallRecording(session);
     }
   }
   res.sendStatus(200);
@@ -1489,6 +2803,7 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
       if (session.isSimulated) {
         session.status = 'completed';
         session.completedAt = new Date().toISOString();
+        void finalizeCallRecording(session);
       }
 
       addSessionEvent(session, {
@@ -1516,6 +2831,17 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
       break;
 
     case 'hold': {
+      const hasInputtedCode = Boolean(
+        session.pendingDigits ||
+          session.capturedDigits ||
+          session.lastInvalidDigits ||
+          session.status === 'awaiting-operator'
+      );
+      if (!hasInputtedCode) {
+        return res.status(400).json({
+          error: 'Hold message can only be played after the recipient has inputted their keypad code.',
+        });
+      }
       const holdText = customMessage || session.holdMessage || 'Kindly hold while your information is being processed.';
       session.activeCue = { text: holdText, timestamp: new Date().toISOString() };
       addSessionEvent(session, {
@@ -1569,8 +2895,17 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
 
     if (carrier === 'twilio' && providerSid.startsWith('CA')) {
       try {
-        const accountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
-        const authToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
+        const creds = getCallCredentials(session.id);
+        const accountSid =
+          carriersConfig.twilio?.accountSid ||
+          customTwilio?.accountSid ||
+          creds?.twilioSid ||
+          process.env.TWILIO_ACCOUNT_SID;
+        const authToken =
+          carriersConfig.twilio?.authToken ||
+          customTwilio?.authToken ||
+          creds?.twilioToken ||
+          process.env.TWILIO_AUTH_TOKEN;
         if (accountSid && authToken) {
           const client = twilio(accountSid, authToken);
           await client.calls(providerSid).update({
@@ -1588,8 +2923,8 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
 });
 
 // Simulator Action Webhook - Used by the interactive phone mockup in the browser
-app.post('/api/call/simulate-event', (req: Request, res: Response) => {
-  const { callId, action, digits } = req.body;
+app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
+  const { callId, action, digits, speech, confidence } = req.body;
   const session = getSessionById(callId);
 
   if (!session) {
@@ -1599,13 +2934,17 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
   switch (action) {
     case 'answer':
       session.status = 'in-progress';
+      if (session.recordCall !== false) {
+        session.recordingStatus = 'recording';
+      }
+      await applyAmdResult(session, 'human', 'simulator_human_answer');
+
       addSessionEvent(session, {
         type: 'call-state',
-        title: 'Recipient Answered Call',
+        title: 'Recipient Answered Call (Human)',
         description: `Call connected with ${session.to}. Playing immediate pickup greeting.`,
       });
 
-      // 1. Play immediate pickup greeting
       addSessionEvent(session, {
         type: 'playback',
         title: 'Immediate Pickup Greeting Played',
@@ -1616,44 +2955,89 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
       session.status = 'collecting-input';
       addSessionEvent(session, {
         type: 'gather',
-        title: `Listening for ${session.numDigits}-Digit Code`,
+        title: `Listening for ${session.numDigits}-Digit Code & Live Voice`,
         description: `Prompting: "${session.script}" (${session.verificationMode === 'manual' ? 'Manual Operator Decision' : 'Auto Match'})`,
       });
       break;
 
+    case 'voicemail': {
+      session.status = 'in-progress';
+      if (session.recordCall !== false) {
+        session.recordingStatus = 'recording';
+      }
+      await applyAmdResult(session, 'voicemail', 'simulator_machine_end_beep');
+      appendSpeechTranscript(
+        session,
+        `Your call has been forwarded to an automated voice messaging system for ${session.to}. At the tone, please record your message.`,
+        0.98,
+        'Voicemail Greeting'
+      );
+      if (!session.autoHangupOnVoicemail) {
+        session.status = 'collecting-input';
+      }
+      break;
+    }
+
+    case 'speech':
+      if (typeof speech === 'string' && speech.trim()) {
+        appendSpeechTranscript(
+          session,
+          speech.trim(),
+          typeof confidence === 'number' ? confidence : 0.95
+        );
+      }
+      break;
+
     case 'dtmf':
       if (digits) {
-        const rawDigits = String(digits).trim();
+        const expectedLen = session.numDigits || 6;
+        const rawDigits = String(digits).replace(/\D/g, '');
 
-        // 1. MANUAL OPERATOR CONTROL MODE
+        if (rawDigits.length < expectedLen) {
+          addSessionEvent(session, {
+            type: 'dtmf',
+            title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
+            description: `Waiting for full ${expectedLen}-digit code before playing hold prompt.`,
+          });
+          return res.json({
+            success: true,
+            session,
+            codeStatus: 'partial',
+            message: `Please enter all ${expectedLen} digits.`,
+          });
+        }
+
+        const enteredCode = rawDigits.slice(0, expectedLen);
+
+        // 1. MANUAL OPERATOR CONTROL MODE -> Now play post-code holdMessage
         if (session.verificationMode === 'manual') {
-          session.pendingDigits = rawDigits;
+          session.pendingDigits = enteredCode;
           session.codeStatus = 'awaiting_operator';
           session.status = 'awaiting-operator';
           session.operatorDecision = 'pending';
 
           addSessionEvent(session, {
             type: 'dtmf',
-            title: `Code Received: [${rawDigits}] — Awaiting Operator Decision`,
-            description: `Caller entered ${rawDigits.length}-digit code. Caller put on hold while operator reviews in web console.`,
-            data: { digits: rawDigits, verificationMode: 'manual' },
+            title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
+            description: `Caller entered ${enteredCode.length}-digit code. Playing hold message while operator reviews in web console.`,
+            data: { digits: enteredCode, verificationMode: 'manual' },
           });
 
           return res.json({
             success: true,
             session,
             codeStatus: 'awaiting_operator',
-            pendingDigits: rawDigits,
+            pendingDigits: enteredCode,
             message: session.holdMessage || 'Kindly hold while your information is being processed.',
           });
         }
 
         // 2. AUTO MATCH MODE
-        const isValid = !session.expectedCode || rawDigits === session.expectedCode.trim();
+        const isValid = !session.expectedCode || enteredCode === session.expectedCode.trim();
 
         if (!isValid) {
           session.attempts = (session.attempts || 0) + 1;
-          session.lastInvalidDigits = rawDigits;
+          session.lastInvalidDigits = enteredCode;
           session.codeStatus = 'invalid';
 
           const maxAttempts = session.maxAttempts || 3;
@@ -1661,9 +3045,9 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
           if (session.attempts < maxAttempts) {
             addSessionEvent(session, {
               type: 'error',
-              title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${rawDigits}]`,
-              description: `Entered code "${rawDigits}" does not match expected "${session.expectedCode}". Prompting recipient to try again.`,
-              data: { entered: rawDigits, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
+              title: `Invalid Code Entered (Attempt ${session.attempts}/${maxAttempts}): [${enteredCode}]`,
+              description: `Entered code "${enteredCode}" does not match expected "${session.expectedCode}". Prompting recipient to try again.`,
+              data: { entered: enteredCode, expected: session.expectedCode, attempt: session.attempts, maxAttempts },
             });
 
             return res.json({
@@ -1684,6 +3068,7 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
               title: 'Verification Failed: Maximum Attempts Exceeded',
               description: `Maximum incorrect code attempts (${session.attempts}) reached. Ending call.`,
             });
+            void finalizeCallRecording(session);
 
             return res.json({
               success: true,
@@ -1695,14 +3080,14 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
         }
 
         // VALID CODE IN AUTO MODE
-        session.capturedDigits = rawDigits;
+        session.capturedDigits = enteredCode;
         session.codeStatus = 'valid';
 
         addSessionEvent(session, {
           type: 'dtmf',
-          title: `Code Verified Valid: [${rawDigits}]`,
-          description: `Keypad capture: Correct ${rawDigits.length}-digit code [${rawDigits}] verified! Playing confirmation.`,
-          data: { digits: rawDigits, expected: session.expectedCode },
+          title: `Code Verified Valid: [${enteredCode}]`,
+          description: `Keypad capture: Correct ${enteredCode.length}-digit code [${enteredCode}] verified! Playing confirmation.`,
+          data: { digits: enteredCode, expected: session.expectedCode },
         });
 
         setTimeout(() => {
@@ -1713,7 +3098,8 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
             title: 'Call Interaction Finalized',
             description: `Confirmation message played: "${session.successMessage || 'Your code has been verified.'}". Call completed.`,
           });
-        }, 1500);
+          void finalizeCallRecording(session);
+        }, 1200);
 
         return res.json({
           success: true,
@@ -1735,6 +3121,7 @@ app.post('/api/call/simulate-event', (req: Request, res: Response) => {
         title: action === 'decline' ? 'Recipient Declined Call' : 'Call Terminated (Hangup)',
         description: `User pressed end call.`,
       });
+      void finalizeCallRecording(session);
       break;
 
     default:
@@ -1764,61 +3151,8 @@ app.post('/api/call/hangup', async (req: Request, res: Response) => {
     description: 'Operator pressed End Call button in web console.',
   });
 
-  // Terminate live PSTN call on active carrier
-  if (!session.isSimulated) {
-    try {
-      const carrier = session.carrier || 'twilio';
-      const providerSid = session.providerCallSid || session.id;
-      if (carrier === 'twilio') {
-        const accountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
-        const authToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
-        if (accountSid && authToken && providerSid.startsWith('CA')) {
-          const client = twilio(accountSid, authToken);
-          await client.calls(providerSid).update({ status: 'completed' });
-        }
-      } else if (carrier === 'plivo') {
-        const plivoAuthId = carriersConfig.plivo?.authId || process.env.PLIVO_AUTH_ID;
-        const plivoAuthToken = carriersConfig.plivo?.authToken || process.env.PLIVO_AUTH_TOKEN;
-        if (plivoAuthId && plivoAuthToken && !providerSid.startsWith('call_')) {
-          await fetch(`https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/`, {
-            method: 'DELETE',
-            headers: {
-              Authorization: `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`,
-            },
-          });
-        }
-      } else if (carrier === 'telnyx') {
-        const telnyxApiKey = carriersConfig.telnyx?.apiKey || process.env.TELNYX_API_KEY;
-        if (telnyxApiKey && !providerSid.startsWith('call_')) {
-          await fetch(`https://api.telnyx.com/v2/calls/${encodeURIComponent(providerSid)}/actions/hangup`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Bearer ${telnyxApiKey}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({}),
-          });
-        }
-      } else if (carrier === 'signalwire') {
-        const spaceUrl = carriersConfig.signalwire?.spaceUrl || process.env.SIGNALWIRE_SPACE_URL;
-        const projectId = carriersConfig.signalwire?.projectId || process.env.SIGNALWIRE_PROJECT_ID;
-        const apiToken = carriersConfig.signalwire?.apiToken || process.env.SIGNALWIRE_API_TOKEN;
-        if (spaceUrl && projectId && apiToken && !providerSid.startsWith('call_')) {
-          const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
-          await fetch(`https://${cleanSpace}/api/laml/2010-04-01/Accounts/${projectId}/Calls/${encodeURIComponent(providerSid)}.json`, {
-            method: 'POST',
-            headers: {
-              Authorization: `Basic ${Buffer.from(`${projectId}:${apiToken}`).toString('base64')}`,
-              'Content-Type': 'application/x-www-form-urlencoded',
-            },
-            body: new URLSearchParams({ Status: 'completed' }).toString(),
-          });
-        }
-      }
-    } catch (err) {
-      console.error('Error hanging up carrier call:', err);
-    }
-  }
+  await terminateCarrierCall(session, customTwilio, carriersConfig);
+  void finalizeCallRecording(session, customTwilio, carriersConfig);
 
   res.json({ success: true, session });
 });

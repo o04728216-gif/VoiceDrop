@@ -39,6 +39,8 @@ interface ControlCenterProps {
     numDigits: number;
     keypadActions: Record<string, string>;
     carrier?: TelephonyCarrier;
+    autoHangupOnVoicemail?: boolean;
+    recordCall?: boolean;
   }) => Promise<void>;
   isLoading: boolean;
   activeCall: boolean;
@@ -62,6 +64,8 @@ const STORAGE_KEYS = {
   maxAttempts: `${STORAGE_PREFIX}maxAttempts`,
   isCustomEdited: `${STORAGE_PREFIX}isCustomEdited`,
   recipientPhone: `${STORAGE_PREFIX}recipientPhone`,
+  autoHangupOnVoicemail: `${STORAGE_PREFIX}autoHangupOnVoicemail`,
+  recordCall: `${STORAGE_PREFIX}recordCall`,
 };
 
 const DEFAULT_TEMPLATES = {
@@ -179,6 +183,15 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     return saved ? Number(saved) : 3;
   });
 
+  const [autoHangupOnVoicemail, setAutoHangupOnVoicemailState] = useState<boolean>(() => {
+    return localStorage.getItem(STORAGE_KEYS.autoHangupOnVoicemail) === 'true';
+  });
+
+  const [recordCall, setRecordCallState] = useState<boolean>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.recordCall);
+    return saved !== null ? saved === 'true' : true;
+  });
+
   // Persistent setters ensuring prompts stay as last edited and never change on refresh
   const setIntroGreeting = (val: string) => {
     setIntroGreetingState(val);
@@ -233,6 +246,16 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   const setMaxAttempts = (attempts: number) => {
     setMaxAttemptsState(attempts);
     localStorage.setItem(STORAGE_KEYS.maxAttempts, String(attempts));
+  };
+
+  const setAutoHangupOnVoicemail = (enabled: boolean) => {
+    setAutoHangupOnVoicemailState(enabled);
+    localStorage.setItem(STORAGE_KEYS.autoHangupOnVoicemail, String(enabled));
+  };
+
+  const setRecordCall = (enabled: boolean) => {
+    setRecordCallState(enabled);
+    localStorage.setItem(STORAGE_KEYS.recordCall, String(enabled));
   };
 
   const handleResetPromptsToDefault = () => {
@@ -336,12 +359,14 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
       successMessage,
       maxAttempts,
       voice: selectedVoice,
-      inputMode: 'dtmf',
+      inputMode: 'dtmf speech',
       numDigits,
       keypadActions: {
         code: `${numDigits}-Digit Code Collection`,
       },
       carrier: activeCarrier,
+      autoHangupOnVoicemail,
+      recordCall,
     });
   };
 
@@ -579,15 +604,34 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
               </div>
             </div>
 
-            {/* 3. Hold Message Spoken while Operator is Reviewing */}
+            {/* 3. Immediate Pickup Message Preview */}
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-slate-300">
+                  Immediate Message on Pickup
+                </label>
+                <span className="text-[11px] text-slate-500">Plays first when recipient answers</span>
+              </div>
+              <textarea
+                rows={2}
+                value={introGreeting}
+                onChange={(e) => setIntroGreeting(e.target.value)}
+                placeholder="Greeting spoken the instant the phone is answered..."
+                className="w-full p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500 leading-relaxed resize-none"
+              />
+            </div>
+
+            {/* 4. Post-Code Hold Message Spoken ONLY After Keypad Code Input */}
             {verificationMode === 'manual' ? (
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-1.5">
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
                     <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Hold Message while You Review</span>
+                    <span>Post-Code Hold Message</span>
                   </label>
-                  <span className="text-[10px] text-slate-500 font-mono">Looping comfort message</span>
+                  <span className="text-[10px] text-amber-400/90 font-mono font-semibold">
+                    Plays ONLY after {numDigits}-digit input
+                  </span>
                 </div>
                 <input
                   type="text"
@@ -596,7 +640,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                   className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-amber-200 focus:outline-none focus:border-amber-400"
                 />
                 <p className="text-[11px] text-slate-400 leading-tight">
-                  Plays to caller right after code is entered while awaiting your [Approve] or [Reject] click.
+                  Played strictly after the caller finishes inputting their {numDigits}-digit keypad code while awaiting your [Approve] or [Reject] decision.
                 </p>
               </div>
             ) : (
@@ -637,21 +681,52 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
               </div>
             )}
 
-            {/* 4. Immediate Pickup Message Preview */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-semibold text-slate-300">
-                  Immediate Message on Pickup
-                </label>
-                <span className="text-[11px] text-slate-500">Plays when recipient answers</span>
+            {/* 5. Voicemail Detection & Live Voice Recording */}
+            <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-200">
+                  Voicemail Detection &amp; Call Recording
+                </span>
+                <span className="text-[10px] font-mono text-emerald-400 font-semibold">
+                  AMD + Speech Active
+                </span>
               </div>
-              <textarea
-                rows={2}
-                value={introGreeting}
-                onChange={(e) => setIntroGreeting(e.target.value)}
-                placeholder="Greeting spoken the instant the phone is answered..."
-                className="w-full p-2.5 bg-slate-950 border border-slate-800 rounded-lg text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-indigo-500 leading-relaxed resize-none"
-              />
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer hover:border-slate-700">
+                  <div>
+                    <span className="font-semibold text-slate-200 block text-[11px]">
+                      Record Voice &amp; Talks
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      Save audio for Call History
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={recordCall}
+                    onChange={(e) => setRecordCall(e.target.checked)}
+                    className="w-4 h-4 accent-indigo-500 rounded cursor-pointer"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer hover:border-slate-700">
+                  <div>
+                    <span className="font-semibold text-slate-200 block text-[11px]">
+                      Auto-End on Voicemail
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      {autoHangupOnVoicemail ? 'Hangs up if machine' : 'Alert only (stay on line)'}
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={autoHangupOnVoicemail}
+                    onChange={(e) => setAutoHangupOnVoicemail(e.target.checked)}
+                    className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                  />
+                </label>
+              </div>
             </div>
 
             {/* 5. Voice Engine Selection */}
@@ -745,10 +820,15 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
 
             {/* Hold Message */}
             <div>
-              <label className="text-xs font-semibold text-amber-300 flex items-center gap-1.5 mb-1">
-                <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
-                <span>3. Hold Message ("Kindly Hold / Please Wait")</span>
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-semibold text-amber-300 flex items-center gap-1.5">
+                  <PauseCircle className="w-3.5 h-3.5 text-amber-400" />
+                  <span>3. Post-Code Hold Message ("Kindly Hold / Please Wait")</span>
+                </label>
+                <span className="text-[10px] text-amber-400/80 font-mono">
+                  Spoken ONLY after keypad code input
+                </span>
+              </div>
               <textarea
                 rows={2}
                 value={holdMessage}
