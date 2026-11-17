@@ -12,6 +12,8 @@ import {
   Eye,
   EyeOff,
   Zap,
+  ShieldCheck,
+  RotateCcw,
 } from 'lucide-react';
 import { normalizeE164Phone } from '../utils/phoneFormat';
 import {
@@ -31,6 +33,8 @@ interface CarrierSettingsViewProps {
   onSaveCarriersConfig: (config: CarriersConfig) => void;
   savedConfig?: TwilioConfig | null;
   onSaveConfig?: (config: TwilioConfig) => void;
+  deviceLabel?: string;
+  onResetDeviceSession?: () => void;
 }
 
 interface CarrierMeta {
@@ -91,6 +95,8 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
   onSaveCarriersConfig,
   savedConfig,
   onSaveConfig,
+  deviceLabel,
+  onResetDeviceSession,
 }) => {
   const [activeCarrierTab, setActiveCarrierTab] = useState<TelephonyCarrier>(() => {
     return savedCarriersConfig?.activeCarrier || 'twilio';
@@ -132,18 +138,37 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
   const [showTokens, setShowTokens] = useState<Record<string, boolean>>({});
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [savedSuccess, setSavedSuccess] = useState<string | null>(null);
+  const [confirmResetOpen, setConfirmResetOpen] = useState(false);
 
-  // Sync when parent config updates
+  // Sync when parent config updates (including full wipe on session rotation)
   useEffect(() => {
     if (savedCarriersConfig) {
-      if (savedCarriersConfig.activeCarrier) {
-        setActiveCarrierTab(savedCarriersConfig.activeCarrier);
-      }
-      if (savedCarriersConfig.twilio) setTwilio(savedCarriersConfig.twilio);
-      if (savedCarriersConfig.plivo) setPlivo(savedCarriersConfig.plivo);
-      if (savedCarriersConfig.telnyx) setTelnyx(savedCarriersConfig.telnyx);
-      if (savedCarriersConfig.signalwire) setSignalwire(savedCarriersConfig.signalwire);
-      if (savedCarriersConfig.fonoster) setFonoster(savedCarriersConfig.fonoster);
+      setActiveCarrierTab(savedCarriersConfig.activeCarrier || 'twilio');
+      setTwilio(
+        savedCarriersConfig.twilio || { accountSid: '', authToken: '', phoneNumber: '' }
+      );
+      setPlivo(
+        savedCarriersConfig.plivo || { authId: '', authToken: '', phoneNumber: '' }
+      );
+      setTelnyx(
+        savedCarriersConfig.telnyx || { apiKey: '', connectionId: '', phoneNumber: '' }
+      );
+      setSignalwire(
+        savedCarriersConfig.signalwire || {
+          spaceUrl: '',
+          projectId: '',
+          apiToken: '',
+          phoneNumber: '',
+        }
+      );
+      setFonoster(
+        savedCarriersConfig.fonoster || {
+          projectId: '',
+          accessKeyId: '',
+          accessKeySecret: '',
+          phoneNumber: '',
+        }
+      );
     } else if (savedConfig) {
       setTwilio(savedConfig);
     }
@@ -229,11 +254,11 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
     setTimeout(() => setSavedSuccess(null), 2500);
   };
 
-  // Helper to check if a carrier is configured
+  // Helper to check if a carrier is configured strictly on THIS device
   const isCarrierConfigured = (carrier: TelephonyCarrier) => {
     switch (carrier) {
       case 'twilio':
-        return Boolean(twilio.accountSid && twilio.authToken && twilio.phoneNumber) || Boolean(serverConfig?.isTwilioConfigured);
+        return Boolean(twilio.accountSid && twilio.authToken && twilio.phoneNumber);
       case 'plivo':
         return Boolean(plivo.authId && plivo.authToken && plivo.phoneNumber);
       case 'telnyx':
@@ -304,12 +329,65 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
             </p>
           </div>
 
-          <div className="flex items-center gap-2 shrink-0">
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {deviceLabel && (
+              <span
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30"
+                title="API credentials and call recordings are strictly isolated to this device session"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Device: {deviceLabel}</span>
+              </span>
+            )}
             <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-indigo-500/10 text-indigo-300 border border-indigo-500/30">
               <Zap className="w-3.5 h-3.5 text-indigo-400" />
               <span>Active: {currentSelectedCarrier.toUpperCase()}</span>
             </span>
           </div>
+        </div>
+
+        {/* Per-Device Session Isolation Notice & Wipe/Rotate Control */}
+        <div className="mt-4 pt-3.5 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <p className="text-[11px] text-slate-400">
+            <strong className="text-emerald-300">Private Device Session:</strong> Your carrier API keys, call history, and audio recordings belong exclusively to this browser/device and never appear on any other user&apos;s device.
+          </p>
+
+          {onResetDeviceSession && (
+            <div className="flex items-center gap-2 shrink-0">
+              {!confirmResetOpen ? (
+                <button
+                  type="button"
+                  onClick={() => setConfirmResetOpen(true)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-950 hover:bg-rose-950/50 text-slate-300 hover:text-rose-300 border border-slate-700 hover:border-rose-500/40 text-xs font-medium transition-colors cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>New Isolated Session / Wipe Keys</span>
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setConfirmResetOpen(false);
+                      onResetDeviceSession();
+                      setSavedSuccess('Created fresh isolated device session and wiped saved API keys.');
+                      setTimeout(() => setSavedSuccess(null), 3000);
+                    }}
+                    className="px-2.5 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold cursor-pointer"
+                  >
+                    Confirm Wipe &amp; Rotate
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmResetOpen(false)}
+                    className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

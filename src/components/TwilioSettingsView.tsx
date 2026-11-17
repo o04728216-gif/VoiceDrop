@@ -8,6 +8,8 @@ interface TwilioSettingsViewProps {
   onSaveConfig: (config: TwilioConfig) => void;
   savedCarriersConfig?: CarriersConfig | null;
   onSaveCarriersConfig?: (config: CarriersConfig) => void;
+  deviceLabel?: string;
+  onResetDeviceSession?: () => void;
 }
 
 export const TwilioSettingsView: React.FC<TwilioSettingsViewProps> = ({
@@ -16,6 +18,8 @@ export const TwilioSettingsView: React.FC<TwilioSettingsViewProps> = ({
   onSaveConfig,
   savedCarriersConfig,
   onSaveCarriersConfig,
+  deviceLabel,
+  onResetDeviceSession,
 }) => {
   return (
     <CarrierSettingsView
@@ -24,6 +28,8 @@ export const TwilioSettingsView: React.FC<TwilioSettingsViewProps> = ({
       onSaveConfig={onSaveConfig}
       savedCarriersConfig={savedCarriersConfig || null}
       onSaveCarriersConfig={onSaveCarriersConfig || (() => {})}
+      deviceLabel={deviceLabel}
+      onResetDeviceSession={onResetDeviceSession}
     />
   );
 };

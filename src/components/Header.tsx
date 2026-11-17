@@ -21,12 +21,13 @@ interface HeaderProps {
   onToggleSound: () => void;
   mode: 'live' | 'simulator';
   activeCarrier?: TelephonyCarrier;
+  deviceLabel?: string;
 }
 
 const TAB_TITLES: Record<NavTab, { title: string; subtitle: string }> = {
   dispatcher: {
     title: 'Multi-Digit Code Collector',
-    subtitle: 'Call US phones and collect 4, 5, or 6-digit keypad inputs in real time.',
+    subtitle: 'Call US phones and collect up to 16-digit keypad codes (# to submit) in real time.',
   },
   keypad: {
     title: 'DTMF Keypad Studio',
@@ -52,6 +53,7 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleSound,
   mode,
   activeCarrier = 'twilio',
+  deviceLabel,
 }) => {
   const meta = TAB_TITLES[currentTab];
   const isCallLive =
@@ -66,7 +68,7 @@ export const Header: React.FC<HeaderProps> = ({
   return (
     <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md px-4 lg:px-8 py-3.5 sticky top-0 z-30 flex items-center justify-between gap-4">
       <div>
-        <h1 className="text-base lg:text-lg font-bold text-white tracking-tight flex items-center gap-2">
+        <h1 className="text-base lg:text-lg font-bold text-white tracking-tight flex flex-wrap items-center gap-2">
           <span>{meta.title}</span>
           {mode === 'simulator' ? (
             <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
@@ -75,6 +77,15 @@ export const Header: React.FC<HeaderProps> = ({
           ) : (
             <span className="text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
               {carrierDisplayName} Carrier
+            </span>
+          )}
+          {deviceLabel && (
+            <span
+              className="hidden md:inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700"
+              title="Private device session — recordings & API keys isolated to this device"
+            >
+              <ShieldCheck className="w-3 h-3 text-emerald-400" />
+              <span>{deviceLabel}</span>
             </span>
           )}
         </h1>

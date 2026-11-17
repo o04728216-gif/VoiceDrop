@@ -1,21 +1,32 @@
 import 'dotenv/config';
-import express, { Request, Response } from 'express';
-import { createServer as createViteServer } from 'vite';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import twilio from 'twilio';
-import { GoogleGenAI } from '@google/genai';
 
 const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function resolvePort(): number {
+  if (process.env.PORT) {
+    const envPort = Number(process.env.PORT);
+    if (!Number.isNaN(envPort) && envPort > 0) return envPort;
+  }
+  const portFlagIdx = process.argv.indexOf('--port');
+  if (portFlagIdx !== -1 && process.argv[portFlagIdx + 1]) {
+    const cliPort = Number(process.argv[portFlagIdx + 1]);
+    if (!Number.isNaN(cliPort) && cliPort > 0) return cliPort;
+  }
+  return 3000;
+}
+
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = resolvePort();
 const isProd = process.env.NODE_ENV === 'production';
 
 app.set('trust proxy', true);
@@ -96,6 +107,7 @@ export interface SpeechTranscriptEntry {
 
 export interface CallSession {
   id: string;
+  deviceId: string;
   to: string;
   from: string;
   status: 'queued' | 'initiating' | 'ringing' | 'in-progress' | 'collecting-input' | 'awaiting-operator' | 'completed' | 'busy' | 'failed' | 'no-answer';
@@ -128,6 +140,7 @@ export interface CallSession {
   attempts?: number;
   codeStatus?: 'pending' | 'awaiting_operator' | 'valid' | 'invalid' | 'max_exceeded';
   pendingDigits?: string;
+  submittedViaPound?: boolean;
   operatorDecision?: 'pending' | 'approved' | 'rejected';
   activeCue?: { text: string; timestamp: string };
   lastInvalidDigits?: string;
@@ -168,6 +181,7 @@ try {
 }
 
 interface StoredCallCredentials {
+  deviceId: string;
   carrier: string;
   authHeader?: string;
   twilioSid?: string;
@@ -184,36 +198,63 @@ const sessions = new Map<string, CallSession>();
 const providerSidToCallId = new Map<string, string>();
 const callCredentialsMap = new Map<string, StoredCallCredentials>();
 
+function getRequestDeviceId(req: Request): string | null {
+  const headerVal = req.headers['x-device-id'];
+  const queryVal = req.query?.deviceId;
+  const raw =
+    (typeof headerVal === 'string' ? headerVal : Array.isArray(headerVal) ? headerVal[0] : '') ||
+    (typeof queryVal === 'string' ? queryVal : '') ||
+    '';
+  const cleaned = raw.trim();
+  if (/^[a-zA-Z0-9_-]{16,128}$/.test(cleaned)) {
+    return cleaned;
+  }
+  return null;
+}
+
+function getEffectiveMaxDigits(numDigits?: number): number {
+  const n = Number(numDigits);
+  if (!Number.isFinite(n) || n <= 0) return 16;
+  return Math.min(16, Math.max(1, Math.floor(n)));
+}
+
 function saveCallCredentials(callId: string, creds: StoredCallCredentials) {
   callCredentialsMap.set(callId, creds);
   try {
-    const entries = Object.fromEntries(Array.from(callCredentialsMap.entries()).slice(-50));
+    const entries = Object.fromEntries(Array.from(callCredentialsMap.entries()).slice(-200));
     fs.writeFileSync(CREDENTIALS_CACHE_FILE, JSON.stringify(entries), { encoding: 'utf8', mode: 0o600 });
   } catch {
     // Ignore disk cache errors
   }
 }
 
-function getCallCredentials(callId: string): StoredCallCredentials | undefined {
-  if (callCredentialsMap.has(callId)) return callCredentialsMap.get(callId);
-  try {
-    if (fs.existsSync(CREDENTIALS_CACHE_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(CREDENTIALS_CACHE_FILE, 'utf8'));
-      if (raw && typeof raw === 'object') {
-        for (const [k, v] of Object.entries(raw)) {
-          callCredentialsMap.set(k, v as StoredCallCredentials);
+function getCallCredentials(callId: string, expectedDeviceId?: string): StoredCallCredentials | undefined {
+  let creds = callCredentialsMap.get(callId);
+  if (!creds) {
+    try {
+      if (fs.existsSync(CREDENTIALS_CACHE_FILE)) {
+        const raw = JSON.parse(fs.readFileSync(CREDENTIALS_CACHE_FILE, 'utf8'));
+        if (raw && typeof raw === 'object') {
+          for (const [k, v] of Object.entries(raw)) {
+            callCredentialsMap.set(k, v as StoredCallCredentials);
+          }
         }
       }
+    } catch {
+      // Ignore read errors
     }
-  } catch {
-    // Ignore read errors
+    creds = callCredentialsMap.get(callId);
   }
-  return callCredentialsMap.get(callId);
+  if (!creds) return undefined;
+  if (expectedDeviceId && creds.deviceId && creds.deviceId !== expectedDeviceId) {
+    return undefined;
+  }
+  return creds;
 }
 
 function persistSessionsToDisk() {
   try {
-    const list = Array.from(sessions.values()).slice(-50);
+    const list = Array.from(sessions.values()).slice(-200);
     fs.writeFileSync(SESSION_CACHE_FILE, JSON.stringify(list), 'utf8');
   } catch {
     // Ignore disk cache errors in restricted environments
@@ -293,29 +334,33 @@ function addSessionEvent(session: CallSession, event: Omit<CallSession['events']
   return fullEvent;
 }
 
-// System configuration endpoint
+// System configuration endpoint (strictly isolated: NEVER leaks server env or other device credentials/numbers)
 app.get('/api/config', (req: Request, res: Response) => {
-  const accountSid = process.env.TWILIO_ACCOUNT_SID || '';
-  const authToken = process.env.TWILIO_AUTH_TOKEN || '';
-  const phoneNumber = process.env.TWILIO_PHONE_NUMBER || '';
   const appUrl = getPublicBaseUrl(req);
   const rawGeminiKey = (process.env.GEMINI_API_KEY || '').trim();
   const hasGemini = Boolean(rawGeminiKey && rawGeminiKey !== 'MY_GEMINI_API_KEY');
 
   res.json({
-    hasTwilioAccountSid: Boolean(accountSid.trim()),
-    hasTwilioAuthToken: Boolean(authToken.trim()),
-    hasTwilioPhoneNumber: Boolean(phoneNumber.trim()),
-    isTwilioConfigured: Boolean(accountSid.trim() && authToken.trim() && phoneNumber.trim()),
-    configuredPhoneNumber: phoneNumber ? `${phoneNumber.slice(0, 5)}...${phoneNumber.slice(-4)}` : null,
+    hasTwilioAccountSid: false,
+    hasTwilioAuthToken: false,
+    hasTwilioPhoneNumber: false,
+    isTwilioConfigured: false,
+    configuredPhoneNumber: null,
     appUrl,
     hasGemini,
+    deviceIsolated: true,
   });
 });
 
-// Server-Sent Events stream for real-time call telemetry
+// Server-Sent Events stream for real-time call telemetry (device-scoped)
 app.get('/api/call/events/:callId', (req: Request, res: Response) => {
   const { callId } = req.params;
+  const deviceId = getRequestDeviceId(req);
+  const existingSession = getSessionById(callId);
+
+  if (!deviceId || (existingSession && existingSession.deviceId !== deviceId)) {
+    return res.status(403).json({ error: 'Access denied for this device session.' });
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -332,9 +377,8 @@ app.get('/api/call/events/:callId', (req: Request, res: Response) => {
   sseClients.get(callId)!.add(res);
 
   // Send initial session data if already exists
-  const session = getSessionById(callId);
-  if (session) {
-    res.write(`event: session-update\ndata: ${JSON.stringify(session)}\n\n`);
+  if (existingSession && existingSession.deviceId === deviceId) {
+    res.write(`event: session-update\ndata: ${JSON.stringify(existingSession)}\n\n`);
   }
 
   // Heartbeat ping every 15 seconds to keep connection alive
@@ -383,24 +427,38 @@ function reconcileSessionRecordingState(s: CallSession): CallSession {
 }
 
 app.get('/api/calls/:callId', (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (!deviceId) {
+    return res.status(403).json({ error: 'Device session required' });
+  }
   const session = getSessionById(req.params.callId);
-  if (!session) {
+  if (!session || session.deviceId !== deviceId) {
     return res.status(404).json({ error: 'Call session not found' });
   }
   res.json(reconcileSessionRecordingState(session));
 });
 
-// List recent calls
+// List recent calls belonging strictly to this device session
 app.get('/api/calls', (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (!deviceId) {
+    return res.json([]);
+  }
   const list = Array.from(sessions.values())
+    .filter((s) => s.deviceId === deviceId)
     .map((s) => reconcileSessionRecordingState(s))
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  res.json(list.slice(0, 25));
+  res.json(list.slice(0, 50));
 });
 
-// Initiate Call endpoint
+// Initiate Call endpoint (strictly isolated per deviceId)
 app.post('/api/call/initiate', async (req: Request, res: Response) => {
   try {
+    const deviceId = getRequestDeviceId(req);
+    if (!deviceId) {
+      return res.status(400).json({ error: 'Missing device session identifier. Please reload the page.' });
+    }
+
     const {
       to,
       introGreeting = 'Hello, thank you for answering. This is an automated verification service.',
@@ -412,7 +470,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       successMessage = 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
       maxAttempts = 3,
       voice = 'Polly.Joanna',
-      numDigits = 6,
+      numDigits = 16,
       keypadActions = {},
       autoHangupOnVoicemail = false,
       recordCall = true,
@@ -440,7 +498,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       });
     }
 
-    // Resolve Active Carrier and Credentials
+    // Resolve Active Carrier and Credentials STRICTLY from this device's own payload (never shared across devices)
     const carrier: 'twilio' | 'plivo' | 'telnyx' | 'signalwire' | 'fonoster' =
       req.body.carrier || req.body.carriersConfig?.activeCarrier || 'twilio';
     const carriersConfig = req.body.carriersConfig || {};
@@ -448,32 +506,32 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     let canUseLiveCarrier = false;
     let carrierPhone = '+18005550199';
 
-    // Twilio
-    const twilioAccountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || process.env.TWILIO_ACCOUNT_SID;
-    const twilioAuthToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || process.env.TWILIO_AUTH_TOKEN;
-    const twilioPhone = normalizeCallerId(carriersConfig.twilio?.phoneNumber || customTwilio?.phoneNumber || process.env.TWILIO_PHONE_NUMBER);
+    // Twilio (device-scoped only)
+    const twilioAccountSid = carriersConfig.twilio?.accountSid || customTwilio?.accountSid || '';
+    const twilioAuthToken = carriersConfig.twilio?.authToken || customTwilio?.authToken || '';
+    const twilioPhone = normalizeCallerId(carriersConfig.twilio?.phoneNumber || customTwilio?.phoneNumber || '');
 
-    // Plivo
-    const plivoAuthId = carriersConfig.plivo?.authId || process.env.PLIVO_AUTH_ID;
-    const plivoAuthToken = carriersConfig.plivo?.authToken || process.env.PLIVO_AUTH_TOKEN;
-    const plivoPhone = normalizeCallerId(carriersConfig.plivo?.phoneNumber || process.env.PLIVO_PHONE_NUMBER);
+    // Plivo (device-scoped only)
+    const plivoAuthId = carriersConfig.plivo?.authId || '';
+    const plivoAuthToken = carriersConfig.plivo?.authToken || '';
+    const plivoPhone = normalizeCallerId(carriersConfig.plivo?.phoneNumber || '');
 
-    // Telnyx
-    const telnyxApiKey = carriersConfig.telnyx?.apiKey || process.env.TELNYX_API_KEY;
-    const telnyxConnectionId = carriersConfig.telnyx?.connectionId || process.env.TELNYX_CONNECTION_ID;
-    const telnyxPhone = normalizeCallerId(carriersConfig.telnyx?.phoneNumber || process.env.TELNYX_PHONE_NUMBER);
+    // Telnyx (device-scoped only)
+    const telnyxApiKey = carriersConfig.telnyx?.apiKey || '';
+    const telnyxConnectionId = carriersConfig.telnyx?.connectionId || '';
+    const telnyxPhone = normalizeCallerId(carriersConfig.telnyx?.phoneNumber || '');
 
-    // SignalWire
-    const signalwireSpaceUrl = carriersConfig.signalwire?.spaceUrl || process.env.SIGNALWIRE_SPACE_URL;
-    const signalwireProjectId = carriersConfig.signalwire?.projectId || process.env.SIGNALWIRE_PROJECT_ID;
-    const signalwireApiToken = carriersConfig.signalwire?.apiToken || process.env.SIGNALWIRE_API_TOKEN;
-    const signalwirePhone = normalizeCallerId(carriersConfig.signalwire?.phoneNumber || process.env.SIGNALWIRE_PHONE_NUMBER);
+    // SignalWire (device-scoped only)
+    const signalwireSpaceUrl = carriersConfig.signalwire?.spaceUrl || '';
+    const signalwireProjectId = carriersConfig.signalwire?.projectId || '';
+    const signalwireApiToken = carriersConfig.signalwire?.apiToken || '';
+    const signalwirePhone = normalizeCallerId(carriersConfig.signalwire?.phoneNumber || '');
 
-    // Fonoster
-    const fonosterProjectId = carriersConfig.fonoster?.projectId || process.env.FONOSTER_PROJECT_ID;
-    const fonosterAccessKeyId = carriersConfig.fonoster?.accessKeyId || process.env.FONOSTER_ACCESS_KEY_ID;
-    const fonosterAccessKeySecret = carriersConfig.fonoster?.accessKeySecret || process.env.FONOSTER_ACCESS_KEY_SECRET;
-    const fonosterPhone = normalizeCallerId(carriersConfig.fonoster?.phoneNumber || process.env.FONOSTER_PHONE_NUMBER);
+    // Fonoster (device-scoped only)
+    const fonosterProjectId = carriersConfig.fonoster?.projectId || '';
+    const fonosterAccessKeyId = carriersConfig.fonoster?.accessKeyId || '';
+    const fonosterAccessKeySecret = carriersConfig.fonoster?.accessKeySecret || '';
+    const fonosterPhone = normalizeCallerId(carriersConfig.fonoster?.phoneNumber || '');
 
     if (carrier === 'twilio') {
       canUseLiveCarrier = Boolean(twilioAccountSid && twilioAuthToken && twilioPhone);
@@ -496,16 +554,18 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
     if (mode === 'live' && !canUseLiveCarrier) {
       return res.status(400).json({
-        error: `${carrier.toUpperCase()} credentials not configured. Please supply required API keys in Carrier Settings, or select Simulator mode.`,
+        error: `${carrier.toUpperCase()} credentials not configured on this device. Please supply your API keys in Carrier Settings, or select Simulator mode.`,
       });
     }
 
     const callId = `call_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     const appBaseUrl = getPublicBaseUrl(req);
     const shouldRecord = recordCall !== false;
+    const maxDigits = getEffectiveMaxDigits(numDigits);
 
     const newSession: CallSession = {
       id: callId,
+      deviceId,
       to: formattedTo,
       from: carrierPhone,
       status: 'queued',
@@ -524,7 +584,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       codeStatus: 'pending',
       voice,
       inputMode: 'dtmf speech',
-      numDigits: Number(numDigits) || (expectedCode ? expectedCode.trim().length : 6),
+      numDigits: maxDigits,
       keypadActions: keypadActions || {},
       isSimulated: useSimulator,
       carrier,
@@ -538,7 +598,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     addSessionEvent(newSession, {
       type: 'system',
       title: 'Call Session Created (AMD + Voice Listener + Recording Active)',
-      description: `Target: ${formattedTo}. Control: ${newSession.verificationMode === 'manual' ? 'Manual Operator Verification' : 'Automatic Match'}. Digits: ${newSession.numDigits}. Carrier: ${carrier.toUpperCase()} (${useSimulator ? 'Simulator' : 'Live PSTN'})`,
+      description: `Target: ${formattedTo}. Control: ${newSession.verificationMode === 'manual' ? 'Manual Operator Verification' : 'Automatic Match'}. Max Digits: up to ${newSession.numDigits} (# submit). Carrier: ${carrier.toUpperCase()} (${useSimulator ? 'Simulator' : 'Live PSTN'})`,
       data: { to: formattedTo, voice, numDigits: newSession.numDigits, verificationMode: newSession.verificationMode, carrier, recordCall: shouldRecord },
     });
 
@@ -580,6 +640,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     try {
       if (carrier === 'twilio') {
         saveCallCredentials(callId, {
+          deviceId,
           carrier: 'twilio',
           authHeader: `Basic ${Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64')}`,
           twilioSid: twilioAccountSid,
@@ -650,6 +711,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
       } else if (carrier === 'plivo') {
         const plivoBasic = `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`;
         saveCallCredentials(callId, {
+          deviceId,
           carrier: 'plivo',
           authHeader: plivoBasic,
           plivoId: plivoAuthId,
@@ -715,6 +777,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         });
       } else if (carrier === 'telnyx') {
         saveCallCredentials(callId, {
+          deviceId,
           carrier: 'telnyx',
           authHeader: `Bearer ${telnyxApiKey}`,
           telnyxKey: telnyxApiKey,
@@ -791,6 +854,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         const cleanSpace = (signalwireSpaceUrl || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
         const swBasic = `Basic ${Buffer.from(`${signalwireProjectId}:${signalwireApiToken}`).toString('base64')}`;
         saveCallCredentials(callId, {
+          deviceId,
           carrier: 'signalwire',
           authHeader: swBasic,
           swSpace: cleanSpace,
@@ -1046,7 +1110,7 @@ async function redirectLiveCallToHumanStart(
   const carrier = session.carrier || 'twilio';
   const providerSid = session.providerCallSid || '';
   const appBaseUrl = getPublicBaseUrl(undefined, session.publicBaseUrl);
-  const savedCreds = getCallCredentials(session.id);
+  const savedCreds = getCallCredentials(session.id, session.deviceId);
 
   session.promptsStarted = true;
   persistSessionsToDisk();
@@ -1056,13 +1120,11 @@ async function redirectLiveCallToHumanStart(
       const accountSid =
         carriersConfig.twilio?.accountSid ||
         customTwilio?.accountSid ||
-        savedCreds?.twilioSid ||
-        process.env.TWILIO_ACCOUNT_SID;
+        savedCreds?.twilioSid;
       const authToken =
         carriersConfig.twilio?.authToken ||
         customTwilio?.authToken ||
-        savedCreds?.twilioToken ||
-        process.env.TWILIO_AUTH_TOKEN;
+        savedCreds?.twilioToken;
       if (accountSid && authToken) {
         const client = twilio(accountSid, authToken);
         await client.calls(providerSid).update({
@@ -1072,12 +1134,9 @@ async function redirectLiveCallToHumanStart(
         return true;
       }
     } else if (carrier === 'signalwire' && providerSid && !providerSid.startsWith('call_')) {
-      const spaceUrl =
-        carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
-      const projectId =
-        carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
-      const apiToken =
-        carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+      const spaceUrl = carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace;
+      const projectId = carriersConfig.signalwire?.projectId || savedCreds?.swProject;
+      const apiToken = carriersConfig.signalwire?.apiToken || savedCreds?.swToken;
       if (spaceUrl && projectId && apiToken) {
         const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
         const r = await fetch(
@@ -1097,10 +1156,8 @@ async function redirectLiveCallToHumanStart(
         if (r.ok) return true;
       }
     } else if (carrier === 'plivo' && providerSid && !providerSid.startsWith('call_')) {
-      const plivoAuthId =
-        carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
-      const plivoAuthToken =
-        carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+      const plivoAuthId = carriersConfig.plivo?.authId || savedCreds?.plivoId;
+      const plivoAuthToken = carriersConfig.plivo?.authToken || savedCreds?.plivoToken;
       if (plivoAuthId && plivoAuthToken) {
         const r = await fetch(
           `https://api.plivo.com/v1/Account/${plivoAuthId}/Call/${encodeURIComponent(providerSid)}/`,
@@ -1164,19 +1221,17 @@ async function terminateCarrierCall(
   try {
     const carrier = session.carrier || 'twilio';
     const providerSid = session.providerCallSid || session.id;
-    const savedCreds = getCallCredentials(session.id);
+    const savedCreds = getCallCredentials(session.id, session.deviceId);
 
     if (carrier === 'twilio') {
       const accountSid =
         carriersConfig.twilio?.accountSid ||
         customTwilio?.accountSid ||
-        savedCreds?.twilioSid ||
-        process.env.TWILIO_ACCOUNT_SID;
+        savedCreds?.twilioSid;
       const authToken =
         carriersConfig.twilio?.authToken ||
         customTwilio?.authToken ||
-        savedCreds?.twilioToken ||
-        process.env.TWILIO_AUTH_TOKEN;
+        savedCreds?.twilioToken;
       if (accountSid && authToken && providerSid.startsWith('CA')) {
         const client = twilio(accountSid, authToken);
         // Stop active call recording first so Twilio flushes the audio file immediately on hangup
@@ -1188,10 +1243,8 @@ async function terminateCarrierCall(
         await client.calls(providerSid).update({ status: 'completed' });
       }
     } else if (carrier === 'plivo') {
-      const plivoAuthId =
-        carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
-      const plivoAuthToken =
-        carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+      const plivoAuthId = carriersConfig.plivo?.authId || savedCreds?.plivoId;
+      const plivoAuthToken = carriersConfig.plivo?.authToken || savedCreds?.plivoToken;
       if (plivoAuthId && plivoAuthToken && !providerSid.startsWith('call_')) {
         const plivoAuth = `Basic ${Buffer.from(`${plivoAuthId}:${plivoAuthToken}`).toString('base64')}`;
         await fetch(
@@ -1207,8 +1260,7 @@ async function terminateCarrierCall(
         );
       }
     } else if (carrier === 'telnyx') {
-      const telnyxApiKey =
-        carriersConfig.telnyx?.apiKey || savedCreds?.telnyxKey || process.env.TELNYX_API_KEY;
+      const telnyxApiKey = carriersConfig.telnyx?.apiKey || savedCreds?.telnyxKey;
       if (telnyxApiKey && !providerSid.startsWith('call_')) {
         await fetch(
           `https://api.telnyx.com/v2/calls/${encodeURIComponent(providerSid)}/actions/hangup`,
@@ -1223,12 +1275,9 @@ async function terminateCarrierCall(
         );
       }
     } else if (carrier === 'signalwire') {
-      const spaceUrl =
-        carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
-      const projectId =
-        carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
-      const apiToken =
-        carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+      const spaceUrl = carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace;
+      const projectId = carriersConfig.signalwire?.projectId || savedCreds?.swProject;
+      const apiToken = carriersConfig.signalwire?.apiToken || savedCreds?.swToken;
       if (spaceUrl && projectId && apiToken && !providerSid.startsWith('call_')) {
         const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
         await fetch(
@@ -1405,23 +1454,8 @@ function buildRecordingCandidateUrls(rawUrl: string, carrier?: string): string[]
 }
 
 function resolveCarrierAuthHeader(session: CallSession): string | undefined {
-  const saved = getCallCredentials(session.id);
-  if (saved?.authHeader) return saved.authHeader;
-
-  const carrier = session.carrier || 'twilio';
-  if (carrier === 'twilio' && process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    return `Basic ${Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')}`;
-  }
-  if (carrier === 'plivo' && process.env.PLIVO_AUTH_ID && process.env.PLIVO_AUTH_TOKEN) {
-    return `Basic ${Buffer.from(`${process.env.PLIVO_AUTH_ID}:${process.env.PLIVO_AUTH_TOKEN}`).toString('base64')}`;
-  }
-  if (carrier === 'telnyx' && process.env.TELNYX_API_KEY) {
-    return `Bearer ${process.env.TELNYX_API_KEY}`;
-  }
-  if (carrier === 'signalwire' && process.env.SIGNALWIRE_PROJECT_ID && process.env.SIGNALWIRE_API_TOKEN) {
-    return `Basic ${Buffer.from(`${process.env.SIGNALWIRE_PROJECT_ID}:${process.env.SIGNALWIRE_API_TOKEN}`).toString('base64')}`;
-  }
-  return undefined;
+  const saved = getCallCredentials(session.id, session.deviceId);
+  return saved?.authHeader;
 }
 
 // Transcode raw carrier WAV/WebM/MP3 into compact (~180-200 KB/min), 24kHz wideband voice-enhanced MP3
@@ -1667,7 +1701,7 @@ async function finalizeCallRecording(
       // 2. LIVE CARRIER CALLS: Actively poll carrier REST API right after call ends
       const carrier = session.carrier || 'twilio';
       const providerSid = session.providerCallSid || '';
-      const savedCreds = getCallCredentials(session.id);
+      const savedCreds = getCallCredentials(session.id, session.deviceId);
 
       const wasNeverAnswered =
         ['busy', 'no-answer', 'failed'].includes(session.status) &&
@@ -1697,13 +1731,11 @@ async function finalizeCallRecording(
           const sid =
             carriersConfig.twilio?.accountSid ||
             customTwilio?.accountSid ||
-            savedCreds?.twilioSid ||
-            process.env.TWILIO_ACCOUNT_SID;
+            savedCreds?.twilioSid;
           const token =
             carriersConfig.twilio?.authToken ||
             customTwilio?.authToken ||
-            savedCreds?.twilioToken ||
-            process.env.TWILIO_AUTH_TOKEN;
+            savedCreds?.twilioToken;
 
           if (sid && token) {
             try {
@@ -1740,12 +1772,9 @@ async function finalizeCallRecording(
             }
           }
         } else if (carrier === 'signalwire' && providerSid && !providerSid.startsWith('call_')) {
-          const spaceUrl =
-            carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace || process.env.SIGNALWIRE_SPACE_URL;
-          const projectId =
-            carriersConfig.signalwire?.projectId || savedCreds?.swProject || process.env.SIGNALWIRE_PROJECT_ID;
-          const apiToken =
-            carriersConfig.signalwire?.apiToken || savedCreds?.swToken || process.env.SIGNALWIRE_API_TOKEN;
+          const spaceUrl = carriersConfig.signalwire?.spaceUrl || savedCreds?.swSpace;
+          const projectId = carriersConfig.signalwire?.projectId || savedCreds?.swProject;
+          const apiToken = carriersConfig.signalwire?.apiToken || savedCreds?.swToken;
           if (spaceUrl && projectId && apiToken) {
             try {
               const cleanSpace = spaceUrl.replace(/^https?:\/\//, '').replace(/\/$/, '');
@@ -1767,10 +1796,8 @@ async function finalizeCallRecording(
             } catch {}
           }
         } else if (carrier === 'plivo' && providerSid && !providerSid.startsWith('call_')) {
-          const plivoId =
-            carriersConfig.plivo?.authId || savedCreds?.plivoId || process.env.PLIVO_AUTH_ID;
-          const plivoToken =
-            carriersConfig.plivo?.authToken || savedCreds?.plivoToken || process.env.PLIVO_AUTH_TOKEN;
+          const plivoId = carriersConfig.plivo?.authId || savedCreds?.plivoId;
+          const plivoToken = carriersConfig.plivo?.authToken || savedCreds?.plivoToken;
           if (plivoId && plivoToken) {
             try {
               const plivoAuth = `Basic ${Buffer.from(`${plivoId}:${plivoToken}`).toString('base64')}`;
@@ -1887,6 +1914,7 @@ function populateHumanGreetingTwiml(
   session: CallSession,
   gatherActionUrl: string
 ) {
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
   session.promptsStarted = true;
   session.status = 'collecting-input';
 
@@ -1903,8 +1931,8 @@ function populateHumanGreetingTwiml(
 
     addSessionEvent(session, {
       type: 'gather',
-      title: `Prompting Live Human for ${session.numDigits}-Digit Code`,
-      description: `Playing code prompt & listening for ${session.numDigits} digits + live voice.`,
+      title: `Prompting Live Human for Code (Up to ${maxDigits} Digits, # to Submit)`,
+      description: `Playing code prompt & listening for up to ${maxDigits} digits (or # key) + live voice.`,
     });
   } else {
     persistSessionsToDisk();
@@ -1918,7 +1946,7 @@ function populateHumanGreetingTwiml(
     method: 'POST',
     input: ['dtmf', 'speech'],
     speechTimeout: 'auto',
-    numDigits: session.numDigits || 6,
+    numDigits: maxDigits,
     finishOnKey: '#',
     timeout: 25,
   });
@@ -1929,7 +1957,7 @@ function populateHumanGreetingTwiml(
     method: 'POST',
     input: ['dtmf', 'speech'],
     speechTimeout: 'auto',
-    numDigits: session.numDigits || 6,
+    numDigits: maxDigits,
     finishOnKey: '#',
     timeout: 20,
   });
@@ -1949,12 +1977,13 @@ function populateSilentListenTwiml(
   amdGateUrl: string,
   pauseSec: number
 ) {
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
   const silentGather = twiml.gather({
     action: amdGateUrl,
     method: 'POST',
     input: ['dtmf', 'speech'],
     speechTimeout: 'auto',
-    numDigits: session.numDigits || 6,
+    numDigits: maxDigits,
     finishOnKey: '#',
     timeout: pauseSec,
   });
@@ -2052,9 +2081,13 @@ app.all(XML_AMD_GATE_ROUTES, async (req: Request, res: Response) => {
 
   const rawDigitsParam = req.body.Digits ?? req.query.Digits;
   const rawDigits = rawDigitsParam ? String(rawDigitsParam).replace(/\D/g, '') : '';
+  const finishedViaPound =
+    req.body?.FinishedOnKey === '#' ||
+    req.query?.FinishedOnKey === '#' ||
+    String(rawDigitsParam || '').includes('#');
   const speechParam = req.body.SpeechResult || req.body.Speech || req.query.SpeechResult;
   const confidenceParam = req.body.Confidence ? parseFloat(req.body.Confidence) : undefined;
-  const expectedLen = session.numDigits || 6;
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
 
   if (typeof speechParam === 'string' && speechParam.trim()) {
     appendSpeechTranscript(
@@ -2065,16 +2098,21 @@ app.all(XML_AMD_GATE_ROUTES, async (req: Request, res: Response) => {
     );
   }
 
-  // If recipient already typed the full code right at call start / wakeup, forward straight to gather handler!
-  if (rawDigits.length >= expectedLen) {
+  // Forward straight to gather if recipient hit # after digits, reached maxDigits, or typed while prompts already started
+  if (
+    rawDigits.length >= maxDigits ||
+    (finishedViaPound && rawDigits.length >= 1) ||
+    (rawDigits.length >= 1 && session.promptsStarted)
+  ) {
     if (session.answeredBy === 'voicemail') {
       session.humanPickedUpAfterVoicemail = true;
     }
-    await applyAmdResult(session, 'human', 'keypad_full_code_entry');
+    await applyAmdResult(session, 'human', finishedViaPound ? 'keypad_pound_submit' : 'keypad_code_entry');
     session.promptsStarted = true;
+    const poundSuffix = finishedViaPound ? '&FinishedOnKey=%23' : '';
     twiml.redirect(
       { method: 'POST' },
-      `${gatherActionUrl}&Digits=${encodeURIComponent(rawDigits)}`
+      `${gatherActionUrl}&Digits=${encodeURIComponent(rawDigits)}${poundSuffix}`
     );
     res.type('text/xml');
     return res.send(twiml.toString());
@@ -2213,7 +2251,7 @@ app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
     method: 'POST',
     input: ['dtmf', 'speech'],
     speechTimeout: 'auto',
-    numDigits: session.numDigits || 6,
+    numDigits: getEffectiveMaxDigits(session.numDigits),
     finishOnKey: '#',
     timeout: 25,
   });
@@ -2228,9 +2266,9 @@ app.all(XML_CUE_GATHER_ROUTES, (req: Request, res: Response) => {
   res.send(twiml.toString());
 });
 
-// 2. XML Gather Callback - Captures Speech AND/OR Keypad Digits
+// 2. XML Gather Callback - Captures Speech AND/OR Keypad Digits (1 to 16 digits; submits immediately on # or maxDigits)
 //    CRITICAL RULE: ONLY play holdMessage ("Kindly hold while your information is being processed.")
-//    AFTER the full keypad code has been inputted by the user!
+//    AFTER the keypad code has been submitted (# pressed or up to maxDigits inputted)!
 app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
   const session = findSession(req);
   const rawDigitsParam = req.body.Digits ?? req.query.Digits;
@@ -2250,16 +2288,20 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
   }
 
   const gatherActionUrl = `${appBaseUrl}${matchedGatherBase}?callId=${encodeURIComponent(session.id)}`;
-  const expectedLen = session.numDigits || 6;
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
 
   // Record any spoken words uttered by the caller
   if (typeof speechParam === 'string' && speechParam.trim()) {
     appendSpeechTranscript(session, speechParam, confidenceParam);
   }
 
+  const viaPound =
+    req.body?.FinishedOnKey === '#' ||
+    req.query?.FinishedOnKey === '#' ||
+    String(rawDigitsParam || '').includes('#');
   const rawDigits = rawDigitsParam ? String(rawDigitsParam).replace(/\D/g, '') : '';
 
-  // Case A: Caller ONLY spoke (no keypad digits pressed yet) -> DO NOT play holdMessage! Keep listening for keypad code & speech
+  // Case A: Caller ONLY spoke or pressed '#' with zero digits -> DO NOT play holdMessage! Keep listening for keypad code & speech
   if (!rawDigits) {
     session.status = 'collecting-input';
     persistSessionsToDisk();
@@ -2269,7 +2311,7 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
       method: 'POST',
       input: ['dtmf', 'speech'],
       speechTimeout: 'auto',
-      numDigits: expectedLen,
+      numDigits: maxDigits,
       finishOnKey: '#',
       timeout: 25,
     });
@@ -2280,7 +2322,7 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
       method: 'POST',
       input: ['dtmf', 'speech'],
       speechTimeout: 'auto',
-      numDigits: expectedLen,
+      numDigits: maxDigits,
       finishOnKey: '#',
       timeout: 20,
     });
@@ -2293,39 +2335,9 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
     return res.send(twiml.toString());
   }
 
-  // Case B: Caller started typing digits, but paused before entering all expected digits -> DO NOT play holdMessage yet!
-  if (rawDigits.length < expectedLen) {
-    session.status = 'collecting-input';
-    addSessionEvent(session, {
-      type: 'dtmf',
-      title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
-      description: `Caller entered ${rawDigits.length} of ${expectedLen} digits. Prompting for full ${expectedLen}-digit code before placing on hold.`,
-      data: { partialDigits: rawDigits, expectedLen },
-    });
-
-    const gatherFull = twiml.gather({
-      action: gatherActionUrl,
-      method: 'POST',
-      input: ['dtmf', 'speech'],
-      speechTimeout: 'auto',
-      numDigits: expectedLen,
-      finishOnKey: '#',
-      timeout: 25,
-    });
-    gatherFull.say(
-      { voice: session.voice as any },
-      `We received ${rawDigits.length} digits. Please enter your full ${expectedLen}-digit code on your keypad now, followed by the pound sign.`
-    );
-
-    twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
-    twiml.hangup();
-
-    res.type('text/xml');
-    return res.send(twiml.toString());
-  }
-
-  // Case C: Full keypad code HAS been inputted by user!
-  const enteredCode = rawDigits.slice(0, expectedLen);
+  // Case B: Variable keypad code HAS been submitted (# pressed or up to maxDigits reached)!
+  const enteredCode = rawDigits.slice(0, maxDigits);
+  session.submittedViaPound = viaPound || undefined;
 
   // 1. MANUAL OPERATOR REVIEW MODE (Default) -> NOW play "Kindly hold while your information is being processed."
   if (session.verificationMode === 'manual') {
@@ -2336,9 +2348,9 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
 
     addSessionEvent(session, {
       type: 'dtmf',
-      title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
-      description: `Recipient inputted ${enteredCode.length}-digit code. Playing post-code hold message while operator reviews.`,
-      data: { digits: enteredCode, verificationMode: 'manual' },
+      title: `Code Received (${enteredCode.length} Digits${viaPound ? ' • # Submitted' : ''}): [${enteredCode}] — Awaiting Operator Decision`,
+      description: `Recipient inputted ${enteredCode.length}-digit code${viaPound ? ' and pressed #' : ''}. Playing post-code hold message while operator reviews.`,
+      data: { digits: enteredCode, digitLength: enteredCode.length, submittedViaPound: viaPound, verificationMode: 'manual' },
     });
 
     const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
@@ -2386,11 +2398,11 @@ app.all(XML_GATHER_ROUTES, (req: Request, res: Response) => {
         method: 'POST',
         input: ['dtmf', 'speech'],
         speechTimeout: 'auto',
-        numDigits: expectedLen,
+        numDigits: maxDigits,
         finishOnKey: '#',
         timeout: 20,
       });
-      gatherRetry.say({ voice: session.voice as any }, `Please enter your ${expectedLen}-digit code now, followed by the pound sign.`);
+      gatherRetry.say({ voice: session.voice as any }, 'Please enter your code on your keypad now, followed by the pound sign.');
 
       twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
       twiml.hangup();
@@ -2544,11 +2556,11 @@ app.all(XML_WAIT_ROUTES, (req: Request, res: Response) => {
       method: 'POST',
       input: ['dtmf', 'speech'],
       speechTimeout: 'auto',
-      numDigits: session.numDigits || 6,
+      numDigits: getEffectiveMaxDigits(session.numDigits),
       finishOnKey: '#',
       timeout: 25,
     });
-    gatherRetry.say({ voice: session.voice as any }, `Please enter your ${session.numDigits}-digit code now, followed by the pound sign.`);
+    gatherRetry.say({ voice: session.voice as any }, 'Please enter your code on your keypad now, followed by the pound sign.');
 
     twiml.say({ voice: session.voice as any }, 'We did not receive your code. Goodbye.');
     twiml.hangup();
@@ -2716,23 +2728,28 @@ app.all(XML_RECORDING_ROUTES, async (req: Request, res: Response) => {
   res.sendStatus(200);
 });
 
-// 7. Stream / Proxy Call Audio Recording for Instant Playback in Call History
+// 7. Stream / Proxy Call Audio Recording for Instant Playback in Call History (strictly device-isolated)
 app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
   const session = getSessionById(req.params.callId);
-  const safeId = req.params.callId;
+  if (!deviceId || !session || session.deviceId !== deviceId) {
+    return res.status(session ? 403 : 404).json({ error: 'Access denied or recording not found.' });
+  }
+
+  const safeId = session.id;
 
   // 1. Serve cached local file with full HTTP byte-range support
   let cached = findCachedRecordingPath(safeId);
 
   // 2. If not cached yet, try downloading from providerRecordingUrl or querying Twilio Recordings API
-  if (!cached && session) {
+  if (!cached) {
     let remoteUrl = session.providerRecordingUrl;
 
     if (!remoteUrl && session.carrier === 'twilio' && session.providerCallSid?.startsWith('CA')) {
       try {
-        const creds = getCallCredentials(session.id);
-        const sid = creds?.twilioSid || process.env.TWILIO_ACCOUNT_SID;
-        const token = creds?.twilioToken || process.env.TWILIO_AUTH_TOKEN;
+        const creds = getCallCredentials(session.id, session.deviceId);
+        const sid = creds?.twilioSid;
+        const token = creds?.twilioToken;
         if (sid && token) {
           const client = twilio(sid, token);
           const list = await client.recordings.list({ callSid: session.providerCallSid, limit: 1 });
@@ -2792,11 +2809,15 @@ app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
   }
 });
 
-// 8. Upload Browser Simulator Call / Microphone Recording (transcoded via ffmpeg to compact HD MP3)
+// 8. Upload Browser Simulator Call / Microphone Recording (strictly device-isolated, transcoded to compact HD MP3)
 app.post('/api/calls/:callId/recording-upload', async (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
   const session = getSessionById(req.params.callId);
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
+  }
+  if (!deviceId || session.deviceId !== deviceId) {
+    return res.status(403).json({ error: 'Access denied for this device session.' });
   }
 
   const { audioBase64, mimeType = 'audio/webm', duration } = req.body || {};
@@ -2910,6 +2931,8 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
       ? `  <Record recordSession="true" fileFormat="wav" redirect="false" callbackUrl="${escapeXml(recCallbackUrl)}" callbackMethod="POST" />\n`
       : '';
 
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
+
   if (session.answeredBy === 'human') {
     session.promptsStarted = true;
     session.status = 'collecting-input';
@@ -2922,7 +2945,7 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 ${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
-  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
     <Speak>${escapeXml(session.script)}</Speak>
   </GetInput>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
@@ -2937,7 +2960,7 @@ ${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
   const waitLen = session.answeredBy === 'voicemail' ? 5 : 2;
   const silentXml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-${recordTag}  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="${waitLen}" speechEndTimeout="auto">
+${recordTag}  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="${waitLen}" speechEndTimeout="auto">
     <Wait length="${waitLen}" />
   </GetInput>
   <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
@@ -2957,10 +2980,15 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
     return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>`);
   }
 
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
   const gatherUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
   const gateUrl = `${appBaseUrl}/api/plivo/amd-gate?callId=${encodeURIComponent(session.id)}`;
   const digitsParam = req.body.Digits || req.query.Digits;
   const rawDigits = digitsParam ? String(digitsParam).replace(/\D/g, '') : '';
+  const finishedViaPound =
+    req.body?.FinishedOnKey === '#' ||
+    req.query?.FinishedOnKey === '#' ||
+    String(digitsParam || '').includes('#');
   const speechParam = req.body.Speech || req.query.Speech;
 
   if (typeof speechParam === 'string' && speechParam.trim()) {
@@ -2970,6 +2998,20 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
       undefined,
       session.answeredBy === 'voicemail' ? 'Voicemail Screening' : 'Pickup'
     );
+  }
+
+  if (rawDigits.length >= maxDigits || (finishedViaPound && rawDigits.length >= 1)) {
+    if (session.answeredBy === 'voicemail') {
+      session.humanPickedUpAfterVoicemail = true;
+    }
+    await applyAmdResult(session, 'human', 'plivo_keypad_submit');
+    session.promptsStarted = true;
+    const poundParam = finishedViaPound ? '&FinishedOnKey=%23' : '';
+    res.type('text/xml');
+    return res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Redirect method="POST">${escapeXml(`${gatherUrl}&Digits=${encodeURIComponent(rawDigits)}${poundParam}`)}</Redirect>
+</Response>`);
   }
 
   const isDirectHumanStart = req.path.endsWith('/human-start');
@@ -3001,7 +3043,7 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
       res.type('text/xml');
       return res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="5" speechEndTimeout="auto">
+  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="5" speechEndTimeout="auto">
     <Wait length="5" />
   </GetInput>
   <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
@@ -3038,7 +3080,7 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(session.introGreeting)}</Speak>
-  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
     <Speak>${escapeXml(session.script)}</Speak>
   </GetInput>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
@@ -3051,14 +3093,14 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
   res.type('text/xml');
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="2" speechEndTimeout="auto">
+  <GetInput action="${escapeXml(gateUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="2" speechEndTimeout="auto">
     <Wait length="2" />
   </GetInput>
   <Redirect method="POST">${escapeXml(gateUrl)}</Redirect>
 </Response>`);
 });
 
-// 2. Plivo Gather Callback (Strict post-code hold message rule + live speech capture)
+// 2. Plivo Gather Callback (Up to 16 digits; submits immediately on # or maxDigits + strict post-code hold message rule)
 app.all('/api/plivo/gather', (req: Request, res: Response) => {
   const session = findSession(req);
   const digitsParam = req.body.Digits || req.query.Digits;
@@ -3074,17 +3116,21 @@ app.all('/api/plivo/gather', (req: Request, res: Response) => {
     appendSpeechTranscript(session, speechParam);
   }
 
-  const expectedLen = session.numDigits || 6;
+  const maxDigits = getEffectiveMaxDigits(session.numDigits);
+  const viaPound =
+    req.body?.FinishedOnKey === '#' ||
+    req.query?.FinishedOnKey === '#' ||
+    String(digitsParam || '').includes('#');
   const rawDigits = digitsParam ? String(digitsParam).replace(/\D/g, '') : '';
   const gatherRetryUrl = `${appBaseUrl}/api/plivo/gather?callId=${encodeURIComponent(session.id)}`;
 
-  // Speech-only (no keypad digits yet) -> DO NOT play holdMessage
+  // Speech-only or '#' with no digits -> DO NOT play holdMessage
   if (!rawDigits) {
     session.status = 'collecting-input';
     persistSessionsToDisk();
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
+  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
     <Wait length="1" />
   </GetInput>
   <Speak>We did not receive your code. Goodbye.</Speak>
@@ -3094,29 +3140,10 @@ app.all('/api/plivo/gather', (req: Request, res: Response) => {
     return res.send(xml);
   }
 
-  // Partial keypad digits -> DO NOT play holdMessage yet
-  if (rawDigits.length < expectedLen) {
-    session.status = 'collecting-input';
-    addSessionEvent(session, {
-      type: 'dtmf',
-      title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
-      description: `Caller entered ${rawDigits.length} of ${expectedLen} digits. Requesting full code before hold.`,
-    });
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="25">
-    <Speak>We received ${rawDigits.length} digits. Please enter your full ${expectedLen}-digit code now, followed by the pound sign.</Speak>
-  </GetInput>
-  <Speak>We did not receive your code. Goodbye.</Speak>
-  <Hangup />
-</Response>`;
-    res.type('text/xml');
-    return res.send(xml);
-  }
+  const enteredCode = rawDigits.slice(0, maxDigits);
+  session.submittedViaPound = viaPound || undefined;
 
-  const enteredCode = rawDigits.slice(0, expectedLen);
-
-  // 1. MANUAL OPERATOR REVIEW MODE -> Play holdMessage ONLY now after full code input
+  // 1. MANUAL OPERATOR REVIEW MODE -> Play holdMessage ONLY now after code input
   if (session.verificationMode === 'manual') {
     session.pendingDigits = enteredCode;
     session.codeStatus = 'awaiting_operator';
@@ -3125,9 +3152,9 @@ app.all('/api/plivo/gather', (req: Request, res: Response) => {
 
     addSessionEvent(session, {
       type: 'dtmf',
-      title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
-      description: `Caller entered ${enteredCode.length}-digit code. Playing post-code hold message while dashboard operator reviews.`,
-      data: { digits: enteredCode, verificationMode: 'manual' },
+      title: `Code Received (${enteredCode.length} Digits${viaPound ? ' • # Submitted' : ''}): [${enteredCode}] — Awaiting Operator Decision`,
+      description: `Caller entered ${enteredCode.length}-digit code${viaPound ? ' and pressed #' : ''}. Playing post-code hold message while dashboard operator reviews.`,
+      data: { digits: enteredCode, digitLength: enteredCode.length, submittedViaPound: viaPound, verificationMode: 'manual' },
     });
 
     const holdPrompt = session.holdMessage || 'Kindly hold while your information is being processed.';
@@ -3161,8 +3188,8 @@ app.all('/api/plivo/gather', (req: Request, res: Response) => {
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(session.invalidMessage || 'That code is incorrect. Please try again.')}</Speak>
-  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${expectedLen}" finishOnKey="#" executionTimeout="20">
-    <Speak>Please enter your ${expectedLen}-digit code now, followed by the pound sign.</Speak>
+  <GetInput action="${escapeXml(gatherRetryUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="20">
+    <Speak>Please enter your code on your keypad now, followed by the pound sign.</Speak>
   </GetInput>
   <Speak>We did not receive your code. Goodbye.</Speak>
   <Hangup />
@@ -3283,8 +3310,8 @@ app.all('/api/plivo/wait-operator', (req: Request, res: Response) => {
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(retryMsg)}</Speak>
-  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits || 6}" finishOnKey="#" executionTimeout="20">
-    <Speak>Please enter your ${session.numDigits}-digit code now, followed by the pound sign.</Speak>
+  <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${getEffectiveMaxDigits(session.numDigits)}" finishOnKey="#" executionTimeout="20">
+    <Speak>Please enter your code on your keypad now, followed by the pound sign.</Speak>
   </GetInput>
   <Speak>We did not receive your code. Goodbye.</Speak>
   <Hangup />
@@ -3339,13 +3366,17 @@ app.all('/api/plivo/status', (req: Request, res: Response) => {
 });
 
 
-// Operator Action Endpoint - Direct manual control of call flow and audio prompts
+// Operator Action Endpoint - Direct manual control of call flow and audio prompts (device-isolated)
 app.post('/api/call/operator-action', async (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
   const { callId, action, customMessage, customTwilio, carriersConfig = {} } = req.body;
   const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
+  }
+  if (!deviceId || session.deviceId !== deviceId) {
+    return res.status(403).json({ error: 'Access denied for this device session.' });
   }
 
   const isCueAction = ['hold', 'incorrect_prompt', 'custom_cue'].includes(action);
@@ -3478,17 +3509,15 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
 
     if (carrier === 'twilio' && providerSid.startsWith('CA')) {
       try {
-        const creds = getCallCredentials(session.id);
+        const creds = getCallCredentials(session.id, session.deviceId);
         const accountSid =
           carriersConfig.twilio?.accountSid ||
           customTwilio?.accountSid ||
-          creds?.twilioSid ||
-          process.env.TWILIO_ACCOUNT_SID;
+          creds?.twilioSid;
         const authToken =
           carriersConfig.twilio?.authToken ||
           customTwilio?.authToken ||
-          creds?.twilioToken ||
-          process.env.TWILIO_AUTH_TOKEN;
+          creds?.twilioToken;
         if (accountSid && authToken) {
           const client = twilio(accountSid, authToken);
           await client.calls(providerSid).update({
@@ -3505,13 +3534,17 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
   res.json({ success: true, session });
 });
 
-// Simulator Action Webhook - Used by the interactive phone mockup in the browser
+// Simulator Action Webhook - Used by the interactive phone mockup in the browser (device-isolated)
 app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
-  const { callId, action, digits, speech, confidence } = req.body;
+  const deviceId = getRequestDeviceId(req);
+  const { callId, action, digits, submittedViaPound, speech, confidence } = req.body;
   const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
+  }
+  if (!deviceId || session.deviceId !== deviceId) {
+    return res.status(403).json({ error: 'Access denied for this device session.' });
   }
 
   switch (action) {
@@ -3630,23 +3663,33 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
       break;
 
     case 'dtmf':
-      if (digits) {
-        const expectedLen = session.numDigits || 6;
-        const rawDigits = String(digits).replace(/\D/g, '');
+      if (digits !== undefined && digits !== null) {
+        const maxDigits = getEffectiveMaxDigits(session.numDigits);
+        const viaPound = Boolean(submittedViaPound) || String(digits).includes('#');
+        const rawDigits = String(digits).replace(/\D/g, '').slice(0, maxDigits);
 
-        // If voicemail was active and a human pressed a digit on the handset, wake up human greeting!
+        if (!rawDigits) {
+          return res.json({
+            success: true,
+            session,
+            codeStatus: 'partial',
+            message: 'Please enter your code digits before pressing #.',
+          });
+        }
+
+        // If voicemail was active and a human pressed digits on the handset, wake up human greeting immediately
         if (session.answeredBy === 'voicemail' && !session.promptsStarted) {
           session.humanPickedUpAfterVoicemail = true;
           session.promptsStarted = true;
           session.status = 'collecting-input';
           await applyAmdResult(session, 'human', 'human_keypad_after_voicemail');
+          addSessionEvent(session, {
+            type: 'playback',
+            title: 'Immediate Pickup Greeting Played',
+            description: `Keypad wakeup after voicemail! Playing greeting: "${session.introGreeting}"`,
+          });
 
-          if (rawDigits.length < expectedLen) {
-            addSessionEvent(session, {
-              type: 'playback',
-              title: 'Immediate Pickup Greeting Played',
-              description: `Keypad wakeup after voicemail! Playing greeting: "${session.introGreeting}"`,
-            });
+          if (!viaPound && rawDigits.length < maxDigits) {
             return res.json({
               success: true,
               session,
@@ -3656,21 +3699,8 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
           }
         }
 
-        if (rawDigits.length < expectedLen) {
-          addSessionEvent(session, {
-            type: 'dtmf',
-            title: `Partial Digits Entered: [${rawDigits}] (${rawDigits.length}/${expectedLen})`,
-            description: `Waiting for full ${expectedLen}-digit code before playing hold prompt.`,
-          });
-          return res.json({
-            success: true,
-            session,
-            codeStatus: 'partial',
-            message: `Please enter all ${expectedLen} digits.`,
-          });
-        }
-
-        const enteredCode = rawDigits.slice(0, expectedLen);
+        const enteredCode = rawDigits;
+        session.submittedViaPound = viaPound || undefined;
 
         // 1. MANUAL OPERATOR CONTROL MODE -> Now play post-code holdMessage
         if (session.verificationMode === 'manual') {
@@ -3681,9 +3711,9 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
 
           addSessionEvent(session, {
             type: 'dtmf',
-            title: `Code Received: [${enteredCode}] — Awaiting Operator Decision`,
-            description: `Caller entered ${enteredCode.length}-digit code. Playing hold message while operator reviews in web console.`,
-            data: { digits: enteredCode, verificationMode: 'manual' },
+            title: `Code Received (${enteredCode.length} Digits${viaPound ? ' • # Submitted' : ''}): [${enteredCode}] — Awaiting Operator Decision`,
+            description: `Caller entered ${enteredCode.length}-digit code${viaPound ? ' and hit #' : ''}. Playing hold message while operator reviews in web console.`,
+            data: { digits: enteredCode, digitLength: enteredCode.length, submittedViaPound: viaPound, verificationMode: 'manual' },
           });
 
           return res.json({
@@ -3794,13 +3824,17 @@ app.post('/api/call/simulate-event', async (req: Request, res: Response) => {
   res.json({ success: true, session });
 });
 
-// Hangup endpoint from dashboard
+// Hangup endpoint from dashboard (device-isolated)
 app.post('/api/call/hangup', async (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
   const { callId, customTwilio, carriersConfig = {} } = req.body;
   const session = getSessionById(callId);
 
   if (!session) {
     return res.status(404).json({ error: 'Call session not found' });
+  }
+  if (!deviceId || session.deviceId !== deviceId) {
+    return res.status(403).json({ error: 'Access denied for this device session.' });
   }
 
   session.status = 'completed';
@@ -3833,6 +3867,7 @@ app.post('/api/ai/enhance-script', async (req: Request, res: Response) => {
       });
     }
 
+    const { GoogleGenAI } = await import('@google/genai');
     const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
@@ -3862,24 +3897,69 @@ Return ONLY valid JSON with this exact schema:
   }
 });
 
-// Mount Vite or static production files
-async function startServer() {
+// Mount Vite in development or static dist in production, binding port 3000 immediately
+function startServer() {
+  let viteInstance: any = null;
+  let viteReady: Promise<any> | null = null;
+
   if (!isProd) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    app.use(async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const vite = viteInstance || (viteReady ? await viteReady : null);
+        if (!vite) return next();
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
   } else {
     app.use(express.static(path.resolve(__dirname, 'dist')));
-    app.get('*', (req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.resolve(__dirname, 'dist', 'index.html'));
     });
   }
 
-  app.listen(Number(PORT), '0.0.0.0', () => {
-    console.log(`VoiceDrop Interactive server running on port ${PORT}`);
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`VoiceDrop Interactive server running on http://0.0.0.0:${PORT}`);
   });
+
+  httpServer.on('error', (err) => {
+    console.error('HTTP server error:', err);
+  });
+
+  if (!isProd) {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
+    viteReady = import('vite')
+      .then(({ createServer: createViteServer }) =>
+        createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: disableHmr ? false : { server: httpServer },
+            ws: disableHmr ? false : undefined,
+            watch: disableHmr ? null : {},
+          } as any,
+          appType: 'spa',
+        })
+      )
+      .then((vite) => {
+        viteInstance = vite;
+        return vite;
+      });
+
+    viteReady.catch((err) => {
+      console.error('Vite initialization error:', err);
+    });
+  }
+
+  const shutdown = () => {
+    httpServer.close(() => {
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 1500).unref();
+  };
+
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 startServer();

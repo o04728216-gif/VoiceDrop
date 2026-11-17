@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Play, Pause, Download, Sparkles } from 'lucide-react';
+import { withDeviceParam } from '../utils/deviceSession';
 
 interface CompactAudioPlayerProps {
   src: string;
@@ -147,7 +148,10 @@ export const CompactAudioPlayer: React.FC<CompactAudioPlayerProps> = ({
   const progressPct =
     effectiveDuration > 0 ? Math.min(100, (currentTime / effectiveDuration) * 100) : 0;
   const sizeLabel = formatAudioBytes(sizeBytes);
-  const downloadHref = src.includes('?') ? `${src}&download=1` : `${src}?download=1`;
+  const authorizedSrc = withDeviceParam(src);
+  const downloadHref = authorizedSrc.includes('?')
+    ? `${authorizedSrc}&download=1`
+    : `${authorizedSrc}?download=1`;
 
   return (
     <div
@@ -158,7 +162,7 @@ export const CompactAudioPlayer: React.FC<CompactAudioPlayerProps> = ({
     >
       <audio
         ref={audioRef}
-        src={src}
+        src={authorizedSrc}
         preload="metadata"
         onLoadedMetadata={(e) => {
           const d = e.currentTarget.duration;

@@ -29,6 +29,7 @@ export interface CallEvent {
 
 export interface CallSession {
   id: string;
+  deviceId?: string;
   to: string;
   from: string;
   status: CallStatus;
@@ -55,6 +56,7 @@ export interface CallSession {
   attempts?: number;
   codeStatus?: 'pending' | 'awaiting_operator' | 'valid' | 'invalid' | 'max_exceeded';
   pendingDigits?: string;
+  submittedViaPound?: boolean;
   operatorDecision?: 'pending' | 'approved' | 'rejected';
   activeCue?: { text: string; timestamp: string };
   lastInvalidDigits?: string;
@@ -71,7 +73,7 @@ export interface CallSession {
   providerCallSid?: string;
   createdAt: string;
   completedAt?: string;
-  events: CallEvent[];
+  events: Array<CallEvent>;
 }
 
 export interface VoiceProfile {
@@ -146,4 +148,5 @@ export interface ServerConfig {
   appUrl: string;
   hasGemini: boolean;
   activeCarrier?: TelephonyCarrier;
+  deviceIsolated?: boolean;
 }

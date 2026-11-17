@@ -26,12 +26,12 @@ interface SidebarProps {
   onOpenSimulator: () => void;
   callsCount: number;
   activeCarrier?: TelephonyCarrier;
+  deviceLabel?: string;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
   currentTab,
   onSelectTab,
-  serverConfig,
   activeSession,
   soundEnabled,
   onToggleSound,
@@ -40,8 +40,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenSimulator,
   callsCount,
   activeCarrier = 'twilio',
+  deviceLabel,
 }) => {
-  const isTwilioReady = serverConfig?.isTwilioConfigured;
   const isCallLive =
     activeSession &&
     ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
@@ -203,7 +203,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </>
             )}
           </button>
-          <span className="text-[10px] text-slate-600 font-mono">v2.5</span>
+          <span className="text-[10px] text-slate-500 font-mono" title="Isolated device session">
+            {deviceLabel || 'v2.5'}
+          </span>
         </div>
       </div>
     </aside>

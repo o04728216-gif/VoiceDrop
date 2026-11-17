@@ -20,6 +20,13 @@ import {
   playConnectedChime,
   playHangupTone,
 } from './utils/audioTones';
+import {
+  getDeviceHeaders,
+  getDeviceId,
+  withDeviceParam,
+  resetDeviceSessionStorage,
+  getDeviceShortLabel,
+} from './utils/deviceSession';
 import { AlertCircle, X, ShieldCheck, Activity, PhoneCall, LayoutGrid } from 'lucide-react';
 
 const STORAGE_KEY_TWILIO = 'voicedrop_twilio_config';
@@ -70,6 +77,7 @@ export default function App() {
   const [operatorTab, setOperatorTab] = useState<'live' | 'setup' | 'both'>('setup');
   const [isLoading, setIsLoading] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [deviceLabel, setDeviceLabel] = useState<string>(() => getDeviceShortLabel());
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const prevSessionStatusRef = useRef<{ id: string; status: string } | null>(null);
@@ -77,13 +85,14 @@ export default function App() {
   soundEnabledRef.current = soundEnabled;
 
   useEffect(() => {
-    fetch('/api/config')
+    // Ensure this browser/device has a persistent cryptographic session ID before making API calls
+    const currentDeviceId = getDeviceId();
+    setDeviceLabel(getDeviceShortLabel(currentDeviceId));
+
+    fetch('/api/config', { headers: getDeviceHeaders() })
       .then((res) => res.json())
       .then((data: ServerConfig) => {
         setServerConfig(data);
-        if (data.isTwilioConfigured && !localStorage.getItem(STORAGE_KEY_MODE)) {
-          setMode('live');
-        }
       })
       .catch((err) => console.error('Failed to load server config:', err));
 
@@ -101,7 +110,7 @@ export default function App() {
 
   const loadCallHistory = async () => {
     try {
-      const res = await fetch('/api/calls');
+      const res = await fetch('/api/calls', { headers: getDeviceHeaders() });
       if (res.ok) {
         const data: CallSession[] = await res.json();
         setCallsHistory(data);
@@ -177,6 +186,25 @@ export default function App() {
     void loadCallHistory();
   };
 
+  const handleResetDeviceSession = () => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    stopRingbackTone();
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    const nextId = resetDeviceSessionStorage();
+    setDeviceLabel(getDeviceShortLabel(nextId));
+    setSavedTwilioConfig(null);
+    setCarriersConfig({ activeCarrier: 'twilio' });
+    setActiveSession(null);
+    setCallsHistory([]);
+    setErrorBanner(null);
+    void loadCallHistory();
+  };
+
   // SSE Telemetry listener (continuous per callId, stays open until recording finalizes)
   useEffect(() => {
     if (!activeSession?.id) {
@@ -204,7 +232,7 @@ export default function App() {
       return;
     }
 
-    const es = new EventSource(`/api/call/events/${activeSession.id}`);
+    const es = new EventSource(withDeviceParam(`/api/call/events/${activeSession.id}`));
     eventSourceRef.current = es;
 
     es.addEventListener('session-update', (event) => {
@@ -342,7 +370,7 @@ export default function App() {
 
       const res = await fetch('/api/call/initiate', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
         body: JSON.stringify(payload),
       });
 
@@ -390,7 +418,7 @@ export default function App() {
       }
       const res = await fetch('/api/call/hangup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
         body: JSON.stringify({
           callId: activeSession.id,
           customTwilio: savedTwilioConfig,
@@ -412,7 +440,7 @@ export default function App() {
     try {
       const res = await fetch('/api/call/simulate-event', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
         body: JSON.stringify({
           callId: activeSession.id,
           action,
@@ -444,7 +472,7 @@ export default function App() {
     try {
       const res = await fetch('/api/call/operator-action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
         body: JSON.stringify({
           callId: activeSession.id,
           action,
@@ -485,6 +513,7 @@ export default function App() {
         onOpenSimulator={handleOpenSimulator}
         callsCount={callsHistory.length}
         activeCarrier={carriersConfig.activeCarrier}
+        deviceLabel={deviceLabel}
       />
 
       {/* Main Content Area */}
@@ -500,6 +529,7 @@ export default function App() {
           onToggleSound={handleToggleSound}
           mode={mode}
           activeCarrier={carriersConfig.activeCarrier}
+          deviceLabel={deviceLabel}
         />
 
         {/* Error Banner */}
@@ -696,6 +726,8 @@ export default function App() {
               onSaveConfig={handleSaveTwilioConfig}
               savedCarriersConfig={carriersConfig}
               onSaveCarriersConfig={handleSaveCarriersConfig}
+              deviceLabel={deviceLabel}
+              onResetDeviceSession={handleResetDeviceSession}
             />
           )}
         </main>

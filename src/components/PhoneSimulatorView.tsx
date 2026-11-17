@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { CallSession } from '../types/telephony';
 import { playDtmfTone } from '../utils/audioTones';
+import { getDeviceHeaders } from '../utils/deviceSession';
 
 interface PhoneSimulatorViewProps {
   session: CallSession | null;
@@ -63,7 +64,7 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
   const [isMicRecording, setIsMicRecording] = useState(false);
   const [simulatedSpeechInput, setSimulatedSpeechInput] = useState('');
 
-  const targetLength = session?.numDigits || 6;
+  const maxDigits = Math.min(16, Math.max(1, session?.numDigits || 16));
   const lastSpokenDecisionRef = useRef<string | null>(null);
   const lastSpeakCallTimeRef = useRef<{ text: string; time: number } | null>(null);
   const soundEnabledRef = useRef(soundEnabled);
@@ -312,7 +313,7 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                       `/api/calls/${encodeURIComponent(callIdToSave)}/recording-upload`,
                       {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 'Content-Type': 'application/json', ...getDeviceHeaders() },
                         body: JSON.stringify({
                           audioBase64: dataUrl,
                           mimeType,
@@ -636,8 +637,8 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     }
 
     if (key === '#') {
-      if (enteredDigits.length >= targetLength) {
-        submitFullCode(enteredDigits.slice(0, targetLength));
+      if (enteredDigits.length >= 1) {
+        submitFullCode(enteredDigits.slice(0, maxDigits), true);
       }
       return;
     }
@@ -650,19 +651,23 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       setAttemptFeedback(null);
     }
 
+    if (enteredDigits.length >= maxDigits) {
+      return;
+    }
+
     const next = enteredDigits + key;
     setEnteredDigits(next);
 
-    if (next.length >= targetLength) {
-      submitFullCode(next);
+    if (next.length >= maxDigits) {
+      submitFullCode(next, false);
     }
   };
 
-  const submitFullCode = async (code: string) => {
+  const submitFullCode = async (code: string, submittedViaPound = false) => {
     setIsSubmittingCode(true);
     setAttemptFeedback(null);
 
-    const res = await onSimulateEvent('dtmf', { digits: code });
+    const res = await onSimulateEvent('dtmf', { digits: code, submittedViaPound });
 
     if (res?.codeStatus === 'awaiting_operator') {
       const holdMsg = res.message || session?.holdMessage || 'Kindly hold while your information is being processed.';
@@ -884,47 +889,59 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                   </div>
                 )}
 
-                {/* MULTI-DIGIT CODE ENTRY BAR (Real-time typed numbers) */}
+                {/* MULTI-DIGIT CODE ENTRY BAR (Up to 16 Digits • # Submits Immediately) */}
                 {isLive && (
                   <div className="my-1 text-center">
                     <div className="flex items-center justify-between text-[9px] uppercase font-semibold text-slate-400 mb-1 px-1">
-                      <span>Enter {targetLength}-Digit Code</span>
+                      <span>
+                        Code (1–{maxDigits} Digits,{' '}
+                        <code className="text-indigo-300 font-mono">#</code> Submit)
+                      </span>
                       <span className="text-slate-500 font-mono">
-                        {session.verificationMode === 'manual' ? 'Manual Operator' : 'Auto Match'}
+                        {(enteredDigits || session.pendingDigits || '').length}/{maxDigits}
                       </span>
                     </div>
 
-                    {/* Boxed display */}
-                    <div className="flex items-center justify-center gap-1 mb-1">
-                      {Array.from({ length: targetLength }).map((_, idx) => {
-                        const char = enteredDigits[idx] || (session.pendingDigits ? session.pendingDigits[idx] : null);
-                        const isCurrent = enteredDigits.length === idx;
-                        const isInvalid = attemptFeedback?.type === 'invalid';
-                        const isValid = attemptFeedback?.type === 'valid';
-                        const isWaiting = attemptFeedback?.type === 'waiting';
+                    {/* Wrapped responsive digit slots supporting up to 16 digits */}
+                    {(() => {
+                      const activeStr = enteredDigits || session.pendingDigits || '';
+                      const visibleCount = session.pendingDigits
+                        ? session.pendingDigits.length
+                        : Math.max(Math.min(8, maxDigits), Math.min(maxDigits, activeStr.length + 1));
 
-                        return (
-                          <div
-                            key={idx}
-                            className={`w-7 h-8.5 rounded-lg border flex items-center justify-center font-mono font-bold text-base transition-all ${
-                              isValid
-                                ? 'bg-slate-900 border-emerald-500 text-emerald-400 shadow-sm'
-                                : isInvalid
-                                ? 'bg-slate-900 border-rose-500 text-rose-400 shadow-sm'
-                                : isWaiting
-                                ? 'bg-slate-900 border-amber-500 text-amber-300 shadow-sm'
-                                : char
-                                ? 'bg-slate-900 border-indigo-500 text-white shadow-sm'
-                                : isCurrent
-                                ? 'bg-slate-900 border-indigo-500 text-white animate-pulse'
-                                : 'bg-slate-950 border-slate-800 text-slate-600'
-                            }`}
-                          >
-                            {char || '·'}
-                          </div>
-                        );
-                      })}
-                    </div>
+                      return (
+                        <div className="flex flex-wrap items-center justify-center gap-1 mb-1">
+                          {Array.from({ length: visibleCount }).map((_, idx) => {
+                            const char = activeStr[idx] || null;
+                            const isCurrent = enteredDigits.length === idx && !session.pendingDigits;
+                            const isInvalid = attemptFeedback?.type === 'invalid';
+                            const isValid = attemptFeedback?.type === 'valid';
+                            const isWaiting = attemptFeedback?.type === 'waiting';
+
+                            return (
+                              <div
+                                key={idx}
+                                className={`w-6 h-7.5 rounded-md border flex items-center justify-center font-mono font-bold text-sm transition-all ${
+                                  isValid
+                                    ? 'bg-slate-900 border-emerald-500 text-emerald-400 shadow-sm'
+                                    : isInvalid
+                                    ? 'bg-slate-900 border-rose-500 text-rose-400 shadow-sm'
+                                    : isWaiting
+                                    ? 'bg-slate-900 border-amber-500 text-amber-300 shadow-sm'
+                                    : char
+                                    ? 'bg-slate-900 border-indigo-500 text-white shadow-sm'
+                                    : isCurrent
+                                    ? 'bg-slate-900 border-indigo-500 text-white animate-pulse'
+                                    : 'bg-slate-950 border-slate-800 text-slate-600'
+                                }`}
+                              >
+                                {char || '·'}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
 
                     {/* Attempt feedback notification */}
                     {attemptFeedback ? (
@@ -954,7 +971,8 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                       </span>
                     ) : (
                       <span className="text-[9px] text-slate-500">
-                        Dial digits, end with <code className="text-indigo-400 font-mono font-bold">#</code>
+                        Dial any length up to {maxDigits}, press{' '}
+                        <code className="text-indigo-400 font-mono font-bold">#</code> to send immediately
                       </span>
                     )}
                   </div>
@@ -970,15 +988,19 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                           type="button"
                           disabled={isSubmittingCode}
                           onClick={() => handleKeyClick(k)}
-                          className="h-8.5 rounded-lg font-bold font-mono text-sm bg-slate-900 hover:bg-slate-850 active:bg-indigo-600 border border-slate-800 text-white transition-all disabled:opacity-50"
+                          className={`h-8.5 rounded-lg font-bold font-mono text-sm border transition-all disabled:opacity-50 ${
+                            k === '#' && enteredDigits.length >= 1
+                              ? 'bg-indigo-600 hover:bg-indigo-500 border-indigo-400 text-white shadow-sm'
+                              : 'bg-slate-900 hover:bg-slate-850 active:bg-indigo-600 border-slate-800 text-white'
+                          }`}
                         >
                           {k}
                         </button>
                       ))}
                     </div>
 
-                    {/* Backspace + Mic Voice Recording Controls */}
-                    <div className="flex items-center justify-center gap-1.5 mt-1">
+                    {/* Backspace + Send # + Mic Voice Recording Controls */}
+                    <div className="flex items-center justify-center gap-1.5 mt-1 flex-wrap">
                       <button
                         type="button"
                         onClick={handleDeleteDigit}
@@ -988,6 +1010,16 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
                         <Delete className="w-3 h-3" />
                         <span>Delete</span>
                       </button>
+
+                      {enteredDigits.length >= 1 && !isSubmittingCode && (
+                        <button
+                          type="button"
+                          onClick={() => submitFullCode(enteredDigits.slice(0, maxDigits), true)}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-400 text-[10px] font-bold cursor-pointer"
+                        >
+                          <span>Send # ({enteredDigits.length})</span>
+                        </button>
+                      )}
 
                       <button
                         type="button"
