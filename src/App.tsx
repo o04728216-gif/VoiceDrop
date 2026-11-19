@@ -74,6 +74,7 @@ export default function App() {
 
   const [isPhoneDocked, setIsPhoneDocked] = useState<boolean>(true);
   const [isPhoneModalOpen, setIsPhoneModalOpen] = useState<boolean>(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const [operatorTab, setOperatorTab] = useState<'live' | 'setup' | 'both'>('setup');
   const [isLoading, setIsLoading] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
@@ -399,7 +400,8 @@ export default function App() {
     if (currentTab !== 'dispatcher') {
       setCurrentTab('dispatcher');
     }
-    if (!isPhoneDocked) {
+    const isNarrowViewport = typeof window !== 'undefined' && window.innerWidth < 1280;
+    if (!isPhoneDocked || isNarrowViewport) {
       setIsPhoneModalOpen(true);
     } else {
       const el = document.getElementById('phone-simulator-dock');
@@ -499,8 +501,8 @@ export default function App() {
     );
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col md:flex-row font-sans selection:bg-indigo-500/30 selection:text-white">
-      {/* Left Sidebar Menu */}
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col md:flex-row font-sans selection:bg-indigo-500/30 selection:text-white overflow-x-hidden">
+      {/* Left Sidebar Menu + Mobile Drawer + Bottom Thumb Bar */}
       <Sidebar
         currentTab={currentTab}
         onSelectTab={setCurrentTab}
@@ -514,10 +516,12 @@ export default function App() {
         callsCount={callsHistory.length}
         activeCarrier={carriersConfig.activeCarrier}
         deviceLabel={deviceLabel}
+        mobileOpen={mobileMenuOpen}
+        onCloseMobile={() => setMobileMenuOpen(false)}
       />
 
       {/* Main Content Area */}
-      <div className="flex-1 flex flex-col min-w-0 overflow-y-auto">
+      <div className="flex-1 flex flex-col min-w-0">
         {/* Top Header */}
         <Header
           currentTab={currentTab}
@@ -530,18 +534,20 @@ export default function App() {
           mode={mode}
           activeCarrier={carriersConfig.activeCarrier}
           deviceLabel={deviceLabel}
+          onOpenMobileMenu={() => setMobileMenuOpen(true)}
         />
 
         {/* Error Banner */}
         {errorBanner && (
-          <div className="bg-rose-950/90 border-b border-rose-500/30 px-4 py-2.5 flex items-center justify-between text-xs text-rose-200">
-            <div className="flex items-center gap-2 max-w-7xl mx-auto w-full">
+          <div className="bg-rose-950/90 border-b border-rose-500/30 px-3 sm:px-4 py-2.5 flex items-center justify-between text-xs text-rose-200">
+            <div className="flex items-center gap-2 max-w-7xl mx-auto w-full min-w-0">
               <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-              <span className="font-medium">{errorBanner}</span>
+              <span className="font-medium break-words">{errorBanner}</span>
             </div>
             <button
+              type="button"
               onClick={() => setErrorBanner(null)}
-              className="text-rose-400 hover:text-white p-1"
+              className="text-rose-400 hover:text-white p-1.5 min-h-[36px] min-w-[36px] flex items-center justify-center shrink-0"
             >
               <X className="w-4 h-4" />
             </button>
@@ -549,30 +555,30 @@ export default function App() {
         )}
 
         {/* View Routing Body */}
-        <main className="flex-1 p-4 lg:p-6">
+        <main className="flex-1 p-3 sm:p-4 lg:p-6 pb-20 md:pb-6">
           {currentTab === 'dispatcher' && (
-            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 sm:gap-6 items-start">
               {/* Operator Command Console (7-8 cols on desktop, or 12 if undocked) */}
               <div
-                className={`flex flex-col gap-5 min-w-0 ${
-                  isPhoneDocked ? 'xl:col-span-7 2xl:col-span-8' : 'col-span-12'
+                className={`flex flex-col gap-4 sm:gap-5 min-w-0 ${
+                  isPhoneDocked ? 'xl:col-span-7 2xl:col-span-8' : 'xl:col-span-12'
                 }`}
               >
                 {/* Operator Subnav Header */}
-                <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-900 border border-slate-800 rounded-xl px-4 py-3">
-                  <div className="flex items-center gap-2.5">
-                    <div className="p-2 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-900 border border-slate-800 rounded-xl px-3.5 sm:px-4 py-3">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div className="p-2 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 shrink-0">
                       <ShieldCheck className="w-4 h-4" />
                     </div>
-                    <div>
-                      <div className="flex items-center gap-2">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
                         <h2 className="text-xs font-bold text-white uppercase tracking-wider">
                           Operator Command Console
                         </h2>
                         {isCallActive ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold bg-emerald-500/10 text-emerald-300 border border-emerald-500/30">
                             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                            <span>ACTIVE CALL ({activeSession?.status.toUpperCase()})</span>
+                            <span>ACTIVE ({activeSession?.status.toUpperCase()})</span>
                           </span>
                         ) : (
                           <span className="text-[10px] text-slate-500 font-mono">
@@ -580,7 +586,7 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <p className="text-[11px] text-slate-400">
+                      <p className="text-[11px] text-slate-400 leading-snug mt-0.5">
                         {activeSession?.status === 'awaiting-operator'
                           ? 'Caller code received — Pending your manual approval or rejection'
                           : 'Control calls, trigger live voice cues, and supervise keypad streams'}
@@ -589,17 +595,17 @@ export default function App() {
                   </div>
 
                   {/* Operator Subtab Switcher */}
-                  <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
+                  <div className="grid grid-cols-2 sm:flex items-center gap-1 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs w-full sm:w-auto shrink-0">
                     <button
                       type="button"
                       onClick={() => setOperatorTab('live')}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all ${
+                      className={`min-h-[38px] sm:min-h-[32px] flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all whitespace-nowrap cursor-pointer ${
                         operatorTab === 'live'
                           ? 'bg-indigo-600 text-white shadow-sm font-semibold'
                           : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      <Activity className="w-3.5 h-3.5" />
+                      <Activity className="w-3.5 h-3.5 shrink-0" />
                       <span>Live Controls</span>
                       {isCallActive && (
                         <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
@@ -609,20 +615,20 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setOperatorTab('setup')}
-                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all ${
+                      className={`min-h-[38px] sm:min-h-[32px] flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all whitespace-nowrap cursor-pointer ${
                         operatorTab === 'setup'
                           ? 'bg-indigo-600 text-white shadow-sm font-semibold'
                           : 'text-slate-400 hover:text-white'
                       }`}
                     >
-                      <PhoneCall className="w-3.5 h-3.5" />
+                      <PhoneCall className="w-3.5 h-3.5 shrink-0" />
                       <span>Call Dispatcher</span>
                     </button>
 
                     <button
                       type="button"
                       onClick={() => setOperatorTab('both')}
-                      className={`hidden 2xl:flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all ${
+                      className={`hidden 2xl:flex items-center gap-1.5 px-3 py-1.5 rounded-md font-medium transition-all whitespace-nowrap cursor-pointer ${
                         operatorTab === 'both'
                           ? 'bg-indigo-600 text-white shadow-sm font-semibold'
                           : 'text-slate-400 hover:text-white'
@@ -684,9 +690,12 @@ export default function App() {
                 )}
               </div>
 
-              {/* Right Side: Docked Smartphone Simulator */}
+              {/* Right Side: Docked Smartphone Simulator (side-by-side on desktop, neatly stacked on mobile) */}
               {isPhoneDocked && (
-                <div id="phone-simulator-dock" className="xl:col-span-5 2xl:col-span-4 sticky top-4">
+                <div
+                  id="phone-simulator-dock"
+                  className="xl:col-span-5 2xl:col-span-4 xl:sticky xl:top-20"
+                >
                   <PhoneSimulatorView
                     session={activeSession}
                     onSimulateEvent={handleSimulateEvent}
@@ -733,8 +742,8 @@ export default function App() {
         </main>
       </div>
 
-      {/* Recipient Phone Floating Popout (active only if user undocked) */}
-      {!isPhoneDocked && isPhoneModalOpen && (
+      {/* Recipient Phone Floating Popout (active when undocked or opened via mobile trigger) */}
+      {isPhoneModalOpen && (
         <PhoneSimulatorView
           session={activeSession}
           onSimulateEvent={handleSimulateEvent}

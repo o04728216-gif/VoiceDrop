@@ -169,15 +169,105 @@ export interface CallSession {
   }>;
 }
 
-// Persistent /tmp storage for sessions, recordings, and server-only carrier auth headers
+// Persistent /tmp storage for sessions, recordings, spoken prompts, and server-only carrier auth headers
 const SESSION_CACHE_FILE = '/tmp/voicedrop-sessions.json';
 const CREDENTIALS_CACHE_FILE = '/tmp/voicedrop-credentials.json';
+const PROMPTS_CACHE_FILE = '/tmp/voicedrop-prompts.json';
 const RECORDINGS_DIR = '/tmp/voicedrop-recordings';
 
 try {
   fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
 } catch {
   // Ignore if already exists
+}
+
+interface StoredDevicePrompts {
+  introGreeting: string;
+  script: string;
+  holdMessage: string;
+  invalidMessage: string;
+  successMessage: string;
+  voice?: string;
+  numDigits?: number;
+  verificationMode?: 'manual' | 'auto';
+  expectedCode?: string;
+  maxAttempts?: number;
+  updatedAt: number;
+}
+
+const devicePromptsMap = new Map<string, StoredDevicePrompts>();
+
+function loadDevicePromptsFromDisk() {
+  try {
+    if (fs.existsSync(PROMPTS_CACHE_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(PROMPTS_CACHE_FILE, 'utf8'));
+      if (parsed && typeof parsed === 'object') {
+        for (const [k, v] of Object.entries(parsed)) {
+          if (v && typeof v === 'object') {
+            devicePromptsMap.set(k, v as StoredDevicePrompts);
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore read errors
+  }
+}
+
+function saveDevicePrompts(deviceId: string, prompts: Partial<StoredDevicePrompts>): StoredDevicePrompts {
+  const existing = devicePromptsMap.get(deviceId);
+  const merged: StoredDevicePrompts = {
+    introGreeting: prompts.introGreeting ?? existing?.introGreeting ?? '',
+    script: prompts.script ?? existing?.script ?? '',
+    holdMessage: prompts.holdMessage ?? existing?.holdMessage ?? '',
+    invalidMessage: prompts.invalidMessage ?? existing?.invalidMessage ?? '',
+    successMessage: prompts.successMessage ?? existing?.successMessage ?? '',
+    voice: prompts.voice ?? existing?.voice,
+    numDigits: prompts.numDigits ?? existing?.numDigits,
+    verificationMode: prompts.verificationMode ?? existing?.verificationMode,
+    expectedCode: prompts.expectedCode ?? existing?.expectedCode,
+    maxAttempts: prompts.maxAttempts ?? existing?.maxAttempts,
+    updatedAt: typeof prompts.updatedAt === 'number' ? prompts.updatedAt : Date.now(),
+  };
+  devicePromptsMap.set(deviceId, merged);
+  try {
+    const entries = Object.fromEntries(Array.from(devicePromptsMap.entries()).slice(-500));
+    fs.writeFileSync(PROMPTS_CACHE_FILE, JSON.stringify(entries), 'utf8');
+  } catch {
+    // Ignore disk write errors
+  }
+  return merged;
+}
+
+loadDevicePromptsFromDisk();
+
+// Enforce favicon and webmanifest delivery across all browsers and devices in both dev and production
+const FAVICON_ROUTES: Record<string, string> = {
+  '/favicon.ico': 'image/x-icon',
+  '/favicon.svg': 'image/svg+xml; charset=utf-8',
+  '/favicon-16x16.png': 'image/png',
+  '/favicon-32x32.png': 'image/png',
+  '/favicon-48x48.png': 'image/png',
+  '/apple-touch-icon.png': 'image/png',
+  '/android-chrome-192x192.png': 'image/png',
+  '/android-chrome-512x512.png': 'image/png',
+  '/safari-pinned-tab.svg': 'image/svg+xml; charset=utf-8',
+  '/site.webmanifest': 'application/manifest+json; charset=utf-8',
+};
+
+for (const [routePath, contentType] of Object.entries(FAVICON_ROUTES)) {
+  const fileName = routePath.replace(/^\//, '');
+  app.get(routePath, (_req: Request, res: Response, next: NextFunction) => {
+    const candidates = [
+      path.resolve(__dirname, 'public', fileName),
+      path.resolve(__dirname, 'dist', fileName),
+    ];
+    const found = candidates.find((p) => fs.existsSync(p));
+    if (!found) return next();
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(found);
+  });
 }
 
 interface StoredCallCredentials {
@@ -594,6 +684,21 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     };
 
     sessions.set(callId, newSession);
+
+    // Remember this device's last inputted spoken prompts automatically
+    saveDevicePrompts(deviceId, {
+      introGreeting: newSession.introGreeting,
+      script: newSession.script,
+      holdMessage: newSession.holdMessage,
+      invalidMessage: newSession.invalidMessage,
+      successMessage: newSession.successMessage,
+      voice: newSession.voice,
+      numDigits: newSession.numDigits,
+      verificationMode: newSession.verificationMode,
+      expectedCode: newSession.expectedCode,
+      maxAttempts: newSession.maxAttempts,
+      updatedAt: Date.now(),
+    });
 
     addSessionEvent(newSession, {
       type: 'system',
@@ -3895,6 +4000,52 @@ Return ONLY valid JSON with this exact schema:
     console.error('AI script enhancement error:', err);
     res.status(500).json({ error: err.message || 'Failed to generate AI script' });
   }
+});
+
+// Per-device spoken prompts persistence (remembers last inputted prompts until changed again)
+app.get('/api/prompts', (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (!deviceId) {
+    return res.json({ prompts: null });
+  }
+  const saved = devicePromptsMap.get(deviceId) || null;
+  res.json({ prompts: saved });
+});
+
+app.put('/api/prompts', (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (!deviceId) {
+    return res.status(400).json({ error: 'Missing device session identifier.' });
+  }
+  const body = req.body || {};
+  const saved = saveDevicePrompts(deviceId, {
+    introGreeting: typeof body.introGreeting === 'string' ? body.introGreeting : undefined,
+    script: typeof body.script === 'string' ? body.script : undefined,
+    holdMessage: typeof body.holdMessage === 'string' ? body.holdMessage : undefined,
+    invalidMessage: typeof body.invalidMessage === 'string' ? body.invalidMessage : undefined,
+    successMessage: typeof body.successMessage === 'string' ? body.successMessage : undefined,
+    voice: typeof body.voice === 'string' ? body.voice : undefined,
+    numDigits: typeof body.numDigits === 'number' ? getEffectiveMaxDigits(body.numDigits) : undefined,
+    verificationMode: body.verificationMode === 'auto' || body.verificationMode === 'manual' ? body.verificationMode : undefined,
+    expectedCode: typeof body.expectedCode === 'string' ? body.expectedCode : undefined,
+    maxAttempts: typeof body.maxAttempts === 'number' ? body.maxAttempts : undefined,
+    updatedAt: typeof body.updatedAt === 'number' ? body.updatedAt : Date.now(),
+  });
+  res.json({ success: true, prompts: saved });
+});
+
+app.delete('/api/prompts', (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (deviceId && devicePromptsMap.has(deviceId)) {
+    devicePromptsMap.delete(deviceId);
+    try {
+      const entries = Object.fromEntries(Array.from(devicePromptsMap.entries()).slice(-500));
+      fs.writeFileSync(PROMPTS_CACHE_FILE, JSON.stringify(entries), 'utf8');
+    } catch {
+      // Ignore write error
+    }
+  }
+  res.json({ success: true });
 });
 
 // Mount Vite in development or static dist in production, binding port 3000 immediately

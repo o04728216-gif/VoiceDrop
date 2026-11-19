@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="vd-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="52%" stop-color="#4338ca"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+    <linearGradient id="vd-wave" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#22d3ee"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded squircle app tile -->
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#vd-bg)"/>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="none" stroke="#a5b4fc" stroke-opacity="0.28" stroke-width="10"/>
+
+  <!-- Acoustic voice signal waves (top-right) -->
+  <path d="M 294 166 A 64 64 0 0 1 352 224" fill="none" stroke="url(#vd-wave)" stroke-width="26" stroke-linecap="round"/>
+  <path d="M 294 106 A 124 124 0 0 1 412 224" fill="none" stroke="url(#vd-wave)" stroke-width="26" stroke-linecap="round" stroke-opacity="0.9"/>
+
+  <!-- Crisp bold telephone handset -->
+  <path fill="#ffffff" d="M 183 122 c 10 -6 23 -3 30 7 l 32 45 c 7 10 5 23 -4 31 l -24 20 c -5 4 -6 11 -3 17 c 15 26 36 47 62 62 c 6 3 13 2 17 -3 l 20 -24 c 8 -9 21 -11 31 -4 l 45 32 c 10 7 13 20 7 30 l -18 32 c -11 19 -33 29 -55 24 c -68 -16 -128 -55 -170 -108 c -42 -53 -65 -116 -66 -184 c -1 -22 13 -42 33 -51 l 33 -14 z"/>
+</svg>
