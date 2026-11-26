@@ -136,7 +136,11 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
     accessKeyId: savedCarriersConfig?.fonoster?.accessKeyId || '',
     accessKeySecret: savedCarriersConfig?.fonoster?.accessKeySecret || '',
     phoneNumber: savedCarriersConfig?.fonoster?.phoneNumber || '',
+    endpoint: savedCarriersConfig?.fonoster?.endpoint || '',
   });
+  const [showSelfHostedEndpoint, setShowSelfHostedEndpoint] = useState<boolean>(() =>
+    Boolean(savedCarriersConfig?.fonoster?.endpoint)
+  );
 
   const [showTokens, setShowTokens] = useState<Record<string, boolean>>({});
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
@@ -170,6 +174,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
           phoneNumber: '',
         }
       );
+      const savedEndpoint = savedCarriersConfig.fonoster?.endpoint || '';
       setFonoster(
         savedCarriersConfig.fonoster
           ? {
@@ -177,14 +182,19 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
               accessKeyId: savedCarriersConfig.fonoster.accessKeyId || '',
               accessKeySecret: savedCarriersConfig.fonoster.accessKeySecret || '',
               phoneNumber: savedCarriersConfig.fonoster.phoneNumber || '',
+              endpoint: savedEndpoint,
             }
           : {
               projectId: '',
               accessKeyId: '',
               accessKeySecret: '',
               phoneNumber: '',
+              endpoint: '',
             }
       );
+      if (savedEndpoint) {
+        setShowSelfHostedEndpoint(true);
+      }
     } else if (savedConfig) {
       setTwilio(savedConfig);
     }
@@ -229,11 +239,13 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
       ...signalwire,
       phoneNumber: signalwire.phoneNumber ? normalizeE164Phone(signalwire.phoneNumber) : '',
     };
+    const cleanFonosterEndpoint = (fonoster.endpoint || '').trim();
     const normFonoster: FonosterConfig = {
       projectId: fonoster.projectId.trim(),
       accessKeyId: fonoster.accessKeyId.trim(),
       accessKeySecret: fonoster.accessKeySecret.trim(),
       phoneNumber: fonoster.phoneNumber.trim() ? normalizeE164Phone(fonoster.phoneNumber.trim()) : '',
+      ...(cleanFonosterEndpoint ? { endpoint: cleanFonosterEndpoint } : {}),
     };
 
     setTwilio(normTwilio);
@@ -278,6 +290,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
     const cleanAccessKeyId = fonoster.accessKeyId.trim();
     const cleanAccessKeySecret = fonoster.accessKeySecret.trim();
     const cleanPhoneNumber = fonoster.phoneNumber.trim();
+    const cleanEndpoint = (fonoster.endpoint || '').trim();
 
     if (!cleanProjectId || !cleanAccessKeyId || !cleanAccessKeySecret) {
       setFonosterTestResult({
@@ -299,11 +312,15 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
           projectId: cleanProjectId,
           accessKeyId: cleanAccessKeyId,
           accessKeySecret: cleanAccessKeySecret,
+          endpoint: cleanEndpoint || undefined,
           syncApp: true,
         }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
+        if (data?.needsSelfHostedEndpoint) {
+          setShowSelfHostedEndpoint(true);
+        }
         setFonosterTestResult({
           ok: false,
           message: data.error || 'Fonoster authentication failed. Double-check your workspace and API keys.',
@@ -321,6 +338,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
         accessKeyId: cleanAccessKeyId,
         accessKeySecret: cleanAccessKeySecret,
         phoneNumber: resolvedPhone ? normalizeE164Phone(resolvedPhone) : '',
+        ...(cleanEndpoint ? { endpoint: cleanEndpoint } : {}),
       };
       setFonoster(updatedFonoster);
 
@@ -338,10 +356,11 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
           : 'Connected to Voice Stream App';
 
       const numCount = Array.isArray(data.numbers) ? data.numbers.length : 0;
+      const endpointNote = data.endpoint ? ` Endpoint: ${data.endpoint}.` : '';
       setFonosterTestResult({
         ok: true,
         message: `Connected to Fonoster! ${appLabel}.`,
-        detail: `${numCount} workspace number${numCount === 1 ? '' : 's'} found.${
+        detail: `${numCount} workspace number${numCount === 1 ? '' : 's'} found.${endpointNote}${
           data.warning ? ` Note: ${data.warning}` : ''
         }`,
       });
@@ -946,6 +965,42 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
                   <p className="text-[11px] text-slate-500 mt-1">
                     Active outbound phone number configured on your Fonoster trunk.
                   </p>
+                </div>
+
+                {/* Collapsed Self-Hosted Server Address Toggle (hidden by default to keep form clean) */}
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowSelfHostedEndpoint((prev) => !prev)}
+                    className="text-[11px] text-slate-400 hover:text-indigo-300 transition-colors flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Server className="w-3 h-3" />
+                    <span>
+                      {showSelfHostedEndpoint
+                        ? 'Hide self-hosted Fonoster server address'
+                        : 'Using a self-hosted Fonoster server? Set server address'}
+                    </span>
+                  </button>
+
+                  {showSelfHostedEndpoint && (
+                    <div className="mt-2">
+                      <div className="relative">
+                        <input
+                          type="text"
+                          value={fonoster.endpoint || ''}
+                          onChange={(e) => setFonoster({ ...fonoster, endpoint: e.target.value.trim() })}
+                          placeholder="your-server-ip:8449 or fonoster.yourdomain.com"
+                          className="w-full min-h-[44px] pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                        />
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
+                          <Globe className="w-3.5 h-3.5" />
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-slate-500 mt-1">
+                        Leave blank when using Fonoster Cloud or when VoiceDrop is deployed on the same VPS (auto-detected). Required only when connecting from a remote preview to your self-hosted server.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Live Fonoster Connection Test & Voice App Auto-Sync */}

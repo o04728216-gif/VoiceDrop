@@ -1089,7 +1089,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           fonosterAccessKeyId,
           fonosterAccessKeySecret,
           fonosterAppRef: dispatched.appRef,
-          fonosterEndpoint: fonosterEndpoint || undefined,
+          fonosterEndpoint: dispatched.endpoint || fonosterEndpoint || undefined,
         });
 
         newSession.providerCallSid = dispatched.ref;
@@ -4338,6 +4338,7 @@ app.post('/api/fonoster/verify', async (req: Request, res: Response) => {
     res.status(400).json({
       ok: false,
       error: err?.details || err?.message || 'Failed to authenticate with Fonoster.',
+      needsSelfHostedEndpoint: Boolean(err?.needsSelfHostedEndpoint),
     });
   }
 });

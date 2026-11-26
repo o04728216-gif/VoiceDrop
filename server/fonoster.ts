@@ -1,6 +1,28 @@
 import type { Server as HttpServer } from 'http';
+import { createRequire } from 'module';
+import net from 'net';
 import * as FonosterSDK from '@fonoster/sdk';
 import { VoiceServer, type Session as FonosterVoiceSession } from '@fonoster/voice';
+
+const requireFromHere = createRequire(import.meta.url);
+let cachedGrpcModule: any = null;
+
+function loadGrpcFromSdk(): any {
+  if (cachedGrpcModule) return cachedGrpcModule;
+  try {
+    const sdkEntry = requireFromHere.resolve('@fonoster/sdk');
+    const requireFromSdk = createRequire(sdkEntry);
+    cachedGrpcModule = requireFromSdk('@grpc/grpc-js');
+    return cachedGrpcModule;
+  } catch {
+    try {
+      cachedGrpcModule = requireFromHere('@grpc/grpc-js');
+      return cachedGrpcModule;
+    } catch {
+      return null;
+    }
+  }
+}
 
 export interface FonosterCredentials {
   projectId: string; // Workspace Access Key ID (e.g. WO...)
@@ -21,33 +43,40 @@ export interface FonosterSessionState {
   amdFallbackTimer?: ReturnType<typeof setTimeout>;
 }
 
+type FonosterTransportMode = 'tls' | 'tls-no-verify' | 'insecure';
+
 const activeFonosterCalls = new Map<string, FonosterSessionState>();
 
-function parseDynamicEndpoint(raw?: string): { endpoint?: string; inferredInsecure?: boolean } {
+function parseDynamicEndpoint(raw?: string): {
+  endpoint?: string;
+  scheme?: string;
+  inferredInsecure?: boolean;
+} {
   if (!raw || !raw.trim()) return {};
   const trimmed = raw.trim();
   const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed);
   let inferredInsecure: boolean | undefined;
+  let scheme = '';
 
   if (hasScheme) {
     const schemeMatch = trimmed.match(/^([a-z][a-z0-9+.-]*):\/\//i);
-    const scheme = schemeMatch ? schemeMatch[1].toLowerCase() : '';
+    scheme = schemeMatch ? schemeMatch[1].toLowerCase() : '';
     if (scheme === 'http' || scheme === 'grpc') {
       inferredInsecure = true;
     } else if (scheme === 'https' || scheme === 'grpcs') {
       inferredInsecure = false;
     }
     try {
-      // Normalize via URL parser using http:// stand-in for grpc(s) schemes so host:port is extracted cleanly
       const parsable = trimmed.replace(/^grpcs?:\/\//i, 'https://');
       const parsed = new URL(parsable);
       return {
         endpoint: parsed.host || undefined,
+        scheme,
         inferredInsecure,
       };
     } catch {
       const stripped = trimmed.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0].trim();
-      return { endpoint: stripped || undefined, inferredInsecure };
+      return { endpoint: stripped || undefined, scheme, inferredInsecure };
     }
   }
 
@@ -55,16 +84,142 @@ function parseDynamicEndpoint(raw?: string): { endpoint?: string; inferredInsecu
   return { endpoint: hostOnly || undefined };
 }
 
-function resolveDynamicTlsInsecure(
+function getOrderedTransportModes(
   explicitAllowInsecure?: boolean,
-  inferredInsecure?: boolean
-): boolean {
-  if (typeof explicitAllowInsecure === 'boolean') return explicitAllowInsecure;
+  inferredInsecure?: boolean,
+  hasCustomEndpoint?: boolean
+): FonosterTransportMode[] {
   const envAllow = (process.env.FONOSTER_ALLOW_INSECURE || '').trim().toLowerCase();
-  if (envAllow === 'true' || envAllow === '1') return true;
-  if (envAllow === 'false' || envAllow === '0') return false;
-  if ((process.env.NODE_TLS_REJECT_UNAUTHORIZED || '').trim() === '0') return true;
-  return Boolean(inferredInsecure);
+  const nodeTlsRelaxed = (process.env.NODE_TLS_REJECT_UNAUTHORIZED || '').trim() === '0';
+
+  const preferInsecure =
+    explicitAllowInsecure === true ||
+    envAllow === 'true' ||
+    envAllow === '1' ||
+    (explicitAllowInsecure === undefined && envAllow === '' && inferredInsecure === true);
+
+  if (preferInsecure) {
+    return ['insecure', 'tls-no-verify', 'tls'];
+  }
+  if (nodeTlsRelaxed) {
+    return ['tls-no-verify', 'insecure', 'tls'];
+  }
+  if (hasCustomEndpoint) {
+    return ['tls', 'tls-no-verify', 'insecure'];
+  }
+  return ['tls'];
+}
+
+function buildClientWithTransport(
+  workspaceKey: string,
+  endpoint: string | undefined,
+  mode: FonosterTransportMode
+): FonosterSDK.Client {
+  if (mode === 'insecure') {
+    return new FonosterSDK.Client({
+      accessKeyId: workspaceKey,
+      ...(endpoint ? { endpoint } : {}),
+      allowInsecure: true,
+    });
+  }
+
+  const client = new FonosterSDK.Client({
+    accessKeyId: workspaceKey,
+    ...(endpoint ? { endpoint } : {}),
+    allowInsecure: false,
+  });
+
+  if (mode === 'tls-no-verify') {
+    const grpc = loadGrpcFromSdk();
+    if (grpc?.credentials?.createSsl) {
+      const relaxedCreds = grpc.credentials.createSsl(null, null, null, {
+        rejectUnauthorized: false,
+        checkServerIdentity: () => undefined,
+      });
+      (client as any).channelCredentials = relaxedCreds;
+      if (typeof (client as any).getIdentityClient === 'function') {
+        (client as any).identityClient = (client as any).getIdentityClient();
+      }
+    }
+  }
+
+  return client;
+}
+
+function extractHostAndPort(endpoint: string, scheme?: string): { host: string; port: number } {
+  const cleaned = endpoint.trim();
+  const ipv6Match = cleaned.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (ipv6Match) {
+    return {
+      host: ipv6Match[1],
+      port: ipv6Match[2] ? Number(ipv6Match[2]) : scheme === 'http' ? 80 : 443,
+    };
+  }
+  const lastColon = cleaned.lastIndexOf(':');
+  if (lastColon > 0) {
+    const portNum = Number(cleaned.slice(lastColon + 1));
+    if (Number.isFinite(portNum) && portNum > 0 && portNum <= 65535) {
+      return { host: cleaned.slice(0, lastColon), port: portNum };
+    }
+  }
+  return { host: cleaned, port: scheme === 'http' ? 80 : 443 };
+}
+
+function probeTcpEndpoint(endpoint: string, scheme?: string, timeoutMs = 2500): Promise<string> {
+  const { host, port } = extractHostAndPort(endpoint, scheme);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (msg: string) => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(msg);
+    };
+
+    const socket = net.createConnection({ host, port });
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => {
+      finish(
+        `TCP port ${host}:${port} is reachable, but gRPC/HTTP2 handshake failed (check that FONOSTER_ENDPOINT points to Fonoster's gRPC API port rather than an HTTP/1.1 web UI or non-gRPC proxy).`
+      );
+    });
+    socket.once('timeout', () => {
+      finish(`TCP connection to ${host}:${port} timed out after ${timeoutMs}ms (firewall/port unreachable).`);
+    });
+    socket.once('error', (err: any) => {
+      const code = err?.code || err?.message || 'UNKNOWN';
+      const dockerHint =
+        host === 'localhost' || host === '127.0.0.1'
+          ? ' Inside Docker/Coolify, localhost refers to the VoiceDrop container itself—use your server IP, domain, or Docker service name instead.'
+          : '';
+      finish(`TCP error connecting to ${host}:${port} (${code}).${dockerHint}`);
+    });
+  });
+}
+
+async function loginWithTimeout(
+  client: FonosterSDK.Client,
+  apiKeyId: string,
+  apiKeySecret: string,
+  timeoutMs = 7000
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      client.loginWithApiKey(apiKeyId, apiKeySecret),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutErr: any = new Error(`Connection timed out after ${timeoutMs}ms`);
+          timeoutErr.code = 14;
+          reject(timeoutErr);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function buildFonosterStreamUrl(appBaseUrl: string): string {
@@ -88,8 +243,103 @@ function isAuthDeniedError(err: any): boolean {
   return err?.code === 7 || msg.includes('invalid credentials') || msg.includes('permission_denied');
 }
 
+function isConnectionError(err: any): boolean {
+  const msg = String(err?.details || err?.message || '').toLowerCase();
+  return (
+    err?.code === 14 ||
+    err?.code === 4 ||
+    msg.includes('no connection established') ||
+    msg.includes('unavailable') ||
+    msg.includes('timed out') ||
+    msg.includes('econnrefused') ||
+    msg.includes('econnreset') ||
+    msg.includes('handshake') ||
+    msg.includes('ssl') ||
+    msg.includes('tls') ||
+    msg.includes('cert')
+  );
+}
+
+function isTcpPortOpen(host: string, port: number, timeoutMs = 900): Promise<boolean> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (ok: boolean) => {
+      if (done) return;
+      done = true;
+      try {
+        sock.destroy();
+      } catch {}
+      resolve(ok);
+    };
+    const sock = net.createConnection({ host, port });
+    sock.setTimeout(timeoutMs);
+    sock.once('connect', () => finish(true));
+    sock.once('timeout', () => finish(false));
+    sock.once('error', () => finish(false));
+  });
+}
+
+function extractDynamicCoHosts(appBaseUrl?: string): string[] {
+  const hosts: string[] = [];
+  if (!appBaseUrl) return hosts;
+  try {
+    const parsed = new URL(appBaseUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    // Skip remote managed cloud preview hosts like *.run.app
+    if (hostname.endsWith('.run.app')) return hosts;
+
+    // Extract IPv4 from wildcard DNS domains (e.g. app.1.2.3.4.sslip.io or app.1-2-3-4.nip.io)
+    const dotIpMatch = hostname.match(/(?:^|\.)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:\.(?:sslip|nip|xip)\.io)?$/);
+    if (dotIpMatch) {
+      hosts.push(dotIpMatch[1]);
+    } else {
+      const dashIpMatch = hostname.match(/(?:^|\.)(\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3})\.(?:sslip|nip|xip)\.io$/);
+      if (dashIpMatch) {
+        hosts.push(dashIpMatch[1].replace(/-/g, '.'));
+      }
+    }
+
+    if (hostname !== 'localhost' && hostname !== '127.0.0.1' && !hosts.includes(hostname)) {
+      hosts.push(hostname);
+    }
+
+    // Standard Docker / Coolify co-host aliases on self-hosted deployments
+    hosts.push('host.docker.internal', 'apiserver');
+  } catch {
+    // Ignore invalid URL
+  }
+  return Array.from(new Set(hosts));
+}
+
+async function discoverOpenCoHostedEndpoints(appBaseUrl?: string): Promise<string[]> {
+  const hosts = extractDynamicCoHosts(appBaseUrl);
+  if (hosts.length === 0) return [];
+  const candidates: Array<{ host: string; port: number }> = [];
+  for (const host of hosts) {
+    candidates.push({ host, port: 8449 });
+    candidates.push({ host, port: 50051 });
+  }
+  const results = await Promise.all(
+    candidates.map(async (c) => ({
+      endpoint: `${c.host}:${c.port}`,
+      open: await isTcpPortOpen(c.host, c.port, 900),
+    }))
+  );
+  return results.filter((r) => r.open).map((r) => r.endpoint);
+}
+
+function hasExplicitPort(endpoint: string): boolean {
+  const cleaned = endpoint.trim();
+  if (/^\[[^\]]+\]:\d+$/.test(cleaned)) return true;
+  const lastColon = cleaned.lastIndexOf(':');
+  if (lastColon <= 0) return false;
+  const portNum = Number(cleaned.slice(lastColon + 1));
+  return Number.isFinite(portNum) && portNum > 0 && portNum <= 65535;
+}
+
 export async function createAuthenticatedFonosterClient(
-  creds: FonosterCredentials
+  creds: FonosterCredentials,
+  appBaseUrl?: string
 ): Promise<FonosterSDK.Client> {
   let workspaceKey = (creds.projectId || '').trim();
   let apiKeyId = (creds.accessKeyId || '').trim();
@@ -115,63 +365,123 @@ export async function createAuthenticatedFonosterClient(
     process.env.FONOSTER_URL ||
     process.env.FONOSTER_BASE_URL ||
     '';
-  const { endpoint, inferredInsecure } = parseDynamicEndpoint(rawEndpoint);
-  const allowInsecure = resolveDynamicTlsInsecure(creds.allowInsecure, inferredInsecure);
+  const { endpoint, scheme, inferredInsecure } = parseDynamicEndpoint(rawEndpoint);
+  const isSelfHostedWorkspaceId = /^WO0{32}$/i.test(workspaceKey);
 
-  const primaryClient = new FonosterSDK.Client({
-    accessKeyId: workspaceKey,
-    ...(endpoint ? { endpoint } : {}),
-    ...(allowInsecure ? { allowInsecure: true } : {}),
-  });
+  // Helper to try authenticating against a single target endpoint across ordered transport modes
+  const tryEndpoint = async (
+    targetEp: string | undefined,
+    modesToTry: FonosterTransportMode[]
+  ): Promise<{ client?: FonosterSDK.Client; err?: any; actualEp?: string; triedModes: string[] }> => {
+    const triedModes: string[] = [];
+    let lastAttemptErr: any = null;
+    let actualEp = targetEp;
+
+    for (const mode of modesToTry) {
+      const client = buildClientWithTransport(workspaceKey, targetEp, mode);
+      actualEp = ((client as any).endpoint as string | undefined) || targetEp;
+      triedModes.push(mode);
+      try {
+        await loginWithTimeout(client, apiKeyId, apiKeySecret);
+        return { client, actualEp, triedModes };
+      } catch (err: any) {
+        lastAttemptErr = err;
+        if (!isConnectionError(err)) {
+          break;
+        }
+      }
+    }
+    return { err: lastAttemptErr, actualEp, triedModes };
+  };
 
   const triedEndpoints: string[] = [];
-  const primaryEp = (primaryClient as any).endpoint as string | undefined;
-  if (primaryEp) triedEndpoints.push(primaryEp);
+  const allTriedModes: string[] = [];
+  let lastErr: any = null;
+  let resolvedPrimaryEp = endpoint;
 
-  try {
-    await primaryClient.loginWithApiKey(apiKeyId, apiKeySecret);
-    return primaryClient;
-  } catch (primaryErr: any) {
-    // If no explicit endpoint was configured and the SDK default ends with .ai,
-    // also try the sibling .com cloud endpoint dynamically for classic Fonoster accounts.
-    if (!endpoint && isAuthDeniedError(primaryErr) && primaryEp && /\.ai$/i.test(primaryEp)) {
-      const siblingEndpoint = primaryEp.replace(/\.ai$/i, '.com');
-      triedEndpoints.push(siblingEndpoint);
-      try {
-        const siblingClient = new FonosterSDK.Client({
-          accessKeyId: workspaceKey,
-          endpoint: siblingEndpoint,
-          ...(allowInsecure ? { allowInsecure: true } : {}),
-        });
-        await siblingClient.loginWithApiKey(apiKeyId, apiKeySecret);
-        return siblingClient;
-      } catch {
-        // Fall through to detailed error below
-      }
+  // 1. If NO explicit endpoint is configured and workspace ID is the default self-hosted WO000...,
+  // probe dynamically discovered co-hosted Fonoster ports (e.g. <vps-ip>:8449 / :50051) FIRST!
+  if (!endpoint && isSelfHostedWorkspaceId && appBaseUrl) {
+    const discovered = await discoverOpenCoHostedEndpoints(appBaseUrl);
+    for (const discEp of discovered) {
+      triedEndpoints.push(discEp);
+      const attempt = await tryEndpoint(discEp, ['tls-no-verify', 'insecure', 'tls']);
+      if (attempt.client) return attempt.client;
+      if (attempt.err) lastErr = attempt.err;
     }
-
-    if (isAuthDeniedError(primaryErr)) {
-      const targetSummary = triedEndpoints.length ? triedEndpoints.join(' and ') : 'configured endpoint';
-      const isPlaceholderWorkspace = /^WO0{32}$/i.test(workspaceKey);
-      const hints: string[] = [];
-      if (!endpoint) {
-        hints.push(
-          'If you are using a self-hosted Fonoster server, set the FONOSTER_ENDPOINT environment variable (and FONOSTER_ALLOW_INSECURE=true if without TLS) so VoiceDrop connects to your server instead of Fonoster Cloud.'
-        );
-      }
-      if (isPlaceholderWorkspace) {
-        hints.push(
-          'Your Workspace Access Key ID looks like the default/self-hosted WO000... ID — double-check it matches your real Fonoster Workspace Access Key ID.'
-        );
-      }
-      hints.push(
-        'Otherwise verify your API Key ID (AP...) and API Key Secret are active and were not regenerated or revoked.'
-      );
-      throw new Error(`Invalid credentials rejected by ${targetSummary}. ${hints.join(' ')}`);
-    }
-
-    throw primaryErr;
   }
+
+  // 2. Try configured endpoint (or SDK default cloud endpoint if none configured)
+  const modes = getOrderedTransportModes(creds.allowInsecure, inferredInsecure, Boolean(endpoint));
+  const primaryAttempt = await tryEndpoint(endpoint, modes);
+  if (primaryAttempt.client) return primaryAttempt.client;
+  if (primaryAttempt.actualEp && !triedEndpoints.includes(primaryAttempt.actualEp)) {
+    triedEndpoints.push(primaryAttempt.actualEp);
+  }
+  if (!resolvedPrimaryEp && primaryAttempt.actualEp) {
+    resolvedPrimaryEp = primaryAttempt.actualEp;
+  }
+  allTriedModes.push(...primaryAttempt.triedModes);
+  lastErr = primaryAttempt.err;
+
+  // 3. If user gave a custom host WITHOUT a port (e.g. "my-vps.com" or "1.2.3.4") and port 443 failed,
+  // also automatically try standard Fonoster gRPC ports (:8449, :50051) on that same host.
+  if (endpoint && !hasExplicitPort(endpoint) && isConnectionError(lastErr)) {
+    for (const port of [8449, 50051]) {
+      const withPort = `${endpoint}:${port}`;
+      if (await isTcpPortOpen(endpoint, port, 1200)) {
+        triedEndpoints.push(withPort);
+        const portAttempt = await tryEndpoint(withPort, ['tls-no-verify', 'insecure', 'tls']);
+        if (portAttempt.client) return portAttempt.client;
+        if (portAttempt.err) lastErr = portAttempt.err;
+      }
+    }
+  }
+
+  // 4. If no explicit endpoint was configured and public cloud rejected credentials:
+  // (a) Try sibling .com cloud domain if primary ended in .ai
+  if (!endpoint && isAuthDeniedError(lastErr) && resolvedPrimaryEp && /\.ai$/i.test(resolvedPrimaryEp)) {
+    const siblingEndpoint = resolvedPrimaryEp.replace(/\.ai$/i, '.com');
+    triedEndpoints.push(siblingEndpoint);
+    const siblingAttempt = await tryEndpoint(siblingEndpoint, [modes[0] || 'tls']);
+    if (siblingAttempt.client) return siblingAttempt.client;
+  }
+
+  // (b) If not already probed above, also check co-hosted Fonoster ports on self-hosted deployments
+  if (!endpoint && !isSelfHostedWorkspaceId && isAuthDeniedError(lastErr) && appBaseUrl) {
+    const discovered = await discoverOpenCoHostedEndpoints(appBaseUrl);
+    for (const discEp of discovered) {
+      if (triedEndpoints.includes(discEp)) continue;
+      triedEndpoints.push(discEp);
+      const attempt = await tryEndpoint(discEp, ['tls-no-verify', 'insecure', 'tls']);
+      if (attempt.client) return attempt.client;
+    }
+  }
+
+  if (isAuthDeniedError(lastErr)) {
+    const targetSummary = triedEndpoints.length ? triedEndpoints.join(' and ') : 'configured endpoint';
+    if (!endpoint) {
+      const err: any = new Error(
+        `Invalid credentials on ${targetSummary}. Your keys appear to belong to a self-hosted Fonoster server — click "Self-hosted server?" below to enter your Fonoster server address (e.g. your-server-ip:8449), or set FONOSTER_ENDPOINT on your deployment.`
+      );
+      err.needsSelfHostedEndpoint = true;
+      throw err;
+    }
+    throw new Error(
+      `Invalid credentials rejected by ${targetSummary}. Verify your Workspace Access Key ID (WO...), API Key ID (AP...), and API Key Secret match an active key on that server.`
+    );
+  }
+
+  if (isConnectionError(lastErr)) {
+    const targetEp = resolvedPrimaryEp || 'configured endpoint';
+    const tcpDiag = resolvedPrimaryEp ? await probeTcpEndpoint(resolvedPrimaryEp, scheme) : '';
+    const detail = lastErr?.details || lastErr?.message || 'gRPC connection failed';
+    throw new Error(
+      `Could not establish gRPC connection to ${targetEp} (tried ${Array.from(new Set(allTriedModes)).join(', ')}). ${tcpDiag || detail}`
+    );
+  }
+
+  throw lastErr;
 }
 
 export async function ensureFonosterVoiceApp(
@@ -291,7 +601,8 @@ export async function verifyFonosterConnection(
   appBaseUrl: string,
   syncApp = true
 ) {
-  const client = await createAuthenticatedFonosterClient(creds);
+  const client = await createAuthenticatedFonosterClient(creds, appBaseUrl);
+  const resolvedEndpoint = (client as any).endpoint as string | undefined;
   const appsApi = new FonosterSDK.Applications(client);
   const numbersApi = new FonosterSDK.Numbers(client);
 
@@ -328,13 +639,14 @@ export async function verifyFonosterConnection(
 
   return {
     ok: true,
+    endpoint: resolvedEndpoint,
     streamUrl,
     syncedAppRef,
     appAction,
     applications,
     numbers,
     warning: isLocalStreamUrl(streamUrl)
-      ? 'Server is currently addressed via localhost; Fonoster Cloud requires a public wss:// URL to connect back to voice streams.'
+      ? 'Server is currently addressed via localhost; Fonoster requires a public wss:// URL to connect back to voice streams.'
       : undefined,
   };
 }
@@ -350,7 +662,8 @@ export async function dispatchFonosterOutboundCall(
     recordCall: boolean;
   }
 ) {
-  const client = await createAuthenticatedFonosterClient(creds);
+  const client = await createAuthenticatedFonosterClient(creds, params.appBaseUrl);
+  const resolvedEndpoint = (client as any).endpoint as string | undefined;
   const { appRef, streamUrl, created, updated } = await ensureFonosterVoiceApp(
     client,
     params.appBaseUrl,
@@ -375,6 +688,7 @@ export async function dispatchFonosterOutboundCall(
     ref: createdCall.ref,
     statusStream: createdCall.statusStream,
     appRef,
+    endpoint: resolvedEndpoint,
     streamUrl,
     appCreated: created,
     appUpdated: updated,
