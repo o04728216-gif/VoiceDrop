@@ -14,8 +14,11 @@ import {
   Zap,
   ShieldCheck,
   RotateCcw,
+  RefreshCw,
+  AlertCircle,
 } from 'lucide-react';
 import { normalizeE164Phone } from '../utils/phoneFormat';
+import { getDeviceHeaders } from '../utils/deviceSession';
 import {
   ServerConfig,
   TwilioConfig,
@@ -82,9 +85,9 @@ const CARRIER_LIST: CarrierMeta[] = [
   {
     id: 'fonoster',
     name: 'Fonoster',
-    badge: 'Voice Webhook',
+    badge: 'Stream Voice API',
     color: 'from-amber-600 to-orange-600',
-    description: 'Open-source programmable telephony with webhook-driven voice applications.',
+    description: 'Dispatch real outbound PSTN calls via Fonoster Cloud/Self-Hosted gRPC API & Voice Stream.',
     docsUrl: 'https://fonoster.com',
   },
 ];
@@ -139,6 +142,12 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null);
   const [savedSuccess, setSavedSuccess] = useState<string | null>(null);
   const [confirmResetOpen, setConfirmResetOpen] = useState(false);
+  const [fonosterTesting, setFonosterTesting] = useState(false);
+  const [fonosterTestResult, setFonosterTestResult] = useState<{
+    ok: boolean;
+    message: string;
+    detail?: string;
+  } | null>(null);
 
   // Sync when parent config updates (including full wipe on session rotation)
   useEffect(() => {
@@ -162,12 +171,19 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
         }
       );
       setFonoster(
-        savedCarriersConfig.fonoster || {
-          projectId: '',
-          accessKeyId: '',
-          accessKeySecret: '',
-          phoneNumber: '',
-        }
+        savedCarriersConfig.fonoster
+          ? {
+              projectId: savedCarriersConfig.fonoster.projectId || '',
+              accessKeyId: savedCarriersConfig.fonoster.accessKeyId || '',
+              accessKeySecret: savedCarriersConfig.fonoster.accessKeySecret || '',
+              phoneNumber: savedCarriersConfig.fonoster.phoneNumber || '',
+            }
+          : {
+              projectId: '',
+              accessKeyId: '',
+              accessKeySecret: '',
+              phoneNumber: '',
+            }
       );
     } else if (savedConfig) {
       setTwilio(savedConfig);
@@ -214,8 +230,10 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
       phoneNumber: signalwire.phoneNumber ? normalizeE164Phone(signalwire.phoneNumber) : '',
     };
     const normFonoster: FonosterConfig = {
-      ...fonoster,
-      phoneNumber: fonoster.phoneNumber ? normalizeE164Phone(fonoster.phoneNumber) : '',
+      projectId: fonoster.projectId.trim(),
+      accessKeyId: fonoster.accessKeyId.trim(),
+      accessKeySecret: fonoster.accessKeySecret.trim(),
+      phoneNumber: fonoster.phoneNumber.trim() ? normalizeE164Phone(fonoster.phoneNumber.trim()) : '',
     };
 
     setTwilio(normTwilio);
@@ -252,6 +270,89 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
     setSavedSuccess(`${activeCarrierTab.toUpperCase()} credentials saved successfully!`);
     setTimeout(() => setSavedSuccess(null), 2500);
+  };
+
+  const handleVerifyFonoster = async () => {
+    setFonosterTestResult(null);
+    const cleanProjectId = fonoster.projectId.trim();
+    const cleanAccessKeyId = fonoster.accessKeyId.trim();
+    const cleanAccessKeySecret = fonoster.accessKeySecret.trim();
+    const cleanPhoneNumber = fonoster.phoneNumber.trim();
+
+    if (!cleanProjectId || !cleanAccessKeyId || !cleanAccessKeySecret) {
+      setFonosterTestResult({
+        ok: false,
+        message: 'Enter Workspace Access Key ID (WO...), API Key ID (AP...), and API Key Secret first.',
+      });
+      return;
+    }
+
+    setFonosterTesting(true);
+    try {
+      const res = await fetch('/api/fonoster/verify', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getDeviceHeaders(),
+        },
+        body: JSON.stringify({
+          projectId: cleanProjectId,
+          accessKeyId: cleanAccessKeyId,
+          accessKeySecret: cleanAccessKeySecret,
+          syncApp: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setFonosterTestResult({
+          ok: false,
+          message: data.error || 'Fonoster authentication failed. Double-check your workspace and API keys.',
+        });
+        return;
+      }
+
+      const firstNum =
+        Array.isArray(data.numbers) && data.numbers[0]?.telUrl
+          ? String(data.numbers[0].telUrl).replace(/^tel:/i, '').trim()
+          : '';
+      const resolvedPhone = cleanPhoneNumber || firstNum;
+      const updatedFonoster: FonosterConfig = {
+        projectId: cleanProjectId,
+        accessKeyId: cleanAccessKeyId,
+        accessKeySecret: cleanAccessKeySecret,
+        phoneNumber: resolvedPhone ? normalizeE164Phone(resolvedPhone) : '',
+      };
+      setFonoster(updatedFonoster);
+
+      const normalized = buildNormalizedConfig(currentSelectedCarrier);
+      onSaveCarriersConfig({
+        ...normalized,
+        fonoster: updatedFonoster,
+      });
+
+      const appLabel =
+        data.appAction === 'created'
+          ? 'Auto-created Voice Stream App'
+          : data.appAction === 'updated'
+          ? 'Synced Voice Stream App'
+          : 'Connected to Voice Stream App';
+
+      const numCount = Array.isArray(data.numbers) ? data.numbers.length : 0;
+      setFonosterTestResult({
+        ok: true,
+        message: `Connected to Fonoster! ${appLabel}.`,
+        detail: `${numCount} workspace number${numCount === 1 ? '' : 's'} found.${
+          data.warning ? ` Note: ${data.warning}` : ''
+        }`,
+      });
+    } catch (err: any) {
+      setFonosterTestResult({
+        ok: false,
+        message: err?.message || 'Network error verifying Fonoster credentials.',
+      });
+    } finally {
+      setFonosterTesting(false);
+    }
   };
 
   // Helper to check if a carrier is configured strictly on THIS device
@@ -299,12 +400,16 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
           { label: 'Gather Callback URL', url: `${appUrl}/api/signalwire/gather`, method: 'POST' },
           { label: 'Status Callback URL', url: `${appUrl}/api/signalwire/status`, method: 'POST' },
         ];
-      case 'fonoster':
+      case 'fonoster': {
+        const wsUrl = appUrl.startsWith('https://')
+          ? `wss://${appUrl.slice('https://'.length)}/api/fonoster/stream`
+          : `ws://${appUrl.replace(/^http:\/\//, '')}/api/fonoster/stream`;
         return [
-          { label: 'Voice App Webhook URL', url: `${appUrl}/api/fonoster/webhook`, method: 'POST' },
-          { label: 'Gather Event Action URL', url: `${appUrl}/api/fonoster/gather`, method: 'POST' },
+          { label: 'Voice Stream Endpoint (Auto-Synced)', url: wsUrl, method: 'WSS' },
+          { label: 'Fallback Voice Webhook URL', url: `${appUrl}/api/fonoster/webhook`, method: 'POST' },
           { label: 'Status Event Webhook', url: `${appUrl}/api/fonoster/status`, method: 'POST' },
         ];
+      }
     }
   };
 
@@ -757,51 +862,57 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
               <>
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                    Fonoster Project ID
+                    Workspace Access Key ID
                   </label>
                   <div className="relative">
                     <input
                       type="text"
                       value={fonoster.projectId}
                       onChange={(e) => setFonoster({ ...fonoster, projectId: e.target.value.trim() })}
-                      placeholder="prj_xxxxxxxx"
-                      className="w-full pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                      placeholder="WOxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      className="w-full min-h-[44px] pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
                     />
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                       <Key className="w-3.5 h-3.5" />
                     </div>
                   </div>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Your Fonoster Workspace Access Key ID (starts with <span className="font-mono text-slate-300">WO</span>).
+                  </p>
                 </div>
 
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                    Fonoster Access Key ID
+                    API Key Access Key ID
                   </label>
                   <div className="relative">
                     <input
                       type="text"
                       value={fonoster.accessKeyId}
                       onChange={(e) => setFonoster({ ...fonoster, accessKeyId: e.target.value.trim() })}
-                      placeholder="AKxxxxxxxx"
-                      className="w-full pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                      placeholder="APxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                      className="w-full min-h-[44px] pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
                     />
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                       <Key className="w-3.5 h-3.5" />
                     </div>
                   </div>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    API Key ID from Workspace &rarr; API Keys (starts with <span className="font-mono text-slate-300">AP</span>).
+                  </p>
                 </div>
 
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                    Fonoster Access Key Secret
+                    API Key Secret
                   </label>
                   <div className="relative">
                     <input
                       type={showTokens['fonoster'] ? 'text' : 'password'}
                       value={fonoster.accessKeySecret}
                       onChange={(e) => setFonoster({ ...fonoster, accessKeySecret: e.target.value.trim() })}
-                      placeholder="Your Fonoster secret key"
-                      className="w-full pl-9 pr-10 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                      placeholder="Your Fonoster API Key Secret"
+                      className="w-full min-h-[44px] pl-9 pr-10 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
                     />
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                       <Lock className="w-3.5 h-3.5" />
@@ -818,7 +929,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
                 <div>
                   <label className="text-xs font-semibold text-slate-300 block mb-1.5">
-                    Fonoster Caller ID Phone (E.164)
+                    Caller ID Phone Number (E.164)
                   </label>
                   <div className="relative">
                     <input
@@ -826,21 +937,59 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
                       value={fonoster.phoneNumber}
                       onChange={(e) => setFonoster({ ...fonoster, phoneNumber: e.target.value.trim() })}
                       placeholder="+18005550199"
-                      className="w-full pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
+                      className="w-full min-h-[44px] pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs font-mono text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500"
                     />
                     <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                       <Phone className="w-3.5 h-3.5" />
                     </div>
                   </div>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Active outbound phone number configured on your Fonoster trunk.
+                  </p>
+                </div>
+
+                {/* Live Fonoster Connection Test & Voice App Auto-Sync */}
+                <div className="pt-1 space-y-2">
+                  <button
+                    type="button"
+                    onClick={handleVerifyFonoster}
+                    disabled={fonosterTesting}
+                    className="w-full sm:w-auto min-h-[42px] px-4 py-2 rounded-xl bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/35 text-amber-200 text-xs font-semibold flex items-center justify-center gap-2 transition-colors disabled:opacity-60 cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${fonosterTesting ? 'animate-spin' : ''}`} />
+                    <span>{fonosterTesting ? 'Verifying & Syncing Voice App...' : 'Test Connection & Sync Voice App'}</span>
+                  </button>
+
+                  {fonosterTestResult && (
+                    <div
+                      className={`p-3 rounded-xl border text-xs flex items-start gap-2 ${
+                        fonosterTestResult.ok
+                          ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                          : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                      }`}
+                    >
+                      {fonosterTestResult.ok ? (
+                        <CheckCircle className="w-4 h-4 shrink-0 mt-0.5 text-emerald-400" />
+                      ) : (
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-rose-400" />
+                      )}
+                      <div>
+                        <p className="font-semibold">{fonosterTestResult.message}</p>
+                        {fonosterTestResult.detail && (
+                          <p className="text-[11px] opacity-85 mt-0.5">{fonosterTestResult.detail}</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </>
             )}
 
             {/* Save Buttons & Feedback */}
-            <div className="pt-2 flex items-center justify-between">
+            <div className="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               {savedSuccess ? (
                 <span className="text-xs text-emerald-400 font-semibold flex items-center gap-1">
-                  <CheckCircle className="w-4 h-4" />
+                  <CheckCircle className="w-4 h-4 shrink-0" />
                   <span>{savedSuccess}</span>
                 </span>
               ) : (
@@ -851,7 +1000,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
               <button
                 type="submit"
-                className="py-2.5 px-5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-xl transition-all shadow-sm shadow-indigo-600/30 cursor-pointer"
+                className="w-full sm:w-auto min-h-[44px] py-2.5 px-5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs rounded-xl transition-all shadow-sm shadow-indigo-600/30 cursor-pointer"
               >
                 Save {currentTabMeta.name} Settings
               </button>

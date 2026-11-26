@@ -6,6 +6,17 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import twilio from 'twilio';
+import {
+  attachFonosterVoiceServer,
+  dispatchFonosterOutboundCall,
+  fetchFonosterRecording,
+  getActiveFonosterState,
+  hangupFonosterCall,
+  sayOnFonosterCall,
+  verifyFonosterConnection,
+  type FonosterCredentials,
+  type FonosterSessionState,
+} from './server/fonoster';
 
 const execFileAsync = promisify(execFile);
 
@@ -282,6 +293,11 @@ interface StoredCallCredentials {
   swSpace?: string;
   swProject?: string;
   swToken?: string;
+  fonosterProjectId?: string;
+  fonosterAccessKeyId?: string;
+  fonosterAccessKeySecret?: string;
+  fonosterAppRef?: string;
+  fonosterEndpoint?: string;
 }
 
 const sessions = new Map<string, CallSession>();
@@ -617,11 +633,13 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
     const signalwireApiToken = carriersConfig.signalwire?.apiToken || '';
     const signalwirePhone = normalizeCallerId(carriersConfig.signalwire?.phoneNumber || '');
 
-    // Fonoster (device-scoped only)
-    const fonosterProjectId = carriersConfig.fonoster?.projectId || '';
-    const fonosterAccessKeyId = carriersConfig.fonoster?.accessKeyId || '';
-    const fonosterAccessKeySecret = carriersConfig.fonoster?.accessKeySecret || '';
-    const fonosterPhone = normalizeCallerId(carriersConfig.fonoster?.phoneNumber || '');
+    // Fonoster (device-scoped only — trimmed cleanly)
+    const fonosterProjectId = String(carriersConfig.fonoster?.projectId || '').trim();
+    const fonosterAccessKeyId = String(carriersConfig.fonoster?.accessKeyId || '').trim();
+    const fonosterAccessKeySecret = String(carriersConfig.fonoster?.accessKeySecret || '').trim();
+    const fonosterPhone = normalizeCallerId(String(carriersConfig.fonoster?.phoneNumber || '').trim());
+    const fonosterAppRef = String(carriersConfig.fonoster?.appRef || '').trim();
+    const fonosterEndpoint = String(carriersConfig.fonoster?.endpoint || '').trim();
 
     if (carrier === 'twilio') {
       canUseLiveCarrier = Boolean(twilioAccountSid && twilioAuthToken && twilioPhone);
@@ -1040,20 +1058,158 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           message: `Live SignalWire call placed to ${formattedTo}!`,
         });
       } else if (carrier === 'fonoster') {
-        const webhookUrl = `${appBaseUrl}/api/fonoster/webhook?callId=${encodeURIComponent(callId)}`;
+        const fonosterCreds: FonosterCredentials = {
+          projectId: fonosterProjectId,
+          accessKeyId: fonosterAccessKeyId,
+          accessKeySecret: fonosterAccessKeySecret,
+          phoneNumber: fonosterPhone,
+          appRef: fonosterAppRef || undefined,
+          endpoint: fonosterEndpoint || undefined,
+        };
+
         addSessionEvent(newSession, {
           type: 'system',
-          title: 'Dispatching Fonoster Voice Application',
-          description: `Fonoster Voice webhook active: ${webhookUrl}`,
+          title: 'Dispatching Fonoster Cloud Call',
+          description: `Authenticating Fonoster workspace and syncing Stream Voice App for ${formattedTo}...`,
         });
+
+        const dispatched = await dispatchFonosterOutboundCall(fonosterCreds, {
+          from: fonosterPhone,
+          to: formattedTo,
+          callId,
+          deviceId,
+          appBaseUrl,
+          recordCall: shouldRecord,
+        });
+
+        saveCallCredentials(callId, {
+          deviceId,
+          carrier: 'fonoster',
+          fonosterProjectId,
+          fonosterAccessKeyId,
+          fonosterAccessKeySecret,
+          fonosterAppRef: dispatched.appRef,
+          fonosterEndpoint: fonosterEndpoint || undefined,
+        });
+
+        newSession.providerCallSid = dispatched.ref;
+        newSession.status = 'initiating';
+        if (shouldRecord) {
+          newSession.recordingStatus = 'recording';
+        }
+        providerSidToCallId.set(dispatched.ref, callId);
+        persistSessionsToDisk();
+
+        addSessionEvent(newSession, {
+          type: 'call-state',
+          title: 'Fonoster Call Dispatched',
+          description: `Fonoster Call Ref: ${dispatched.ref}. Stream App: ${dispatched.appRef}${
+            dispatched.appCreated ? ' (auto-created)' : dispatched.appUpdated ? ' (synced)' : ''
+          }.`,
+          data: {
+            callRef: dispatched.ref,
+            appRef: dispatched.appRef,
+            streamUrl: dispatched.streamUrl,
+          },
+        });
+
+        // Track real-time PSTN dial status updates from Fonoster gRPC stream
+        void (async () => {
+          try {
+            for await (const update of dispatched.statusStream) {
+              const s = getSessionById(callId);
+              if (!s) break;
+              const rawStatus = String(update?.status || '').toUpperCase();
+              const cause = update?.hangupCause ? String(update.hangupCause) : '';
+
+              if (rawStatus === 'TRYING') {
+                if (s.status === 'queued') {
+                  s.status = 'initiating';
+                  addSessionEvent(s, {
+                    type: 'call-state',
+                    title: 'Fonoster Dialing PSTN Route',
+                    description: `Connecting outbound call to ${s.to} via Fonoster...`,
+                  });
+                }
+              } else if (rawStatus === 'PROGRESS') {
+                if (['queued', 'initiating'].includes(s.status)) {
+                  s.status = 'ringing';
+                  addSessionEvent(s, {
+                    type: 'call-state',
+                    title: 'Ringing Recipient Phone (Fonoster)',
+                    description: `Destination ${s.to} is ringing. Waiting for answer...`,
+                  });
+                }
+              } else if (rawStatus === 'ANSWER') {
+                if (!['in-progress', 'collecting-input', 'awaiting-operator', 'completed'].includes(s.status)) {
+                  s.status = 'in-progress';
+                  s.answeredAt = s.answeredAt || new Date().toISOString();
+                  addSessionEvent(s, {
+                    type: 'call-state',
+                    title: 'Call Answered (Fonoster)',
+                    description: `Recipient answered ${s.to}. Connecting voice stream & AMD listener...`,
+                  });
+                }
+              } else if (rawStatus === 'BUSY') {
+                s.status = 'busy';
+                s.completedAt = new Date().toISOString();
+                addSessionEvent(s, {
+                  type: 'call-state',
+                  title: 'Line Busy (Fonoster)',
+                  description: cause ? `Recipient line busy (${cause}).` : 'Recipient line is busy.',
+                });
+                void finalizeCallRecording(s);
+              } else if (rawStatus === 'NOANSWER' || rawStatus === 'CANCEL') {
+                if (!['completed', 'failed', 'busy', 'no-answer'].includes(s.status)) {
+                  s.status = 'no-answer';
+                  s.completedAt = new Date().toISOString();
+                  addSessionEvent(s, {
+                    type: 'call-state',
+                    title: rawStatus === 'CANCEL' ? 'Call Canceled (Fonoster)' : 'No Answer (Fonoster)',
+                    description: cause ? `Call ended without answer (${cause}).` : 'Recipient did not answer.',
+                  });
+                  void finalizeCallRecording(s);
+                }
+              } else if (rawStatus === 'FAILED') {
+                if (!['completed', 'failed', 'busy', 'no-answer'].includes(s.status)) {
+                  s.status = 'failed';
+                  s.completedAt = new Date().toISOString();
+                  addSessionEvent(s, {
+                    type: 'error',
+                    title: 'Fonoster Call Failed',
+                    description: cause
+                      ? `Fonoster reported call failure (${cause}). Check your Fonoster trunk, balance, and caller ID.`
+                      : 'Fonoster could not complete the call. Check your Fonoster trunk and caller ID.',
+                  });
+                  void finalizeCallRecording(s);
+                }
+              }
+            }
+          } catch (streamErr: any) {
+            console.error(`Fonoster statusStream error for ${callId}:`, streamErr);
+            const s = getSessionById(callId);
+            if (s && ['queued', 'initiating', 'ringing'].includes(s.status)) {
+              s.status = 'failed';
+              s.completedAt = new Date().toISOString();
+              addSessionEvent(s, {
+                type: 'error',
+                title: 'Fonoster Call Stream Interrupted',
+                description: streamErr?.message || 'Fonoster call tracking stream closed unexpectedly.',
+              });
+              void finalizeCallRecording(s);
+            }
+          }
+        })();
 
         return res.json({
           success: true,
           callId,
+          providerCallSid: dispatched.ref,
+          appRef: dispatched.appRef,
           session: newSession,
           mode: 'live',
           carrier: 'fonoster',
-          message: `Fonoster call routing configured. Listening for webhook events!`,
+          message: `Live Fonoster call placed to ${formattedTo}!`,
         });
       }
     } catch (carrierErr: any) {
@@ -1281,6 +1437,28 @@ async function redirectLiveCallToHumanStart(
         );
         if (r.ok) return true;
       }
+    } else if (carrier === 'fonoster') {
+      const fState = getActiveFonosterState(session.id);
+      if (fState && !fState.voiceSession.ended) {
+        fState.greetStarted = true;
+        session.status = 'collecting-input';
+        addSessionEvent(session, {
+          type: 'playback',
+          title: 'Immediate Pickup Greeting Played (Fonoster)',
+          description: `Live human confirmed. Playing voice greeting & prompt: "${session.introGreeting}"`,
+          data: { greeting: session.introGreeting, script: session.script },
+        });
+        const spokenPrompt = [session.introGreeting, session.script]
+          .filter((t) => Boolean(t && t.trim()))
+          .join(' ');
+        if (spokenPrompt) {
+          void sayOnFonosterCall(session.id, spokenPrompt, {
+            interruptible: true,
+            preempt: true,
+          });
+        }
+        return true;
+      }
     }
   } catch (err) {
     console.error('Live call human-start redirect fallback to amd-gate poll:', err);
@@ -1397,6 +1575,8 @@ async function terminateCarrierCall(
           }
         );
       }
+    } else if (carrier === 'fonoster') {
+      await hangupFonosterCall(session.id);
     }
   } catch (err) {
     console.error('Error terminating carrier call:', err);
@@ -1921,6 +2101,38 @@ async function finalizeCallRecording(
                   const saved = await downloadAndCacheRecording(session, rec.recording_url);
                   if (saved) return;
                 }
+              }
+            } catch {}
+          }
+        } else if (carrier === 'fonoster' && providerSid && !providerSid.startsWith('call_')) {
+          const projectId = carriersConfig.fonoster?.projectId || savedCreds?.fonosterProjectId;
+          const accessKeyId = carriersConfig.fonoster?.accessKeyId || savedCreds?.fonosterAccessKeyId;
+          const accessKeySecret =
+            carriersConfig.fonoster?.accessKeySecret || savedCreds?.fonosterAccessKeySecret;
+          const endpoint = carriersConfig.fonoster?.endpoint || savedCreds?.fonosterEndpoint;
+          if (projectId && accessKeyId && accessKeySecret) {
+            try {
+              const rec = await fetchFonosterRecording(
+                { projectId, accessKeyId, accessKeySecret, endpoint },
+                providerSid
+              );
+              if (rec?.buffer && rec.buffer.byteLength > 128) {
+                const rawExt = rec.contentType.includes('wav')
+                  ? 'wav'
+                  : rec.contentType.includes('ogg')
+                  ? 'ogg'
+                  : 'mp3';
+                const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+                const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
+                const transcoded = await transcodeToCompactHdMp3(rec.buffer, rawExt, mp3OutPath);
+                if (transcoded.ok) {
+                  markRecordingCompleted(session, mp3OutPath, 'mp3', transcoded.durationSec);
+                  return;
+                }
+                const fallbackPath = path.join(RECORDINGS_DIR, `${safeId}.${rawExt}`);
+                fs.writeFileSync(fallbackPath, rec.buffer);
+                markRecordingCompleted(session, fallbackPath, rawExt);
+                return;
               }
             } catch {}
           }
@@ -3636,6 +3848,50 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
     }
   }
 
+  // Live Fonoster VoiceStream direct command execution (approve / reject / spoken cues)
+  if (!session.isSimulated && session.carrier === 'fonoster') {
+    const fState = getActiveFonosterState(session.id);
+    if (fState && !fState.voiceSession.ended) {
+      if (action === 'approve') {
+        const confMsg =
+          session.successMessage ||
+          'Thank you. Your code has been verified successfully. Goodbye.';
+        session.status = 'completed';
+        session.completedAt = new Date().toISOString();
+        addSessionEvent(session, {
+          type: 'playback',
+          title: 'Confirmation Message Played & Call Completed (Fonoster)',
+          description: `Playing synthetic voice: "${confMsg}"`,
+        });
+        void (async () => {
+          await sayOnFonosterCall(session.id, confMsg, {
+            interruptible: false,
+            preempt: true,
+          });
+          await hangupFonosterCall(session.id);
+          void finalizeCallRecording(session, customTwilio, carriersConfig);
+        })();
+      } else if (action === 'reject') {
+        session.operatorDecision = undefined;
+        fState.digitBuffer = '';
+        const retryMsg =
+          session.invalidMessage ||
+          'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
+        void sayOnFonosterCall(session.id, retryMsg, {
+          interruptible: true,
+          preempt: true,
+        });
+      } else if (isCueAction && session.activeCue) {
+        const cueText = session.activeCue.text;
+        session.activeCue = undefined;
+        void sayOnFonosterCall(session.id, cueText, {
+          interruptible: true,
+          preempt: true,
+        });
+      }
+    }
+  }
+
   res.json({ success: true, session });
 });
 
@@ -4048,6 +4304,44 @@ app.delete('/api/prompts', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
+// Verify Fonoster Cloud credentials and auto-sync Stream Voice App (strictly device-scoped, never persisted globally)
+app.post('/api/fonoster/verify', async (req: Request, res: Response) => {
+  const deviceId = getRequestDeviceId(req);
+  if (!deviceId) {
+    return res.status(400).json({ error: 'Missing device session identifier.' });
+  }
+  const { projectId, accessKeyId, accessKeySecret, appRef, endpoint, syncApp = true } = req.body || {};
+  const cleanProjectId = String(projectId || '').trim();
+  const cleanAccessKeyId = String(accessKeyId || '').trim();
+  const cleanAccessKeySecret = String(accessKeySecret || '').trim();
+  if (!cleanProjectId || !cleanAccessKeyId || !cleanAccessKeySecret) {
+    return res.status(400).json({
+      error: 'Workspace Access Key ID, API Key Access Key ID, and API Key Secret are required.',
+    });
+  }
+  try {
+    const appBaseUrl = getPublicBaseUrl(req);
+    const result = await verifyFonosterConnection(
+      {
+        projectId: cleanProjectId,
+        accessKeyId: cleanAccessKeyId,
+        accessKeySecret: cleanAccessKeySecret,
+        appRef: appRef ? String(appRef).trim() : undefined,
+        endpoint: endpoint ? String(endpoint).trim() : undefined,
+      },
+      appBaseUrl,
+      Boolean(syncApp)
+    );
+    res.json(result);
+  } catch (err: any) {
+    console.error('Fonoster verify error:', err);
+    res.status(400).json({
+      ok: false,
+      error: err?.details || err?.message || 'Failed to authenticate with Fonoster.',
+    });
+  }
+});
+
 // Mount Vite in development or static dist in production, binding port 3000 immediately
 function startServer() {
   let viteInstance: any = null;
@@ -4072,6 +4366,175 @@ function startServer() {
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`VoiceDrop Interactive server running on http://0.0.0.0:${PORT}`);
+  });
+
+  attachFonosterVoiceServer(httpServer, {
+    resolveSession: ({ callId, callRef, to }) => {
+      if (callId) {
+        const byId = getSessionById(callId);
+        if (byId) return byId;
+      }
+      if (callRef) {
+        const byRef = getSessionById(callRef);
+        if (byRef) return byRef;
+      }
+      const normTo = normalizeCallerId(to);
+      if (!normTo) return undefined;
+      return Array.from(sessions.values())
+        .filter(
+          (s) =>
+            s.carrier === 'fonoster' &&
+            s.to === normTo &&
+            ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
+              s.status
+            )
+        )
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+    },
+    onSessionConnected: (session: CallSession, callRef: string) => {
+      if (callRef && !session.providerCallSid) {
+        session.providerCallSid = callRef;
+        providerSidToCallId.set(callRef, session.id);
+      }
+      session.status = 'in-progress';
+      session.answeredAt = session.answeredAt || new Date().toISOString();
+      if (session.recordCall !== false) {
+        session.recordingStatus = 'recording';
+      }
+      addSessionEvent(session, {
+        type: 'call-state',
+        title: 'Fonoster Voice Stream Connected',
+        description: 'Audio stream active. Listening for voice, AMD, and keypad input.',
+      });
+    },
+    onAmdResult: async (session: CallSession, status, rawLabel) => {
+      await applyAmdResult(session, status, rawLabel);
+    },
+    onStartHumanGreeting: async (session: CallSession) => {
+      session.promptsStarted = true;
+      session.status = 'collecting-input';
+      addSessionEvent(session, {
+        type: 'playback',
+        title: 'Immediate Pickup Greeting Played (Fonoster)',
+        description: `Playing voice prompt: "${session.introGreeting}"`,
+        data: { greeting: session.introGreeting, script: session.script },
+      });
+      const promptText = [session.introGreeting, session.script]
+        .filter((t) => Boolean(t && t.trim()))
+        .join(' ');
+      if (promptText) {
+        await sayOnFonosterCall(session.id, promptText, { interruptible: true, preempt: true });
+      }
+    },
+    onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {
+      const ctx = session.status === 'awaiting-operator' ? 'On Hold' : 'Live Call';
+      appendSpeechTranscript(session, text, confidence, ctx);
+      if (
+        session.answeredBy === 'voicemail' &&
+        !session.humanPickedUpAfterVoicemail &&
+        checkHumanPickupOnVoicemail(session, text)
+      ) {
+        session.humanPickedUpAfterVoicemail = true;
+        await applyAmdResult(session, 'human', 'speech_human_pickup');
+        return true;
+      }
+      return false;
+    },
+    onDigitsSubmitted: async (
+      session: CallSession,
+      digits: string,
+      submittedViaPound: boolean,
+      state: FonosterSessionState
+    ) => {
+      session.submittedViaPound = submittedViaPound;
+      if (session.verificationMode === 'manual') {
+        session.pendingDigits = digits;
+        session.codeStatus = 'awaiting_operator';
+        session.status = 'awaiting-operator';
+        addSessionEvent(session, {
+          type: 'dtmf',
+          title: `Keypad Input Captured: [${digits}]${submittedViaPound ? ' (#)' : ''}`,
+          description: `Awaiting operator review. Playing hold message.`,
+          data: { digits, submittedViaPound },
+        });
+        const holdMsg =
+          session.holdMessage || 'Kindly hold while your information is being processed.';
+        await sayOnFonosterCall(session.id, holdMsg, { interruptible: false, preempt: true });
+        return;
+      }
+
+      const expected = (session.expectedCode || '').trim();
+      if (!expected || digits === expected) {
+        session.capturedDigits = digits;
+        session.pendingDigits = undefined;
+        session.codeStatus = 'valid';
+        session.status = 'completed';
+        session.completedAt = new Date().toISOString();
+        addSessionEvent(session, {
+          type: 'dtmf',
+          title: `Code Verified Automatically: [${digits}]`,
+          description: 'Playing confirmation message and ending call.',
+          data: { digits, submittedViaPound },
+        });
+        const okMsg =
+          session.successMessage ||
+          'Thank you. Your code has been verified successfully. Goodbye.';
+        await sayOnFonosterCall(session.id, okMsg, { interruptible: false, preempt: true });
+        await hangupFonosterCall(session.id);
+        void finalizeCallRecording(session);
+      } else {
+        session.attempts = (session.attempts || 0) + 1;
+        session.lastInvalidDigits = digits;
+        const maxAtt = session.maxAttempts || 3;
+        if (session.attempts >= maxAtt) {
+          session.codeStatus = 'max_exceeded';
+          session.status = 'completed';
+          session.completedAt = new Date().toISOString();
+          addSessionEvent(session, {
+            type: 'error',
+            title: `Max Attempts Reached (${session.attempts}/${maxAtt}): [${digits}]`,
+            description: 'Maximum retry attempts reached. Ending call.',
+          });
+          await sayOnFonosterCall(session.id, 'Maximum attempts reached. Goodbye.', {
+            interruptible: false,
+            preempt: true,
+          });
+          await hangupFonosterCall(session.id);
+          void finalizeCallRecording(session);
+        } else {
+          session.codeStatus = 'invalid';
+          state.digitBuffer = '';
+          addSessionEvent(session, {
+            type: 'error',
+            title: `Invalid Input (Attempt ${session.attempts}/${maxAtt}): [${digits}]`,
+            description: 'Prompting caller to re-enter input.',
+          });
+          const retryMsg =
+            session.invalidMessage ||
+            'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
+          await sayOnFonosterCall(session.id, retryMsg, { interruptible: true, preempt: true });
+        }
+      }
+    },
+    onSessionEnded: async (session: CallSession, reason: string) => {
+      if (!['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {
+        session.status = 'completed';
+        session.completedAt = new Date().toISOString();
+        if (session.answeredAt) {
+          session.duration = Math.max(
+            1,
+            Math.round((Date.now() - new Date(session.answeredAt).getTime()) / 1000)
+          );
+        }
+        addSessionEvent(session, {
+          type: 'call-state',
+          title: 'Call Completed (Fonoster)',
+          description: `Voice stream closed (${reason}).`,
+        });
+      }
+      void finalizeCallRecording(session);
+    },
+    getMaxDigits: getEffectiveMaxDigits,
   });
 
   httpServer.on('error', (err) => {
