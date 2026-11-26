@@ -16,7 +16,7 @@ import {
   verifyFonosterConnection,
   type FonosterCredentials,
   type FonosterSessionState,
-} from './server/fonoster';
+} from './server/fonoster.ts';
 
 const execFileAsync = promisify(execFile);
 
