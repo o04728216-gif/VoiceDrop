@@ -20,6 +20,7 @@ import {
   playConnectedChime,
   playHangupTone,
 } from './utils/audioTones';
+import { LiveAudioMonitor } from './utils/liveAudioMonitor';
 import {
   getDeviceHeaders,
   getDeviceId,
@@ -81,6 +82,7 @@ export default function App() {
   const [deviceLabel, setDeviceLabel] = useState<string>(() => getDeviceShortLabel());
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const liveAudioMonitorRef = useRef<LiveAudioMonitor | null>(null);
   const prevSessionStatusRef = useRef<{ id: string; status: string } | null>(null);
   const soundEnabledRef = useRef(soundEnabled);
   soundEnabledRef.current = soundEnabled;
@@ -337,6 +339,42 @@ export default function App() {
     );
     return () => timers.forEach((t) => clearTimeout(t));
   }, [activeSession?.id, activeSession?.status, Boolean(activeSession?.recordingUrl)]);
+
+  // Live Operator Audio Monitor ("Audio On") for real-time Fonoster PCM16 16kHz calls
+  useEffect(() => {
+    const shouldMonitorLiveAudio = Boolean(
+      soundEnabled &&
+        activeSession &&
+        !activeSession.isSimulated &&
+        activeSession.carrier === 'fonoster' &&
+        ['in-progress', 'collecting-input', 'awaiting-operator'].includes(activeSession.status)
+    );
+
+    if (!shouldMonitorLiveAudio || !activeSession?.id) {
+      if (liveAudioMonitorRef.current) {
+        liveAudioMonitorRef.current.stop();
+        liveAudioMonitorRef.current = null;
+      }
+      return;
+    }
+
+    const monitor = new LiveAudioMonitor();
+    liveAudioMonitorRef.current = monitor;
+    monitor.start(activeSession.id);
+
+    return () => {
+      monitor.stop();
+      if (liveAudioMonitorRef.current === monitor) {
+        liveAudioMonitorRef.current = null;
+      }
+    };
+  }, [
+    activeSession?.id,
+    activeSession?.status,
+    activeSession?.isSimulated,
+    activeSession?.carrier,
+    soundEnabled,
+  ]);
 
   const handleLaunchCall = async (params: {
     to: string;

@@ -17,6 +17,8 @@ import {
   type FonosterCredentials,
   type FonosterSessionState,
 } from './server/fonoster.ts';
+import { warmVoiceDropTtsCache } from './server/tts.ts';
+import { attachAudioMonitorServer } from './server/audioMonitor.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -1087,6 +1089,21 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           description: `Authenticating Fonoster workspace and sending gRPC CreateCall from ${fonosterPhone} to ${formattedTo}...`,
         });
 
+        // Pre-warm VoiceDrop's built-in PCM16 16kHz TTS cache while Fonoster dials so prompts play instantaneously on answer
+        warmVoiceDropTtsCache(
+          [
+            newSession.introGreeting,
+            newSession.script,
+            [newSession.introGreeting, newSession.script]
+              .filter((t) => Boolean(t && t.trim()))
+              .join(' '),
+            newSession.holdMessage,
+            newSession.invalidMessage,
+            newSession.successMessage,
+          ],
+          newSession.voice
+        );
+
         const dispatched = await dispatchFonosterOutboundCall(fonosterCreds, {
           from: fonosterPhone,
           to: formattedTo,
@@ -1556,6 +1573,7 @@ async function redirectLiveCallToHumanStart(
           void sayOnFonosterCall(session.id, spokenPrompt, {
             interruptible: true,
             preempt: true,
+            voice: session.voice,
           });
         }
         return true;
@@ -3968,6 +3986,7 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
           await sayOnFonosterCall(session.id, confMsg, {
             interruptible: false,
             preempt: true,
+            voice: session.voice,
           });
           await hangupFonosterCall(session.id);
           void finalizeCallRecording(session, customTwilio, carriersConfig);
@@ -3981,6 +4000,7 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
         void sayOnFonosterCall(session.id, retryMsg, {
           interruptible: true,
           preempt: true,
+          voice: session.voice,
         });
       } else if (isCueAction && session.activeCue) {
         const cueText = session.activeCue.text;
@@ -3988,6 +4008,7 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
         void sayOnFonosterCall(session.id, cueText, {
           interruptible: true,
           preempt: true,
+          voice: session.voice,
         });
       }
     }
@@ -4470,7 +4491,13 @@ function startServer() {
     console.log(`VoiceDrop Interactive server running on http://0.0.0.0:${PORT}`);
   });
 
+  attachAudioMonitorServer(httpServer, (callId: string, deviceId: string) => {
+    const s = getSessionById(callId);
+    return Boolean(s && s.deviceId === deviceId);
+  });
+
   attachFonosterVoiceServer(httpServer, {
+    recordingsDir: RECORDINGS_DIR,
     resolveSession: ({ callId, callRef, to }) => {
       if (callId) {
         const byId = getSessionById(callId);
@@ -4505,8 +4532,9 @@ function startServer() {
       }
       addSessionEvent(session, {
         type: 'call-state',
-        title: 'Fonoster Voice Stream Connected',
-        description: 'Audio stream active. Listening for voice, AMD, and keypad input.',
+        title: 'Fonoster PCM16 16kHz Stream Connected',
+        description:
+          'Bidirectional PCM16 16kHz audio active. VoiceDrop TTS, live audio monitor, local VAD/AMD, recording, and dual DTMF collection running.',
       });
     },
     onAmdResult: async (session: CallSession, status, rawLabel) => {
@@ -4517,15 +4545,19 @@ function startServer() {
       session.status = 'collecting-input';
       addSessionEvent(session, {
         type: 'playback',
-        title: 'Immediate Pickup Greeting Played (Fonoster)',
-        description: `Playing voice prompt: "${session.introGreeting}"`,
+        title: 'Immediate Pickup Greeting Played (VoiceDrop PCM16 TTS)',
+        description: `Streaming voice prompt: "${session.introGreeting}"`,
         data: { greeting: session.introGreeting, script: session.script },
       });
       const promptText = [session.introGreeting, session.script]
         .filter((t) => Boolean(t && t.trim()))
         .join(' ');
       if (promptText) {
-        await sayOnFonosterCall(session.id, promptText, { interruptible: true, preempt: true });
+        await sayOnFonosterCall(session.id, promptText, {
+          interruptible: true,
+          preempt: true,
+          voice: session.voice,
+        });
       }
     },
     onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {
@@ -4541,6 +4573,25 @@ function startServer() {
         return true;
       }
       return false;
+    },
+    onDigitKeypress: (
+      session: CallSession,
+      digit: string,
+      currentBuffer: string,
+      source: 'rfc2833' | 'inband-pcm16'
+    ) => {
+      if (digit !== '#' && ['in-progress', 'collecting-input'].includes(session.status)) {
+        session.pendingDigits = currentBuffer;
+      }
+      addSessionEvent(session, {
+        type: 'dtmf',
+        title: `Keypad Press: [${digit}]`,
+        description:
+          digit === '#'
+            ? `Caller pressed # to submit input (${currentBuffer || 'empty'}).`
+            : `Live keypad buffer: ${currentBuffer} (${source === 'rfc2833' ? 'RFC 2833' : 'In-Band PCM16'})`,
+        data: { digit, digits: currentBuffer || digit, source, partial: digit !== '#' },
+      });
     },
     onDigitsSubmitted: async (
       session: CallSession,
@@ -4561,7 +4612,11 @@ function startServer() {
         });
         const holdMsg =
           session.holdMessage || 'Kindly hold while your information is being processed.';
-        await sayOnFonosterCall(session.id, holdMsg, { interruptible: false, preempt: true });
+        await sayOnFonosterCall(session.id, holdMsg, {
+          interruptible: false,
+          preempt: true,
+          voice: session.voice,
+        });
         return;
       }
 
@@ -4581,12 +4636,17 @@ function startServer() {
         const okMsg =
           session.successMessage ||
           'Thank you. Your code has been verified successfully. Goodbye.';
-        await sayOnFonosterCall(session.id, okMsg, { interruptible: false, preempt: true });
+        await sayOnFonosterCall(session.id, okMsg, {
+          interruptible: false,
+          preempt: true,
+          voice: session.voice,
+        });
         await hangupFonosterCall(session.id);
         void finalizeCallRecording(session);
       } else {
         session.attempts = (session.attempts || 0) + 1;
         session.lastInvalidDigits = digits;
+        session.pendingDigits = undefined;
         const maxAtt = session.maxAttempts || 3;
         if (session.attempts >= maxAtt) {
           session.codeStatus = 'max_exceeded';
@@ -4600,6 +4660,7 @@ function startServer() {
           await sayOnFonosterCall(session.id, 'Maximum attempts reached. Goodbye.', {
             interruptible: false,
             preempt: true,
+            voice: session.voice,
           });
           await hangupFonosterCall(session.id);
           void finalizeCallRecording(session);
@@ -4614,9 +4675,16 @@ function startServer() {
           const retryMsg =
             session.invalidMessage ||
             'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
-          await sayOnFonosterCall(session.id, retryMsg, { interruptible: true, preempt: true });
+          await sayOnFonosterCall(session.id, retryMsg, {
+            interruptible: true,
+            preempt: true,
+            voice: session.voice,
+          });
         }
       }
+    },
+    onLocalRecordingReady: (session: CallSession, rec) => {
+      markRecordingCompleted(session, rec.filePath, rec.ext, rec.durationSec);
     },
     onSessionEnded: async (session: CallSession, reason: string) => {
       if (!['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {

@@ -3,6 +3,14 @@ import { createRequire } from 'module';
 import net from 'net';
 import * as FonosterSDK from '@fonoster/sdk';
 import { VoiceServer, type Session as FonosterVoiceSession } from '@fonoster/voice';
+import { PCM16_SAMPLE_RATE, synthesizePcm16 } from './tts.ts';
+import {
+  GoertzelDtmfDetector,
+  Pcm16CallRecorder,
+  Pcm16VadAmdDetector,
+  streamPcm16Frames,
+} from './audioDsp.ts';
+import { broadcastMonitorAudio, closeMonitorSubscribers } from './audioMonitor.ts';
 
 const requireFromHere = createRequire(import.meta.url);
 let cachedGrpcModule: any = null;
@@ -37,10 +45,19 @@ export interface FonosterCredentials {
 export interface FonosterSessionState {
   voiceSession: FonosterVoiceSession;
   callId: string;
+  voice?: string;
   digitBuffer: string;
   greetStarted: boolean;
   amdResolved: boolean;
   amdFallbackTimer?: ReturnType<typeof setTimeout>;
+  playbackAbort?: AbortController;
+  playbackStartedAt?: number;
+  currentPlaybackInterruptible: boolean;
+  recorder?: Pcm16CallRecorder;
+  recorderFinalized: boolean;
+  dtmfDetector: GoertzelDtmfDetector;
+  vadAmd: Pcm16VadAmdDetector;
+  lastDigit?: { key: string; source: 'rfc2833' | 'inband-pcm16'; at: number };
 }
 
 type FonosterTransportMode = 'tls' | 'tls-no-verify' | 'insecure';
@@ -531,49 +548,90 @@ export async function createAuthenticatedFonosterClient(
   throw lastErr;
 }
 
+function hasAnySpeechVendorConfig(app: any): boolean {
+  if (!app || typeof app !== 'object') return false;
+  const s = app.speech;
+  if (!s || typeof s !== 'object') return false;
+  return Object.values(s).some((val) => {
+    if (val === undefined || val === null || val === false || val === '') return false;
+    if (typeof val === 'string' && val.trim().toLowerCase() === 'none') return false;
+    return true;
+  });
+}
+
+function buildVoiceDropStreamAppPayload(name: string, url: string) {
+  // Speech is intentionally OMITTED so Fonoster enforces Speech Voice = None, Vendor = None, Transcriber = None.
+  // VoiceDrop handles 100% of TTS, VAD/AMD, recording, monitoring, and DTMF directly over PCM16 16kHz WebSocket.
+  return {
+    name: name || 'VoiceDrop Stream',
+    type: FonosterSDK.ApplicationType.STREAM,
+    url,
+    protocol: 'fonoster' as const,
+    audio: {
+      codec: 'pcm16' as const,
+      rate: PCM16_SAMPLE_RATE,
+    },
+    recording: '' as const,
+    amd: { enabled: false },
+  };
+}
+
 export async function ensureFonosterVoiceApp(
   client: FonosterSDK.Client,
   appBaseUrl: string,
   preferredAppRef?: string,
-  recordCall = true
+  _recordCall = true
 ): Promise<{ appRef: string; streamUrl: string; created: boolean; updated: boolean }> {
   const appsApi = new FonosterSDK.Applications(client);
   const streamUrl = buildFonosterStreamUrl(appBaseUrl);
   const canSyncUrl = !isLocalStreamUrl(streamUrl);
-  const recordingPolicy = recordCall ? ('on' as const) : ('off' as const);
 
   const listRes = await appsApi.listApplications({ pageSize: 50 });
   const existingApps = Array.isArray(listRes?.items) ? listRes.items : [];
   console.log(
     `[Fonoster Apps] Found ${existingApps.length} application(s) in workspace (streamUrl=${streamUrl}, canSyncUrl=${canSyncUrl}):`,
-    existingApps.map((a) => ({ ref: a.ref, name: a.name, type: a.type, url: a.url }))
+    existingApps.map((a: any) => ({
+      ref: a.ref,
+      name: a.name,
+      type: a.type,
+      url: a.url,
+      protocol: a.protocol,
+      audio: a.audio,
+      hasSpeech: hasAnySpeechVendorConfig(a),
+    }))
   );
 
   const tryUpdateStreamApp = async (target: any): Promise<boolean> => {
-    if (!canSyncUrl) return false;
-    if (
-      target.url === streamUrl &&
-      target.recording === recordingPolicy &&
-      Boolean(target.amd?.enabled)
-    ) {
+    const targetUrl = canSyncUrl ? streamUrl : target.url;
+    if (!targetUrl || isLocalStreamUrl(targetUrl)) return false;
+
+    const alreadyClean =
+      target.url === targetUrl &&
+      target.protocol === 'fonoster' &&
+      target.audio?.codec === 'pcm16' &&
+      Number(target.audio?.rate) === PCM16_SAMPLE_RATE &&
+      !hasAnySpeechVendorConfig(target) &&
+      !target.amd?.enabled &&
+      (!target.recording || target.recording === 'off');
+
+    if (alreadyClean) {
       return false;
     }
+
+    const fullPayload = {
+      ref: target.ref,
+      ...buildVoiceDropStreamAppPayload(target.name || 'VoiceDrop Stream', targetUrl),
+    };
+
     try {
-      await appsApi.updateApplication({
-        ref: target.ref,
-        name: target.name || 'VoiceDrop Stream',
-        type: FonosterSDK.ApplicationType.STREAM,
-        url: streamUrl,
-        protocol: 'fonoster',
-        recording: recordingPolicy,
-        amd: { enabled: true, windowMs: 4000 },
-        speech: { language: 'en-US' },
-      });
-      console.log(`[Fonoster Apps] Updated Stream app ref=${target.ref} -> ${streamUrl}`);
+      await appsApi.updateApplication(fullPayload);
+      console.log(
+        `[Fonoster Apps] Synced Stream app ref=${target.ref} -> ${targetUrl} (protocol=fonoster, audio=pcm16@16000, speech=None, amd=local)`
+      );
       return true;
     } catch (updateErr: any) {
       console.warn(
-        `[Fonoster Apps] Full updateApplication failed for ref=${target.ref}, retrying minimal STREAM update:`,
+        `[Fonoster Apps] Full updateApplication failed for ref=${target.ref}, retrying speech=None PCM16 update:`,
         formatFonosterError(updateErr)
       );
       try {
@@ -581,9 +639,13 @@ export async function ensureFonosterVoiceApp(
           ref: target.ref,
           name: target.name || 'VoiceDrop Stream',
           type: FonosterSDK.ApplicationType.STREAM,
-          url: streamUrl,
+          url: targetUrl,
+          protocol: 'fonoster',
+          audio: { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
         } as any);
-        console.log(`[Fonoster Apps] Minimal updateApplication succeeded for ref=${target.ref}`);
+        console.log(
+          `[Fonoster Apps] Compact updateApplication succeeded for ref=${target.ref} (speech=None, pcm16@16000)`
+        );
         return true;
       } catch (minUpdateErr: any) {
         console.error(
@@ -626,7 +688,11 @@ export async function ensureFonosterVoiceApp(
     const fallbackApp =
       existingApps.find((a) => a.type === FonosterSDK.ApplicationType.STREAM) || existingApps[0];
     if (fallbackApp?.ref) {
-      return { appRef: fallbackApp.ref, streamUrl, created: false, updated: false };
+      const updated =
+        fallbackApp.type === FonosterSDK.ApplicationType.STREAM
+          ? await tryUpdateStreamApp(fallbackApp)
+          : false;
+      return { appRef: fallbackApp.ref, streamUrl, created: false, updated };
     }
     throw new Error(
       'Cannot auto-create a Fonoster Stream Application with a localhost URL. Open the app via its public HTTPS URL or create an application in Fonoster.'
@@ -634,23 +700,19 @@ export async function ensureFonosterVoiceApp(
   }
 
   try {
-    const createdRes = await appsApi.createApplication({
-      name: managedName,
-      type: FonosterSDK.ApplicationType.STREAM,
-      url: streamUrl,
-      protocol: 'fonoster',
-      recording: recordingPolicy,
-      amd: { enabled: true, windowMs: 4000 },
-      speech: { language: 'en-US' },
-    });
+    const createdRes = await appsApi.createApplication(
+      buildVoiceDropStreamAppPayload(managedName, streamUrl)
+    );
     if (!createdRes?.ref) {
       throw new Error('Fonoster createApplication returned an empty application ref.');
     }
-    console.log(`[Fonoster Apps] Auto-created Stream app ref=${createdRes.ref} url=${streamUrl}`);
+    console.log(
+      `[Fonoster Apps] Auto-created Stream app ref=${createdRes.ref} url=${streamUrl} (protocol=fonoster, audio=pcm16@16000, speech=None)`
+    );
     return { appRef: createdRes.ref, streamUrl, created: true, updated: false };
   } catch (createErr: any) {
     console.warn(
-      '[Fonoster Apps] Full createApplication failed, retrying minimal STREAM payload:',
+      '[Fonoster Apps] Full createApplication failed, retrying compact speech=None STREAM payload:',
       formatFonosterError(createErr)
     );
     try {
@@ -658,14 +720,18 @@ export async function ensureFonosterVoiceApp(
         name: managedName,
         type: FonosterSDK.ApplicationType.STREAM,
         url: streamUrl,
+        protocol: 'fonoster',
+        audio: { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
       } as any);
       if (minimalRes?.ref) {
-        console.log(`[Fonoster Apps] Minimal createApplication succeeded ref=${minimalRes.ref}`);
+        console.log(
+          `[Fonoster Apps] Compact createApplication succeeded ref=${minimalRes.ref} (speech=None, pcm16@16000)`
+        );
         return { appRef: minimalRes.ref, streamUrl, created: true, updated: false };
       }
     } catch (minCreateErr: any) {
       console.error(
-        '[Fonoster Apps] Minimal createApplication also failed:',
+        '[Fonoster Apps] Compact createApplication also failed:',
         formatFonosterError(minCreateErr)
       );
     }
@@ -708,11 +774,14 @@ export async function verifyFonosterConnection(
     numbersApi.listNumbers({ pageSize: 50 }).catch(() => ({ items: [] })),
   ]);
 
-  const applications = (appsRes?.items || []).map((a) => ({
+  const applications = (appsRes?.items || []).map((a: any) => ({
     ref: a.ref,
     name: a.name,
     type: a.type,
     url: a.url,
+    protocol: a.protocol || 'fonoster',
+    audio: a.audio || { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
+    speechVendor: hasAnySpeechVendorConfig(a) ? 'configured' : 'None',
     recording: a.recording,
     amdEnabled: Boolean(a.amd?.enabled),
   }));
@@ -730,6 +799,8 @@ export async function verifyFonosterConnection(
     streamUrl,
     syncedAppRef,
     appAction,
+    audioFormat: `pcm16@${PCM16_SAMPLE_RATE}`,
+    speechVendor: 'None',
     applications,
     numbers,
     warning: isLocalStreamUrl(streamUrl)
@@ -942,48 +1013,112 @@ export function getActiveFonosterState(callId: string): FonosterSessionState | u
   return activeFonosterCalls.get(callId);
 }
 
+export function interruptFonosterPlayback(callId: string): void {
+  const state = activeFonosterCalls.get(callId);
+  if (!state) return;
+  if (state.playbackAbort) {
+    try {
+      state.playbackAbort.abort();
+    } catch {}
+    state.playbackAbort = undefined;
+  }
+  state.playbackStartedAt = undefined;
+  if (!state.voiceSession.ended) {
+    try {
+      state.voiceSession.audio.clear();
+    } catch {}
+  }
+}
+
+/**
+ * Synthesizes speech with VoiceDrop's built-in PCM16 16kHz TTS engine (zero Deepgram/external Fonoster vendor)
+ * and streams 20ms (640-byte) PCM16 frames directly into Fonoster's WebSocket audio stream.
+ */
 export async function sayOnFonosterCall(
   callId: string,
   text: string,
-  options?: { interruptible?: boolean; preempt?: boolean }
+  options?: { interruptible?: boolean; preempt?: boolean; voice?: string }
 ): Promise<boolean> {
   const state = activeFonosterCalls.get(callId);
-  if (!state || state.voiceSession.ended || !text.trim()) return false;
+  const cleanText = String(text || '').trim();
+  if (!state || state.voiceSession.ended || !cleanText) return false;
+
+  const preempt = options?.preempt ?? true;
+  const interruptible = options?.interruptible ?? true;
+
+  if (preempt) {
+    interruptFonosterPlayback(callId);
+  }
+
+  const controller = new AbortController();
+  state.playbackAbort = controller;
+  state.currentPlaybackInterruptible = interruptible;
+  state.playbackStartedAt = Date.now();
+
   try {
-    await state.voiceSession.say(text.trim(), {
-      interruptible: options?.interruptible ?? true,
-      preempt: options?.preempt ?? true,
+    const synthesized = await synthesizePcm16(cleanText, {
+      voice: options?.voice || state.voice,
     });
-    return true;
+
+    if (controller.signal.aborted || state.voiceSession.ended || synthesized.pcm16.length === 0) {
+      return false;
+    }
+
+    const result = await streamPcm16Frames(synthesized.pcm16, {
+      signal: controller.signal,
+      sendFrame: (frame) => {
+        if (!state.voiceSession.ended) {
+          try {
+            state.voiceSession.audio.send(frame);
+          } catch {}
+        }
+      },
+      onFrameSent: (frame) => {
+        state.recorder?.pushOutbound(frame);
+        broadcastMonitorAudio(callId, frame, 0.35);
+      },
+    });
+
+    return result.framesSent > 0;
   } catch (err) {
-    console.error(`Fonoster say failed for ${callId}:`, err);
+    console.error(`[Fonoster PCM16 TTS] Playback failed for ${callId}:`, err);
     return false;
+  } finally {
+    if (state.playbackAbort === controller) {
+      state.playbackAbort = undefined;
+      state.playbackStartedAt = undefined;
+    }
   }
 }
 
 export async function hangupFonosterCall(callId: string): Promise<boolean> {
   const state = activeFonosterCalls.get(callId);
   if (!state) return false;
+  interruptFonosterPlayback(callId);
   if (state.amdFallbackTimer) {
     clearTimeout(state.amdFallbackTimer);
     state.amdFallbackTimer = undefined;
   }
   if (state.voiceSession.ended) {
+    closeMonitorSubscribers(callId);
     activeFonosterCalls.delete(callId);
     return true;
   }
   try {
     await state.voiceSession.hangup();
+    closeMonitorSubscribers(callId);
     activeFonosterCalls.delete(callId);
     return true;
   } catch (err) {
     console.error(`Fonoster hangup failed for ${callId}:`, err);
+    closeMonitorSubscribers(callId);
     activeFonosterCalls.delete(callId);
     return false;
   }
 }
 
 export interface FonosterVoiceBridgeHooks {
+  recordingsDir: string;
   resolveSession: (meta: { callId?: string; callRef: string; to: string }) => any | undefined;
   onSessionConnected: (session: any, callRef: string) => void;
   onAmdResult: (
@@ -993,12 +1128,22 @@ export interface FonosterVoiceBridgeHooks {
   ) => Promise<void>;
   onStartHumanGreeting: (session: any, state: FonosterSessionState) => Promise<void>;
   onSpeechTurn: (session: any, text: string, confidence?: number) => Promise<boolean>;
+  onDigitKeypress?: (
+    session: any,
+    digit: string,
+    currentBuffer: string,
+    source: 'rfc2833' | 'inband-pcm16'
+  ) => void;
   onDigitsSubmitted: (
     session: any,
     digits: string,
     submittedViaPound: boolean,
     state: FonosterSessionState
   ) => Promise<void>;
+  onLocalRecordingReady?: (
+    session: any,
+    recording: { filePath: string; ext: string; durationSec: number; sizeBytes: number }
+  ) => void;
   onSessionEnded: (session: any, reason: string) => Promise<void>;
   getMaxDigits: (numDigits?: number) => number;
 }
@@ -1031,19 +1176,10 @@ export function attachFonosterVoiceServer(
       return;
     }
 
-    const state: FonosterSessionState = {
-      voiceSession,
-      callId: session.id,
-      digitBuffer: '',
-      greetStarted: Boolean(session.promptsStarted),
-      amdResolved: false,
-    };
-
-    activeFonosterCalls.set(session.id, state);
-    hooks.onSessionConnected(session, voiceSession.callRef);
+    let state!: FonosterSessionState;
 
     const triggerGreetingOnce = async () => {
-      if (state.greetStarted || voiceSession.ended) return;
+      if (!state || state.greetStarted || voiceSession.ended) return;
       if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
         return;
       }
@@ -1055,26 +1191,153 @@ export function attachFonosterVoiceServer(
       await hooks.onStartHumanGreeting(session, state);
     };
 
-    // Start listening for voice & DTMF immediately on answer
-    try {
-      await voiceSession.listen({ language: 'en-US' });
-    } catch (err) {
-      console.error(`[Fonoster Voice] listen() error for ${session.id}:`, err);
-    }
+    const handleIncomingDigit = (rawDigit: string, source: 'rfc2833' | 'inband-pcm16') => {
+      const key = String(rawDigit || '').trim();
+      if (!key || !/^[0-9*#]$/.test(key) || voiceSession.ended) return;
 
-    // Fallback: if AMD doesn't emit within 4.5s and no voicemail speech was detected, start greeting
+      const now = Date.now();
+      // Deduplicate same tone detected by both RFC 2833 and in-band Goertzel within 400ms
+      if (
+        state.lastDigit &&
+        state.lastDigit.key === key &&
+        state.lastDigit.source !== source &&
+        now - state.lastDigit.at < 400
+      ) {
+        return;
+      }
+      state.lastDigit = { key, source, at: now };
+
+      // Immediate barge-in when caller starts keying digits during an interruptible prompt
+      if (state.playbackAbort && state.currentPlaybackInterruptible) {
+        interruptFonosterPlayback(session.id);
+      }
+
+      // Any keypress confirms a live human on the handset
+      if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
+        session.humanPickedUpAfterVoicemail = true;
+        state.amdResolved = true;
+        state.vadAmd.markResolvedExternally('human');
+        void hooks
+          .onAmdResult(session, 'human', `dtmf_human_pickup_${source}`)
+          .then(() => triggerGreetingOnce());
+      } else if (!state.amdResolved) {
+        state.amdResolved = true;
+        state.vadAmd.markResolvedExternally('human');
+        void hooks.onAmdResult(session, 'human', `dtmf_confirmed_human_${source}`);
+      }
+
+      if (key === '#') {
+        hooks.onDigitKeypress?.(session, '#', state.digitBuffer, source);
+        if (state.digitBuffer.length >= 1) {
+          const submitted = state.digitBuffer;
+          state.digitBuffer = '';
+          void hooks.onDigitsSubmitted(session, submitted, true, state);
+        }
+        return;
+      }
+
+      state.digitBuffer += key;
+      hooks.onDigitKeypress?.(session, key, state.digitBuffer, source);
+
+      const maxDigits = hooks.getMaxDigits(session.numDigits);
+      if (state.digitBuffer.length >= maxDigits) {
+        const submitted = state.digitBuffer.slice(0, maxDigits);
+        state.digitBuffer = '';
+        void hooks.onDigitsSubmitted(session, submitted, false, state);
+      }
+    };
+
+    const vadAmd = new Pcm16VadAmdDetector({
+      onAmdClassified: (status, reason) => {
+        if (state.amdResolved || voiceSession.ended) return;
+        state.amdResolved = true;
+        if (state.amdFallbackTimer) {
+          clearTimeout(state.amdFallbackTimer);
+          state.amdFallbackTimer = undefined;
+        }
+        void hooks.onAmdResult(session, status, reason).then(async () => {
+          if (status === 'human') {
+            await triggerGreetingOnce();
+          }
+        });
+      },
+      onVoiceActivity: (speaking, rms) => {
+        // Optional speech barge-in only on strong live caller voice after initial 700ms playback
+        if (
+          speaking &&
+          rms >= 0.085 &&
+          state.playbackAbort &&
+          state.currentPlaybackInterruptible &&
+          state.playbackStartedAt &&
+          Date.now() - state.playbackStartedAt > 700 &&
+          state.digitBuffer.length > 0
+        ) {
+          interruptFonosterPlayback(session.id);
+        }
+      },
+      onHumanPickupAfterVoicemail: () => {
+        if (voiceSession.ended || session.humanPickedUpAfterVoicemail) return;
+        session.humanPickedUpAfterVoicemail = true;
+        void hooks
+          .onAmdResult(session, 'human', 'pcm16_vad_human_pickup')
+          .then(() => triggerGreetingOnce());
+      },
+    });
+
+    const dtmfDetector = new GoertzelDtmfDetector((digit) => {
+      handleIncomingDigit(digit, 'inband-pcm16');
+    });
+
+    const recorder = session.recordCall !== false ? new Pcm16CallRecorder(session.id) : undefined;
+
+    state = {
+      voiceSession,
+      callId: session.id,
+      voice: session.voice,
+      digitBuffer: '',
+      greetStarted: Boolean(session.promptsStarted),
+      amdResolved: false,
+      currentPlaybackInterruptible: true,
+      recorder,
+      recorderFinalized: false,
+      dtmfDetector,
+      vadAmd,
+    };
+
+    activeFonosterCalls.set(session.id, state);
+    hooks.onSessionConnected(session, voiceSession.callRef);
+
+    // IMPORTANT: We NEVER call voiceSession.listen() or voiceSession.say() so Fonoster never invokes Deepgram.
+    // Instead, consume raw bidirectional PCM16 16kHz frames directly from the WebSocket stream.
+    voiceSession.audio.onFrame((frame: Buffer) => {
+      if (!frame || frame.length === 0 || voiceSession.ended) return;
+      state.recorder?.pushInbound(frame);
+      broadcastMonitorAudio(session.id, frame, 1.0);
+      state.vadAmd.pushPcm16(frame);
+      state.dtmfDetector.pushPcm16(frame);
+    });
+
+    // Safety fallback: if no audio frames or AMD classification finishes within 3.8s, proceed with live human greeting
     state.amdFallbackTimer = setTimeout(() => {
       if (!state.amdResolved && !state.greetStarted && !voiceSession.ended) {
         if (session.answeredBy !== 'voicemail') {
           state.amdResolved = true;
+          state.vadAmd.markResolvedExternally('human');
           void hooks
-            .onAmdResult(session, 'human', 'fonoster_timeout_human')
+            .onAmdResult(session, 'human', 'pcm16_timeout_human')
             .then(() => triggerGreetingOnce());
         }
       }
-    }, 4500);
+    }, 3800);
 
+    // Still handle native Fonoster RFC 2833 DTMF events (primary) alongside in-band Goertzel backup
+    voiceSession.on('dtmf', ({ digit }) => {
+      handleIncomingDigit(String(digit || ''), 'rfc2833');
+    });
+
+    // Optional passthrough if Fonoster ever emits AMD/turn events without vendor dependency
     voiceSession.on('amd.result', (amd) => {
+      if (state.amdResolved) return;
       state.amdResolved = true;
       if (state.amdFallbackTimer) {
         clearTimeout(state.amdFallbackTimer);
@@ -1089,6 +1352,7 @@ export function attachFonosterVoiceServer(
           ? 'voicemail'
           : 'unknown';
 
+      state.vadAmd.markResolvedExternally(mapped === 'voicemail' ? 'voicemail' : 'human');
       const rawLabel = `fonoster_${rawStatus}${amd.reason ? `_${amd.reason}` : ''}`;
       void hooks.onAmdResult(session, mapped, rawLabel).then(async () => {
         if (mapped === 'human' || (mapped === 'unknown' && session.answeredBy !== 'voicemail')) {
@@ -1107,50 +1371,29 @@ export function attachFonosterVoiceServer(
       });
     });
 
-    voiceSession.on('dtmf', ({ digit }) => {
-      const key = String(digit || '').trim();
-      if (!key) return;
-
-      // Any keypress confirms a live human on the handset
-      if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
-        session.humanPickedUpAfterVoicemail = true;
-        void hooks.onAmdResult(session, 'human', 'dtmf_human_pickup').then(() => triggerGreetingOnce());
-      } else if (!state.greetStarted) {
-        state.amdResolved = true;
-        void hooks.onAmdResult(session, 'human', 'dtmf_confirmed_human');
-      }
-
-      if (key === '#') {
-        if (state.digitBuffer.length >= 1) {
-          const submitted = state.digitBuffer;
-          state.digitBuffer = '';
-          void hooks.onDigitsSubmitted(session, submitted, true, state);
-        }
-        return;
-      }
-
-      if (/^[0-9*]$/.test(key)) {
-        state.digitBuffer += key;
-        const maxDigits = hooks.getMaxDigits(session.numDigits);
-        if (state.digitBuffer.length >= maxDigits) {
-          const submitted = state.digitBuffer.slice(0, maxDigits);
-          state.digitBuffer = '';
-          void hooks.onDigitsSubmitted(session, submitted, false, state);
-        }
-      }
-    });
-
     voiceSession.on('error', (err) => {
       console.error(`[Fonoster Voice] Session error (${session.id}):`, err);
     });
 
     voiceSession.on('end', ({ reason }) => {
+      interruptFonosterPlayback(session.id);
       if (state.amdFallbackTimer) {
         clearTimeout(state.amdFallbackTimer);
         state.amdFallbackTimer = undefined;
       }
+      closeMonitorSubscribers(session.id);
       activeFonosterCalls.delete(session.id);
-      void hooks.onSessionEnded(session, reason || 'ended');
+
+      void (async () => {
+        if (state.recorder && !state.recorderFinalized) {
+          state.recorderFinalized = true;
+          const saved = await state.recorder.finalize(hooks.recordingsDir);
+          if (saved) {
+            hooks.onLocalRecordingReady?.(session, saved);
+          }
+        }
+        await hooks.onSessionEnded(session, reason || 'ended');
+      })();
     });
   });
 
