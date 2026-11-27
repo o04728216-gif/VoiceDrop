@@ -110,17 +110,58 @@ function getOrderedTransportModes(
   return ['tls'];
 }
 
+function formatFonosterError(err: any): {
+  summary: string;
+  code?: number | string;
+  details?: string;
+  message?: string;
+  cause?: string;
+  metadata?: Record<string, any>;
+} {
+  const code = err?.code;
+  const details = typeof err?.details === 'string' && err.details.trim() ? err.details.trim() : undefined;
+  const message = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : undefined;
+  const cause =
+    err?.cause instanceof Error
+      ? err.cause.message
+      : err?.cause
+      ? String(err.cause)
+      : undefined;
+  let metadata: Record<string, any> | undefined;
+  try {
+    if (err?.metadata && typeof err.metadata.getMap === 'function') {
+      metadata = err.metadata.getMap();
+    }
+  } catch {
+    // Ignore metadata extraction errors
+  }
+
+  const baseText = details || message || String(err || 'Unknown Fonoster error');
+  const codePrefix = code !== undefined && code !== null ? `[gRPC code=${code}] ` : '';
+  const causeSuffix = cause && !baseText.includes(cause) ? ` (cause: ${cause})` : '';
+  return {
+    summary: `${codePrefix}${baseText}${causeSuffix}`.trim(),
+    code,
+    details,
+    message,
+    cause,
+    metadata,
+  };
+}
+
 function buildClientWithTransport(
   workspaceKey: string,
   endpoint: string | undefined,
   mode: FonosterTransportMode
 ): FonosterSDK.Client {
   if (mode === 'insecure') {
-    return new FonosterSDK.Client({
+    const client = new FonosterSDK.Client({
       accessKeyId: workspaceKey,
       ...(endpoint ? { endpoint } : {}),
       allowInsecure: true,
     });
+    (client as any).__fonosterTransportMode = mode;
+    return client;
   }
 
   const client = new FonosterSDK.Client({
@@ -128,6 +169,7 @@ function buildClientWithTransport(
     ...(endpoint ? { endpoint } : {}),
     allowInsecure: false,
   });
+  (client as any).__fonosterTransportMode = mode;
 
   if (mode === 'tls-no-verify') {
     const grpc = loadGrpcFromSdk();
@@ -383,6 +425,11 @@ export async function createAuthenticatedFonosterClient(
       triedModes.push(mode);
       try {
         await loginWithTimeout(client, apiKeyId, apiKeySecret);
+        (client as any).__fonosterTransportMode = mode;
+        (client as any).__fonosterResolvedEndpoint = actualEp;
+        console.log(
+          `[Fonoster Auth] Connected endpoint=${actualEp || 'default'} transport=${mode} workspace=${workspaceKey.slice(0, 8)}...`
+        );
         return { client, actualEp, triedModes };
       } catch (err: any) {
         lastAttemptErr = err;
@@ -497,38 +544,70 @@ export async function ensureFonosterVoiceApp(
 
   const listRes = await appsApi.listApplications({ pageSize: 50 });
   const existingApps = Array.isArray(listRes?.items) ? listRes.items : [];
+  console.log(
+    `[Fonoster Apps] Found ${existingApps.length} application(s) in workspace (streamUrl=${streamUrl}, canSyncUrl=${canSyncUrl}):`,
+    existingApps.map((a) => ({ ref: a.ref, name: a.name, type: a.type, url: a.url }))
+  );
+
+  const tryUpdateStreamApp = async (target: any): Promise<boolean> => {
+    if (!canSyncUrl) return false;
+    if (
+      target.url === streamUrl &&
+      target.recording === recordingPolicy &&
+      Boolean(target.amd?.enabled)
+    ) {
+      return false;
+    }
+    try {
+      await appsApi.updateApplication({
+        ref: target.ref,
+        name: target.name || 'VoiceDrop Stream',
+        type: FonosterSDK.ApplicationType.STREAM,
+        url: streamUrl,
+        protocol: 'fonoster',
+        recording: recordingPolicy,
+        amd: { enabled: true, windowMs: 4000 },
+        speech: { language: 'en-US' },
+      });
+      console.log(`[Fonoster Apps] Updated Stream app ref=${target.ref} -> ${streamUrl}`);
+      return true;
+    } catch (updateErr: any) {
+      console.warn(
+        `[Fonoster Apps] Full updateApplication failed for ref=${target.ref}, retrying minimal STREAM update:`,
+        formatFonosterError(updateErr)
+      );
+      try {
+        await appsApi.updateApplication({
+          ref: target.ref,
+          name: target.name || 'VoiceDrop Stream',
+          type: FonosterSDK.ApplicationType.STREAM,
+          url: streamUrl,
+        } as any);
+        console.log(`[Fonoster Apps] Minimal updateApplication succeeded for ref=${target.ref}`);
+        return true;
+      } catch (minUpdateErr: any) {
+        console.error(
+          `[Fonoster Apps] updateApplication failed for ref=${target.ref}:`,
+          formatFonosterError(minUpdateErr)
+        );
+        return false;
+      }
+    }
+  };
 
   const trimmedPreferred = (preferredAppRef || '').trim();
   if (trimmedPreferred) {
     const matched = existingApps.find((a) => a.ref === trimmedPreferred);
     if (matched) {
-      let updated = false;
-      if (
-        canSyncUrl &&
-        matched.type === FonosterSDK.ApplicationType.STREAM &&
-        (matched.url !== streamUrl ||
-          matched.recording !== recordingPolicy ||
-          !matched.amd?.enabled)
-      ) {
-        await appsApi
-          .updateApplication({
-            ref: matched.ref,
-            name: matched.name,
-            type: FonosterSDK.ApplicationType.STREAM,
-            url: streamUrl,
-            protocol: 'fonoster',
-            recording: recordingPolicy,
-            amd: { enabled: true, windowMs: 4000 },
-            speech: { language: 'en-US' },
-          })
-          .then(() => {
-            updated = true;
-          })
-          .catch(() => {});
-      }
+      const updated =
+        matched.type === FonosterSDK.ApplicationType.STREAM
+          ? await tryUpdateStreamApp(matched)
+          : false;
       return { appRef: matched.ref, streamUrl, created: false, updated };
     }
-    return { appRef: trimmedPreferred, streamUrl, created: false, updated: false };
+    console.warn(
+      `[Fonoster Apps] Preferred appRef=${trimmedPreferred} not found in workspace applications; resolving automatically.`
+    );
   }
 
   const managedName = 'VoiceDrop Stream';
@@ -539,36 +618,14 @@ export async function ensureFonosterVoiceApp(
   );
 
   if (existingManaged) {
-    let updated = false;
-    if (
-      canSyncUrl &&
-      (existingManaged.url !== streamUrl ||
-        existingManaged.recording !== recordingPolicy ||
-        !existingManaged.amd?.enabled)
-    ) {
-      await appsApi
-        .updateApplication({
-          ref: existingManaged.ref,
-          name: existingManaged.name || managedName,
-          type: FonosterSDK.ApplicationType.STREAM,
-          url: streamUrl,
-          protocol: 'fonoster',
-          recording: recordingPolicy,
-          amd: { enabled: true, windowMs: 4000 },
-          speech: { language: 'en-US' },
-        })
-        .then(() => {
-          updated = true;
-        })
-        .catch(() => {});
-    }
+    const updated = await tryUpdateStreamApp(existingManaged);
     return { appRef: existingManaged.ref, streamUrl, created: false, updated };
   }
 
   if (!canSyncUrl) {
     const fallbackApp =
       existingApps.find((a) => a.type === FonosterSDK.ApplicationType.STREAM) || existingApps[0];
-    if (fallbackApp) {
+    if (fallbackApp?.ref) {
       return { appRef: fallbackApp.ref, streamUrl, created: false, updated: false };
     }
     throw new Error(
@@ -586,11 +643,41 @@ export async function ensureFonosterVoiceApp(
       amd: { enabled: true, windowMs: 4000 },
       speech: { language: 'en-US' },
     });
-
+    if (!createdRes?.ref) {
+      throw new Error('Fonoster createApplication returned an empty application ref.');
+    }
+    console.log(`[Fonoster Apps] Auto-created Stream app ref=${createdRes.ref} url=${streamUrl}`);
     return { appRef: createdRes.ref, streamUrl, created: true, updated: false };
-  } catch (createErr) {
-    if (existingApps.length > 0) {
-      return { appRef: existingApps[0].ref, streamUrl, created: false, updated: false };
+  } catch (createErr: any) {
+    console.warn(
+      '[Fonoster Apps] Full createApplication failed, retrying minimal STREAM payload:',
+      formatFonosterError(createErr)
+    );
+    try {
+      const minimalRes = await appsApi.createApplication({
+        name: managedName,
+        type: FonosterSDK.ApplicationType.STREAM,
+        url: streamUrl,
+      } as any);
+      if (minimalRes?.ref) {
+        console.log(`[Fonoster Apps] Minimal createApplication succeeded ref=${minimalRes.ref}`);
+        return { appRef: minimalRes.ref, streamUrl, created: true, updated: false };
+      }
+    } catch (minCreateErr: any) {
+      console.error(
+        '[Fonoster Apps] Minimal createApplication also failed:',
+        formatFonosterError(minCreateErr)
+      );
+    }
+
+    const fallbackStream =
+      existingApps.find((a) => a.type === FonosterSDK.ApplicationType.STREAM && a.ref) ||
+      existingApps.find((a) => Boolean(a.ref));
+    if (fallbackStream?.ref) {
+      console.warn(
+        `[Fonoster Apps] Falling back to existing workspace app ref=${fallbackStream.ref} name=${fallbackStream.name} type=${fallbackStream.type}`
+      );
+      return { appRef: fallbackStream.ref, streamUrl, created: false, updated: false };
     }
     throw createErr;
   }
@@ -651,6 +738,34 @@ export async function verifyFonosterConnection(
   };
 }
 
+function normalizeE164Strict(raw: string): string {
+  const cleaned = String(raw || '')
+    .trim()
+    .replace(/^tel:/i, '')
+    .replace(/[\s\-().]/g, '');
+  if (!cleaned) return '';
+  if (cleaned.startsWith('+')) return cleaned;
+  return `+${cleaned}`;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          const timeoutErr: any = new Error(`${label} timed out after ${timeoutMs}ms`);
+          timeoutErr.code = 4; // gRPC DEADLINE_EXCEEDED
+          reject(timeoutErr);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export async function dispatchFonosterOutboundCall(
   creds: FonosterCredentials,
   params: {
@@ -662,8 +777,23 @@ export async function dispatchFonosterOutboundCall(
     recordCall: boolean;
   }
 ) {
+  const cleanFrom = normalizeE164Strict(params.from || creds.phoneNumber || '');
+  const cleanTo = normalizeE164Strict(params.to);
+
+  if (!/^\+\d{7,15}$/.test(cleanFrom)) {
+    throw new Error(`Invalid Fonoster Caller ID E.164 phone number: "${params.from}"`);
+  }
+  if (!/^\+\d{7,15}$/.test(cleanTo)) {
+    throw new Error(`Invalid destination E.164 phone number: "${params.to}"`);
+  }
+
   const client = await createAuthenticatedFonosterClient(creds, params.appBaseUrl);
-  const resolvedEndpoint = (client as any).endpoint as string | undefined;
+  const resolvedEndpoint =
+    ((client as any).__fonosterResolvedEndpoint as string | undefined) ||
+    ((client as any).endpoint as string | undefined);
+  const transportMode =
+    ((client as any).__fonosterTransportMode as FonosterTransportMode | undefined) || 'tls';
+
   const { appRef, streamUrl, created, updated } = await ensureFonosterVoiceApp(
     client,
     params.appBaseUrl,
@@ -671,24 +801,116 @@ export async function dispatchFonosterOutboundCall(
     params.recordCall
   );
 
-  const callsApi = new FonosterSDK.Calls(client);
-  const createdCall = await callsApi.createCall({
-    from: params.from,
-    to: params.to,
-    appRef,
+  const cleanAppRef = String(appRef || '').trim();
+  if (!cleanAppRef) {
+    throw new Error(
+      'Unable to resolve a valid Fonoster Voice Application ref (appRef) in your workspace.'
+    );
+  }
+
+  const createCallRequest = {
+    from: cleanFrom,
+    to: cleanTo,
+    appRef: cleanAppRef,
     timeout: 45,
     metadata: {
       callId: params.callId,
       deviceId: params.deviceId,
     },
-  });
+  };
+
+  console.log(
+    '[Fonoster CreateCall] Sending gRPC Calls.CreateCall request:',
+    JSON.stringify({
+      endpoint: resolvedEndpoint || 'default',
+      transportMode,
+      workspaceId: (creds.projectId || '').trim(),
+      from: createCallRequest.from,
+      to: createCallRequest.to,
+      appRef: createCallRequest.appRef,
+      timeout: createCallRequest.timeout,
+      metadata: createCallRequest.metadata,
+      streamUrl,
+    })
+  );
+
+  const callsApi = new FonosterSDK.Calls(client);
+  let createdCall: Awaited<ReturnType<FonosterSDK.Calls['createCall']>>;
+  try {
+    createdCall = await withTimeout(
+      callsApi.createCall(createCallRequest),
+      20000,
+      'Fonoster Calls.CreateCall'
+    );
+  } catch (err: any) {
+    const diag = formatFonosterError(err);
+    console.error(
+      '[Fonoster CreateCall] gRPC Calls.CreateCall FAILED:',
+      JSON.stringify({
+        endpoint: resolvedEndpoint || 'default',
+        transportMode,
+        from: createCallRequest.from,
+        to: createCallRequest.to,
+        appRef: createCallRequest.appRef,
+        error: diag,
+      })
+    );
+    const wrapped: any = new Error(
+      `Fonoster CreateCall rejected by ${resolvedEndpoint || 'server'}: ${diag.summary}`
+    );
+    wrapped.code = diag.code;
+    wrapped.details = diag.details;
+    wrapped.cause = err;
+    throw wrapped;
+  }
+
+  const callRef = typeof createdCall?.ref === 'string' ? createdCall.ref.trim() : '';
+  if (!callRef) {
+    console.error(
+      '[Fonoster CreateCall] Invalid response — empty call ref:',
+      JSON.stringify({
+        endpoint: resolvedEndpoint || 'default',
+        transportMode,
+        response: createdCall ? { ref: createdCall.ref } : null,
+      })
+    );
+    throw new Error(
+      `Fonoster server (${resolvedEndpoint || 'default'}) did not return a valid Call Ref from CreateCall.`
+    );
+  }
+
+  console.log(
+    '[Fonoster CreateCall] gRPC Calls.CreateCall ACCEPTED:',
+    JSON.stringify({
+      endpoint: resolvedEndpoint || 'default',
+      transportMode,
+      callRef,
+      appRef: cleanAppRef,
+      from: cleanFrom,
+      to: cleanTo,
+    })
+  );
+
+  const getCallRecord = async (ref: string) => {
+    try {
+      return await withTimeout(callsApi.getCall(ref), 5000, 'Fonoster Calls.GetCall');
+    } catch (cdrErr: any) {
+      console.warn(
+        `[Fonoster GetCall] Could not fetch CDR for ref=${ref}:`,
+        formatFonosterError(cdrErr)
+      );
+      return null;
+    }
+  };
 
   return {
     client,
-    ref: createdCall.ref,
+    ref: callRef,
     statusStream: createdCall.statusStream,
-    appRef,
+    getCallRecord,
+    appRef: cleanAppRef,
     endpoint: resolvedEndpoint,
+    transportMode,
     streamUrl,
     appCreated: created,
     appUpdated: updated,

@@ -127,6 +127,7 @@ export interface FonosterConfig {
   accessKeySecret: string;
   phoneNumber: string;
   endpoint?: string;
+  appRef?: string;
 }
 
 export type TelephonyCarrier = 'twilio' | 'plivo' | 'telnyx' | 'signalwire' | 'fonoster';

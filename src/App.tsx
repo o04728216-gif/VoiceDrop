@@ -377,6 +377,11 @@ export default function App() {
 
       const data = await res.json();
       if (!res.ok) {
+        if (data?.session) {
+          setActiveSession(data.session);
+          setOperatorTab('live');
+          loadCallHistory();
+        }
         throw new Error(data.error || 'Failed to place call');
       }
 

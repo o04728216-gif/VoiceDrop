@@ -1067,10 +1067,24 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           endpoint: fonosterEndpoint || undefined,
         };
 
+        console.log(
+          '[Call Initiate] Starting live Fonoster outbound call:',
+          JSON.stringify({
+            callId,
+            from: fonosterPhone,
+            to: formattedTo,
+            workspaceId: fonosterProjectId,
+            configuredEndpoint: fonosterEndpoint || process.env.FONOSTER_ENDPOINT || '(auto)',
+            preferredAppRef: fonosterAppRef || '(auto)',
+            appBaseUrl,
+            recordCall: shouldRecord,
+          })
+        );
+
         addSessionEvent(newSession, {
           type: 'system',
           title: 'Dispatching Fonoster Cloud Call',
-          description: `Authenticating Fonoster workspace and syncing Stream Voice App for ${formattedTo}...`,
+          description: `Authenticating Fonoster workspace and sending gRPC CreateCall from ${fonosterPhone} to ${formattedTo}...`,
         });
 
         const dispatched = await dispatchFonosterOutboundCall(fonosterCreds, {
@@ -1081,6 +1095,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           appBaseUrl,
           recordCall: shouldRecord,
         });
+
+        if (!dispatched.ref || !dispatched.ref.trim()) {
+          throw new Error('Fonoster CreateCall succeeded without returning a Call Ref.');
+        }
 
         saveCallCredentials(callId, {
           deviceId,
@@ -1103,34 +1121,45 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
         addSessionEvent(newSession, {
           type: 'call-state',
           title: 'Fonoster Call Dispatched',
-          description: `Fonoster Call Ref: ${dispatched.ref}. Stream App: ${dispatched.appRef}${
+          description: `Fonoster Call Ref: ${dispatched.ref} via ${dispatched.endpoint || 'Fonoster'} (${dispatched.transportMode}). Stream App: ${dispatched.appRef}${
             dispatched.appCreated ? ' (auto-created)' : dispatched.appUpdated ? ' (synced)' : ''
           }.`,
           data: {
             callRef: dispatched.ref,
             appRef: dispatched.appRef,
+            endpoint: dispatched.endpoint,
+            transportMode: dispatched.transportMode,
             streamUrl: dispatched.streamUrl,
           },
         });
 
         // Track real-time PSTN dial status updates from Fonoster gRPC stream
         void (async () => {
+          let receivedTerminalUpdate = false;
+          let lastStatusSeen = '';
+          let lastCauseSeen = '';
           try {
             for await (const update of dispatched.statusStream) {
               const s = getSessionById(callId);
               if (!s) break;
               const rawStatus = String(update?.status || '').toUpperCase();
               const cause = update?.hangupCause ? String(update.hangupCause) : '';
+              lastStatusSeen = rawStatus || lastStatusSeen;
+              lastCauseSeen = cause || lastCauseSeen;
+
+              console.log(
+                `[Fonoster TrackCall] callId=${callId} ref=${dispatched.ref} status=${rawStatus || 'UNKNOWN'} hangupCause=${cause || 'none'}`
+              );
 
               if (rawStatus === 'TRYING') {
                 if (s.status === 'queued') {
                   s.status = 'initiating';
-                  addSessionEvent(s, {
-                    type: 'call-state',
-                    title: 'Fonoster Dialing PSTN Route',
-                    description: `Connecting outbound call to ${s.to} via Fonoster...`,
-                  });
                 }
+                addSessionEvent(s, {
+                  type: 'call-state',
+                  title: 'Fonoster Dialing PSTN Route',
+                  description: `Fonoster is originating SIP INVITE to ${s.to} (Ref: ${dispatched.ref})...`,
+                });
               } else if (rawStatus === 'PROGRESS') {
                 if (['queued', 'initiating'].includes(s.status)) {
                   s.status = 'ringing';
@@ -1141,6 +1170,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                   });
                 }
               } else if (rawStatus === 'ANSWER') {
+                receivedTerminalUpdate = true;
                 if (!['in-progress', 'collecting-input', 'awaiting-operator', 'completed'].includes(s.status)) {
                   s.status = 'in-progress';
                   s.answeredAt = s.answeredAt || new Date().toISOString();
@@ -1151,8 +1181,10 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                   });
                 }
               } else if (rawStatus === 'BUSY') {
+                receivedTerminalUpdate = true;
                 s.status = 'busy';
                 s.completedAt = new Date().toISOString();
+                persistSessionsToDisk();
                 addSessionEvent(s, {
                   type: 'call-state',
                   title: 'Line Busy (Fonoster)',
@@ -1160,9 +1192,11 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                 });
                 void finalizeCallRecording(s);
               } else if (rawStatus === 'NOANSWER' || rawStatus === 'CANCEL') {
+                receivedTerminalUpdate = true;
                 if (!['completed', 'failed', 'busy', 'no-answer'].includes(s.status)) {
                   s.status = 'no-answer';
                   s.completedAt = new Date().toISOString();
+                  persistSessionsToDisk();
                   addSessionEvent(s, {
                     type: 'call-state',
                     title: rawStatus === 'CANCEL' ? 'Call Canceled (Fonoster)' : 'No Answer (Fonoster)',
@@ -1170,31 +1204,90 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                   });
                   void finalizeCallRecording(s);
                 }
-              } else if (rawStatus === 'FAILED') {
+              } else if (rawStatus === 'FAILED' || rawStatus === 'ERROR') {
+                receivedTerminalUpdate = true;
+                // Note: @fonoster/sdk maps TrackCallResponse.Status.NOANSWER to "ERROR"
+                const isNoAnswer =
+                  rawStatus === 'ERROR' && (!cause || cause === 'NO_ANSWER' || cause === 'NO_USER_RESPONSE');
                 if (!['completed', 'failed', 'busy', 'no-answer'].includes(s.status)) {
-                  s.status = 'failed';
+                  s.status = isNoAnswer ? 'no-answer' : 'failed';
                   s.completedAt = new Date().toISOString();
+                  persistSessionsToDisk();
                   addSessionEvent(s, {
-                    type: 'error',
-                    title: 'Fonoster Call Failed',
+                    type: isNoAnswer ? 'call-state' : 'error',
+                    title: isNoAnswer ? 'No Answer (Fonoster)' : 'Fonoster Call Failed',
                     description: cause
-                      ? `Fonoster reported call failure (${cause}). Check your Fonoster trunk, balance, and caller ID.`
-                      : 'Fonoster could not complete the call. Check your Fonoster trunk and caller ID.',
+                      ? `Fonoster reported ${rawStatus} (${cause}). Check your Fonoster trunk, route, and caller ID.`
+                      : isNoAnswer
+                      ? 'Recipient did not answer before timeout (Fonoster NOANSWER).'
+                      : 'Fonoster could not complete the call. Check your Fonoster trunk, routing, and caller ID.',
                   });
                   void finalizeCallRecording(s);
                 }
               }
             }
+
+            // If TrackCall stream ended cleanly before the call ever connected and no Voice Stream is active,
+            // inspect Fonoster CDR via GetCall and mark the session failed/no-answer instead of leaving it stuck!
+            const s = getSessionById(callId);
+            if (
+              !receivedTerminalUpdate &&
+              s &&
+              ['queued', 'initiating', 'ringing'].includes(s.status) &&
+              !getActiveFonosterState(callId)
+            ) {
+              const cdr = await dispatched.getCallRecord(dispatched.ref);
+              const cdrStatus = cdr?.status ? String(cdr.status).toUpperCase() : '';
+              console.error(
+                `[Fonoster TrackCall] Stream closed before answer for callId=${callId} ref=${dispatched.ref}:`,
+                JSON.stringify({ lastStatusSeen, lastCauseSeen, cdrStatus, cdr })
+              );
+              const mappedStatus =
+                cdrStatus === 'USER_BUSY'
+                  ? 'busy'
+                  : cdrStatus === 'NO_ANSWER' || cdrStatus === 'NO_USER_RESPONSE'
+                  ? 'no-answer'
+                  : 'failed';
+              s.status = mappedStatus;
+              s.completedAt = new Date().toISOString();
+              persistSessionsToDisk();
+              addSessionEvent(s, {
+                type: mappedStatus === 'failed' ? 'error' : 'call-state',
+                title:
+                  mappedStatus === 'busy'
+                    ? 'Line Busy (Fonoster)'
+                    : mappedStatus === 'no-answer'
+                    ? 'No Answer (Fonoster)'
+                    : 'Fonoster Outbound Call Failed',
+                description: cdrStatus
+                  ? `Fonoster ended call ${dispatched.ref} with status ${cdrStatus}. Check your SIP trunk, egress route, and caller ID.`
+                  : `Fonoster TrackCall stream closed before answer (last status: ${lastStatusSeen || 'none'}). Check Fonoster apiserver/routr logs for call ${dispatched.ref}.`,
+                data: { callRef: dispatched.ref, cdrStatus, lastStatusSeen, lastCauseSeen },
+              });
+              void finalizeCallRecording(s);
+            }
           } catch (streamErr: any) {
-            console.error(`Fonoster statusStream error for ${callId}:`, streamErr);
+            console.error(
+              `[Fonoster TrackCall] Stream error for callId=${callId} ref=${dispatched.ref}:`,
+              JSON.stringify({
+                code: streamErr?.code,
+                details: streamErr?.details,
+                message: streamErr?.message,
+                cause: streamErr?.cause ? String(streamErr.cause) : undefined,
+              })
+            );
             const s = getSessionById(callId);
             if (s && ['queued', 'initiating', 'ringing'].includes(s.status)) {
               s.status = 'failed';
               s.completedAt = new Date().toISOString();
+              persistSessionsToDisk();
               addSessionEvent(s, {
                 type: 'error',
                 title: 'Fonoster Call Stream Interrupted',
-                description: streamErr?.message || 'Fonoster call tracking stream closed unexpectedly.',
+                description:
+                  streamErr?.details ||
+                  streamErr?.message ||
+                  'Fonoster call tracking stream closed unexpectedly.',
               });
               void finalizeCallRecording(s);
             }
@@ -1209,21 +1302,29 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           session: newSession,
           mode: 'live',
           carrier: 'fonoster',
-          message: `Live Fonoster call placed to ${formattedTo}!`,
+          message: `Live Fonoster call placed to ${formattedTo} (Ref: ${dispatched.ref})!`,
         });
       }
     } catch (carrierErr: any) {
-      console.error(`${carrier.toUpperCase()} Call Error:`, carrierErr);
+      const errDetail = {
+        code: carrierErr?.code,
+        details: carrierErr?.details,
+        message: carrierErr?.message || `Failed to initiate ${carrier} voice call.`,
+        cause: carrierErr?.cause instanceof Error ? carrierErr.cause.message : carrierErr?.cause ? String(carrierErr.cause) : undefined,
+      };
+      console.error(`${carrier.toUpperCase()} Call Error:`, JSON.stringify(errDetail), carrierErr);
       newSession.status = 'failed';
+      newSession.completedAt = new Date().toISOString();
+      persistSessionsToDisk();
       addSessionEvent(newSession, {
         type: 'error',
         title: `${carrier.toUpperCase()} Carrier Dispatch Error`,
-        description: carrierErr.message || `Failed to initiate ${carrier} voice call.`,
-        data: carrierErr,
+        description: errDetail.message,
+        data: errDetail,
       });
 
       return res.status(500).json({
-        error: `${carrier.toUpperCase()} call failed: ${carrierErr.message || 'Unknown carrier error'}`,
+        error: `${carrier.toUpperCase()} call failed: ${errDetail.message}`,
         callId,
         session: newSession,
       });

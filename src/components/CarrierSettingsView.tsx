@@ -137,6 +137,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
     accessKeySecret: savedCarriersConfig?.fonoster?.accessKeySecret || '',
     phoneNumber: savedCarriersConfig?.fonoster?.phoneNumber || '',
     endpoint: savedCarriersConfig?.fonoster?.endpoint || '',
+    appRef: savedCarriersConfig?.fonoster?.appRef || '',
   });
   const [showSelfHostedEndpoint, setShowSelfHostedEndpoint] = useState<boolean>(() =>
     Boolean(savedCarriersConfig?.fonoster?.endpoint)
@@ -183,6 +184,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
               accessKeySecret: savedCarriersConfig.fonoster.accessKeySecret || '',
               phoneNumber: savedCarriersConfig.fonoster.phoneNumber || '',
               endpoint: savedEndpoint,
+              appRef: savedCarriersConfig.fonoster.appRef || '',
             }
           : {
               projectId: '',
@@ -190,6 +192,7 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
               accessKeySecret: '',
               phoneNumber: '',
               endpoint: '',
+              appRef: '',
             }
       );
       if (savedEndpoint) {
@@ -240,12 +243,14 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
       phoneNumber: signalwire.phoneNumber ? normalizeE164Phone(signalwire.phoneNumber) : '',
     };
     const cleanFonosterEndpoint = (fonoster.endpoint || '').trim();
+    const cleanFonosterAppRef = (fonoster.appRef || '').trim();
     const normFonoster: FonosterConfig = {
       projectId: fonoster.projectId.trim(),
       accessKeyId: fonoster.accessKeyId.trim(),
       accessKeySecret: fonoster.accessKeySecret.trim(),
       phoneNumber: fonoster.phoneNumber.trim() ? normalizeE164Phone(fonoster.phoneNumber.trim()) : '',
       ...(cleanFonosterEndpoint ? { endpoint: cleanFonosterEndpoint } : {}),
+      ...(cleanFonosterAppRef ? { appRef: cleanFonosterAppRef } : {}),
     };
 
     setTwilio(normTwilio);
@@ -333,12 +338,17 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
           ? String(data.numbers[0].telUrl).replace(/^tel:/i, '').trim()
           : '';
       const resolvedPhone = cleanPhoneNumber || firstNum;
+      const resolvedAppRef =
+        typeof data.syncedAppRef === 'string' && data.syncedAppRef.trim()
+          ? data.syncedAppRef.trim()
+          : (fonoster.appRef || '').trim();
       const updatedFonoster: FonosterConfig = {
         projectId: cleanProjectId,
         accessKeyId: cleanAccessKeyId,
         accessKeySecret: cleanAccessKeySecret,
         phoneNumber: resolvedPhone ? normalizeE164Phone(resolvedPhone) : '',
         ...(cleanEndpoint ? { endpoint: cleanEndpoint } : {}),
+        ...(resolvedAppRef ? { appRef: resolvedAppRef } : {}),
       };
       setFonoster(updatedFonoster);
 
