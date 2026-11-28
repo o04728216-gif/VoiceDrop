@@ -833,11 +833,18 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                         : 'bg-slate-900 border-slate-850 text-slate-300'
                     }`}
                   >
-                    <div>
-                      <span className="font-semibold text-slate-200 mr-2">[{evt.type.toUpperCase()}]</span>
-                      <span>{evt.title}</span>
+                    <div className="min-w-0 pr-2">
+                      <div>
+                        <span className="font-semibold text-slate-200 mr-2">[{evt.type.toUpperCase()}]</span>
+                        <span>{evt.title}</span>
+                      </div>
+                      {evt.type === 'error' && evt.description && (
+                        <p className="text-[11px] text-rose-200/80 mt-1 leading-snug break-words">
+                          {evt.description}
+                        </p>
+                      )}
                     </div>
-                    <span className="text-[10px] text-slate-500 font-mono">
+                    <span className="text-[10px] text-slate-500 font-mono shrink-0">
                       {new Date(evt.timestamp).toLocaleTimeString()}
                     </span>
                   </div>

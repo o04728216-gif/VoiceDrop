@@ -13,12 +13,12 @@ import {
   getActiveFonosterState,
   hangupFonosterCall,
   sayOnFonosterCall,
+  stopFonosterPlayback,
   verifyFonosterConnection,
   type FonosterCredentials,
   type FonosterSessionState,
 } from './server/fonoster.ts';
-import { warmVoiceDropTtsCache } from './server/tts.ts';
-import { attachAudioMonitorServer } from './server/audioMonitor.ts';
+import { warmTtsCache } from './server/tts.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -78,23 +78,54 @@ function isValidPublicHttpUrl(val?: string): boolean {
 // Dynamic public base URL helper that auto-detects live production domains (reverse proxy headers, Origin/Referer, stored session base URL, or APP_URL)
 export function getPublicBaseUrl(req?: Request, fallbackUrl?: string): string {
   if (req) {
-    const rawProto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
-    const proto = rawProto.split(',')[0].trim() || 'https';
+    const rawForwardedProto = (req.headers['x-forwarded-proto'] as string) || '';
+    const forwardedProto = rawForwardedProto.split(',')[0].trim().toLowerCase();
     const rawHost = (req.headers['x-forwarded-host'] as string) || req.headers.host || '';
     const host = rawHost.split(',')[0].trim();
 
-    if (host && !isLocalUrl(host)) {
-      return `${proto}://${host}`.replace(/\/$/, '');
-    }
-
-    const candidates = [
+    const originCandidates = [
       req.body?.clientOrigin,
       req.headers.origin,
       req.headers.referer,
       fallbackUrl,
+      process.env.APP_URL,
     ];
 
-    for (const candidate of candidates) {
+    // Check if the browser or APP_URL already tells us the exact public scheme (https vs http) for this host
+    let detectedOriginProto: 'https' | 'http' | undefined;
+    for (const candidate of originCandidates) {
+      if (isValidPublicHttpUrl(candidate)) {
+        try {
+          const parsed = new URL(candidate!.trim());
+          if (!host || parsed.host.toLowerCase() === host.toLowerCase()) {
+            detectedOriginProto = parsed.protocol === 'https:' ? 'https' : 'http';
+            break;
+          }
+        } catch {}
+      }
+    }
+
+    if (host && !isLocalUrl(host)) {
+      const hostLower = host.toLowerCase();
+      const isRawIpWithPort = /^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(hostLower);
+      const isHttpsDomain =
+        hostLower.endsWith('.run.app') ||
+        hostLower.endsWith('.sslip.io') ||
+        (!isRawIpWithPort && !hostLower.includes(':'));
+
+      const proto =
+        forwardedProto === 'https' || detectedOriginProto === 'https'
+          ? 'https'
+          : forwardedProto === 'http' && detectedOriginProto === 'http'
+          ? 'http'
+          : isHttpsDomain
+          ? 'https'
+          : forwardedProto || req.protocol || 'https';
+
+      return `${proto}://${host}`.replace(/\/$/, '');
+    }
+
+    for (const candidate of originCandidates) {
       if (isValidPublicHttpUrl(candidate)) {
         const parsed = new URL(candidate!.trim());
         return parsed.origin.replace(/\/$/, '');
@@ -1089,14 +1120,14 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           description: `Authenticating Fonoster workspace and sending gRPC CreateCall from ${fonosterPhone} to ${formattedTo}...`,
         });
 
-        // Pre-warm VoiceDrop's built-in PCM16 16kHz TTS cache while Fonoster dials so prompts play instantaneously on answer
-        warmVoiceDropTtsCache(
+        // Pre-synthesize all spoken prompts into memory while Fonoster is dialing
+        // so the greeting & custom prompt play instantly upon pickup with zero Deepgram latency!
+        const combinedIntroPrompt = [newSession.introGreeting, newSession.script]
+          .filter((t) => Boolean(t && t.trim()))
+          .join(' ');
+        void warmTtsCache(
           [
-            newSession.introGreeting,
-            newSession.script,
-            [newSession.introGreeting, newSession.script]
-              .filter((t) => Boolean(t && t.trim()))
-              .join(' '),
+            combinedIntroPrompt,
             newSession.holdMessage,
             newSession.invalidMessage,
             newSession.successMessage,
@@ -1188,15 +1219,135 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                 }
               } else if (rawStatus === 'ANSWER') {
                 receivedTerminalUpdate = true;
-                if (!['in-progress', 'collecting-input', 'awaiting-operator', 'completed'].includes(s.status)) {
+                // Never resurrect an already-ended/failed/declined call if a late ANSWER arrives
+                if (['completed', 'failed', 'busy', 'no-answer'].includes(s.status)) {
+                  continue;
+                }
+                const answeredAtMs = Date.now();
+                if (!['in-progress', 'collecting-input', 'awaiting-operator'].includes(s.status)) {
                   s.status = 'in-progress';
                   s.answeredAt = s.answeredAt || new Date().toISOString();
                   addSessionEvent(s, {
                     type: 'call-state',
                     title: 'Call Answered (Fonoster)',
-                    description: `Recipient answered ${s.to}. Connecting voice stream & AMD listener...`,
+                    description: `Recipient answered ${s.to}. Connecting voice stream (${dispatched.streamUrl})...`,
                   });
                 }
+
+                // Post-answer watchdog: Fonoster TrackCall ends at ANSWER and does NOT stream hangup events.
+                // Poll Fonoster CDR (Calls.GetCall) quickly right after answer and verify AppBridge connected
+                // to /api/fonoster/stream so VoiceDrop immediately stops counting if the phone drops on pickup!
+                void (async () => {
+                  const maxWatchMs = 10 * 60 * 1000;
+                  const fastInitialDelays = [1200, 1300, 1500, 1500];
+                  const steadyPollMs = 2500;
+                  const wsConnectTimeoutMs = 5200;
+                  let checkIndex = 0;
+
+                  while (Date.now() - answeredAtMs < maxWatchMs) {
+                    const delay =
+                      checkIndex < fastInitialDelays.length
+                        ? fastInitialDelays[checkIndex]
+                        : steadyPollMs;
+                    checkIndex += 1;
+                    await new Promise((r) => setTimeout(r, delay));
+
+                    const live = getSessionById(callId);
+                    if (
+                      !live ||
+                      ['completed', 'failed', 'busy', 'no-answer'].includes(live.status)
+                    ) {
+                      break;
+                    }
+
+                    const activeVoice = getActiveFonosterState(callId);
+                    const cdr = await dispatched.getCallRecord(dispatched.ref);
+                    const cdrStatus = cdr?.status ? String(cdr.status).toUpperCase() : '';
+                    const cdrEnded = Boolean(
+                      cdr &&
+                        ((typeof cdr.endedAt === 'number' && cdr.endedAt > 0) ||
+                          (cdrStatus && cdrStatus !== 'UNKNOWN'))
+                    );
+
+                    if (cdrEnded) {
+                      const isNormal = cdrStatus === 'NORMAL_CLEARING';
+                      stopFonosterPlayback(callId);
+                      live.status = isNormal ? 'completed' : 'failed';
+                      live.completedAt = new Date().toISOString();
+                      if (typeof cdr?.duration === 'number' && cdr.duration > 0) {
+                        live.duration = cdr.duration;
+                      } else if (live.answeredAt) {
+                        live.duration = Math.max(
+                          1,
+                          Math.round((Date.now() - new Date(live.answeredAt).getTime()) / 1000)
+                        );
+                      }
+                      persistSessionsToDisk();
+
+                      const neverConnectedWs = !activeVoice && !live.promptsStarted;
+                      const isAisPreview = /ais-(dev|pre)-.*\.run\.app/i.test(dispatched.streamUrl);
+                      console.warn(
+                        `[Fonoster Watchdog] Call ended on Fonoster CDR callId=${callId} ref=${dispatched.ref}:`,
+                        JSON.stringify({
+                          cdrStatus,
+                          duration: cdr?.duration,
+                          endedAt: cdr?.endedAt,
+                          neverConnectedWs,
+                          streamUrl: dispatched.streamUrl,
+                        })
+                      );
+
+                      addSessionEvent(live, {
+                        type: neverConnectedWs || !isNormal ? 'error' : 'call-state',
+                        title: neverConnectedWs
+                          ? 'Call Dropped Upon Pickup (Voice Stream Unreachable)'
+                          : isNormal
+                          ? 'Call Ended on Phone (Fonoster CDR)'
+                          : `Call Terminated by Fonoster (${cdrStatus})`,
+                        description: neverConnectedWs
+                          ? isAisPreview
+                            ? `Fonoster ended call ${dispatched.ref} (${cdrStatus || 'HANGUP'}) because AI Studio preview URLs (${dispatched.streamUrl}) require Google login cookies (HTTP 302) and block Fonoster WebSockets. Test from your deployed public server (Coolify) or set FONOSTER_STREAM_URL.`
+                            : `Fonoster ended call ${dispatched.ref} (${cdrStatus || 'HANGUP'}) after pickup because AppBridge never connected to ${dispatched.streamUrl}. Verify that URL is reachable from your Fonoster server over WebSocket (valid TLS / no auth proxy / no hairpin NAT) or set FONOSTER_STREAM_URL.`
+                          : `Fonoster CDR reported ${cdrStatus || 'ENDED'} (duration: ${live.duration || 0}s). Stopped active timer and audio playback.`,
+                        data: {
+                          callRef: dispatched.ref,
+                          cdrStatus,
+                          duration: cdr?.duration,
+                          neverConnectedWs,
+                          streamUrl: dispatched.streamUrl,
+                        },
+                      });
+                      void finalizeCallRecording(live);
+                      break;
+                    }
+
+                    // If 5.2+ seconds passed after ANSWER and AppBridge still never connected to /api/fonoster/stream,
+                    // Fonoster's ~2.5s AppBridge dial timeout has already fired and dropped the call.
+                    if (
+                      !activeVoice &&
+                      !live.promptsStarted &&
+                      Date.now() - answeredAtMs >= wsConnectTimeoutMs
+                    ) {
+                      live.status = 'failed';
+                      live.completedAt = new Date().toISOString();
+                      persistSessionsToDisk();
+                      const isAisPreview = /ais-(dev|pre)-.*\.run\.app/i.test(dispatched.streamUrl);
+                      console.error(
+                        `[Fonoster Watchdog] AppBridge never connected to ${dispatched.streamUrl} within ${wsConnectTimeoutMs}ms of ANSWER for callId=${callId} ref=${dispatched.ref}`
+                      );
+                      addSessionEvent(live, {
+                        type: 'error',
+                        title: 'Fonoster Voice Stream Never Connected',
+                        description: isAisPreview
+                          ? `Phone answered, but AI Studio preview URLs (${dispatched.streamUrl}) require login cookies and block Fonoster WebSockets. Deploy to your public server (Coolify) or set FONOSTER_STREAM_URL so calls connect upon pickup.`
+                          : `Phone answered, but Fonoster AppBridge never opened WebSocket ${dispatched.streamUrl} within ${Math.round(wsConnectTimeoutMs / 1000)}s (Fonoster hangs up after ~2.5s when unreachable). Check TLS/proxy/firewall or set FONOSTER_STREAM_URL on your server.`,
+                        data: { callRef: dispatched.ref, streamUrl: dispatched.streamUrl },
+                      });
+                      void finalizeCallRecording(live);
+                      break;
+                    }
+                  }
+                })();
               } else if (rawStatus === 'BUSY') {
                 receivedTerminalUpdate = true;
                 s.status = 'busy';
@@ -1557,7 +1708,7 @@ async function redirectLiveCallToHumanStart(
       }
     } else if (carrier === 'fonoster') {
       const fState = getActiveFonosterState(session.id);
-      if (fState && !fState.voiceSession.ended) {
+      if (fState && !fState.transport.ended) {
         fState.greetStarted = true;
         session.status = 'collecting-input';
         addSessionEvent(session, {
@@ -1573,7 +1724,6 @@ async function redirectLiveCallToHumanStart(
           void sayOnFonosterCall(session.id, spokenPrompt, {
             interruptible: true,
             preempt: true,
-            voice: session.voice,
           });
         }
         return true;
@@ -3970,7 +4120,7 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
   // Live Fonoster VoiceStream direct command execution (approve / reject / spoken cues)
   if (!session.isSimulated && session.carrier === 'fonoster') {
     const fState = getActiveFonosterState(session.id);
-    if (fState && !fState.voiceSession.ended) {
+    if (fState && !fState.transport.ended) {
       if (action === 'approve') {
         const confMsg =
           session.successMessage ||
@@ -3986,7 +4136,6 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
           await sayOnFonosterCall(session.id, confMsg, {
             interruptible: false,
             preempt: true,
-            voice: session.voice,
           });
           await hangupFonosterCall(session.id);
           void finalizeCallRecording(session, customTwilio, carriersConfig);
@@ -4000,7 +4149,6 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
         void sayOnFonosterCall(session.id, retryMsg, {
           interruptible: true,
           preempt: true,
-          voice: session.voice,
         });
       } else if (isCueAction && session.activeCue) {
         const cueText = session.activeCue.text;
@@ -4008,7 +4156,6 @@ app.post('/api/call/operator-action', async (req: Request, res: Response) => {
         void sayOnFonosterCall(session.id, cueText, {
           interruptible: true,
           preempt: true,
-          voice: session.voice,
         });
       }
     }
@@ -4491,13 +4638,7 @@ function startServer() {
     console.log(`VoiceDrop Interactive server running on http://0.0.0.0:${PORT}`);
   });
 
-  attachAudioMonitorServer(httpServer, (callId: string, deviceId: string) => {
-    const s = getSessionById(callId);
-    return Boolean(s && s.deviceId === deviceId);
-  });
-
   attachFonosterVoiceServer(httpServer, {
-    recordingsDir: RECORDINGS_DIR,
     resolveSession: ({ callId, callRef, to }) => {
       if (callId) {
         const byId = getSessionById(callId);
@@ -4532,9 +4673,8 @@ function startServer() {
       }
       addSessionEvent(session, {
         type: 'call-state',
-        title: 'Fonoster PCM16 16kHz Stream Connected',
-        description:
-          'Bidirectional PCM16 16kHz audio active. VoiceDrop TTS, live audio monitor, local VAD/AMD, recording, and dual DTMF collection running.',
+        title: 'Fonoster Voice Stream Connected',
+        description: 'Raw audio stream active (Deepgram bypassed). Playing custom voice prompts & listening for keypad input.',
       });
     },
     onAmdResult: async (session: CallSession, status, rawLabel) => {
@@ -4545,19 +4685,15 @@ function startServer() {
       session.status = 'collecting-input';
       addSessionEvent(session, {
         type: 'playback',
-        title: 'Immediate Pickup Greeting Played (VoiceDrop PCM16 TTS)',
-        description: `Streaming voice prompt: "${session.introGreeting}"`,
+        title: 'Immediate Pickup Greeting Played (Fonoster)',
+        description: `Playing voice prompt: "${session.introGreeting}"`,
         data: { greeting: session.introGreeting, script: session.script },
       });
       const promptText = [session.introGreeting, session.script]
         .filter((t) => Boolean(t && t.trim()))
         .join(' ');
       if (promptText) {
-        await sayOnFonosterCall(session.id, promptText, {
-          interruptible: true,
-          preempt: true,
-          voice: session.voice,
-        });
+        await sayOnFonosterCall(session.id, promptText, { interruptible: true, preempt: true });
       }
     },
     onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {
@@ -4573,25 +4709,6 @@ function startServer() {
         return true;
       }
       return false;
-    },
-    onDigitKeypress: (
-      session: CallSession,
-      digit: string,
-      currentBuffer: string,
-      source: 'rfc2833' | 'inband-pcm16'
-    ) => {
-      if (digit !== '#' && ['in-progress', 'collecting-input'].includes(session.status)) {
-        session.pendingDigits = currentBuffer;
-      }
-      addSessionEvent(session, {
-        type: 'dtmf',
-        title: `Keypad Press: [${digit}]`,
-        description:
-          digit === '#'
-            ? `Caller pressed # to submit input (${currentBuffer || 'empty'}).`
-            : `Live keypad buffer: ${currentBuffer} (${source === 'rfc2833' ? 'RFC 2833' : 'In-Band PCM16'})`,
-        data: { digit, digits: currentBuffer || digit, source, partial: digit !== '#' },
-      });
     },
     onDigitsSubmitted: async (
       session: CallSession,
@@ -4612,11 +4729,7 @@ function startServer() {
         });
         const holdMsg =
           session.holdMessage || 'Kindly hold while your information is being processed.';
-        await sayOnFonosterCall(session.id, holdMsg, {
-          interruptible: false,
-          preempt: true,
-          voice: session.voice,
-        });
+        await sayOnFonosterCall(session.id, holdMsg, { interruptible: false, preempt: true });
         return;
       }
 
@@ -4636,17 +4749,12 @@ function startServer() {
         const okMsg =
           session.successMessage ||
           'Thank you. Your code has been verified successfully. Goodbye.';
-        await sayOnFonosterCall(session.id, okMsg, {
-          interruptible: false,
-          preempt: true,
-          voice: session.voice,
-        });
+        await sayOnFonosterCall(session.id, okMsg, { interruptible: false, preempt: true });
         await hangupFonosterCall(session.id);
         void finalizeCallRecording(session);
       } else {
         session.attempts = (session.attempts || 0) + 1;
         session.lastInvalidDigits = digits;
-        session.pendingDigits = undefined;
         const maxAtt = session.maxAttempts || 3;
         if (session.attempts >= maxAtt) {
           session.codeStatus = 'max_exceeded';
@@ -4660,7 +4768,6 @@ function startServer() {
           await sayOnFonosterCall(session.id, 'Maximum attempts reached. Goodbye.', {
             interruptible: false,
             preempt: true,
-            voice: session.voice,
           });
           await hangupFonosterCall(session.id);
           void finalizeCallRecording(session);
@@ -4675,16 +4782,19 @@ function startServer() {
           const retryMsg =
             session.invalidMessage ||
             'That code is incorrect. Please re-enter your code now, followed by the pound sign.';
-          await sayOnFonosterCall(session.id, retryMsg, {
-            interruptible: true,
-            preempt: true,
-            voice: session.voice,
-          });
+          await sayOnFonosterCall(session.id, retryMsg, { interruptible: true, preempt: true });
         }
       }
     },
-    onLocalRecordingReady: (session: CallSession, rec) => {
-      markRecordingCompleted(session, rec.filePath, rec.ext, rec.durationSec);
+    onSessionError: (session: CallSession, err) => {
+      addSessionEvent(session, {
+        type: 'error',
+        title: 'Fonoster Audio Stream Notice',
+        description: err?.message
+          ? `AppBridge reported [${err.code || 'error'}]: ${err.message}`
+          : 'AppBridge reported a stream error.',
+        data: err,
+      });
     },
     onSessionEnded: async (session: CallSession, reason: string) => {
       if (!['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {

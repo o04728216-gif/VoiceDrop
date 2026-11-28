@@ -324,6 +324,45 @@ export default function App() {
     };
   }, [activeSession?.id]);
 
+  // Active-call polling fallback (2s) so proxy-buffered SSE never leaves the UI timer counting after hangup/failure
+  useEffect(() => {
+    const isActive = Boolean(
+      activeSession?.id &&
+        ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
+          activeSession.status
+        )
+    );
+    if (!isActive || !activeSession?.id) return;
+
+    const callId = activeSession.id;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch(withDeviceParam(`/api/calls/${encodeURIComponent(callId)}`));
+        if (!res.ok || cancelled) return;
+        const fresh: CallSession = await res.json();
+        if (cancelled || !fresh?.id || fresh.id !== callId) return;
+        setActiveSession((curr) => {
+          if (!curr || curr.id !== callId) return curr;
+          const changed =
+            curr.status !== fresh.status ||
+            (curr.events?.length || 0) !== (fresh.events?.length || 0) ||
+            curr.completedAt !== fresh.completedAt;
+          return changed ? fresh : curr;
+        });
+        if (['completed', 'failed', 'busy', 'no-answer'].includes(fresh.status)) {
+          stopRingbackTone();
+        }
+      } catch {}
+    };
+
+    const timer = setInterval(() => void poll(), 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeSession?.id, activeSession?.status]);
+
   // Rapid post-call polling fallback so recordingUrl appears immediately after call completion
   useEffect(() => {
     const isTerminal =

@@ -1,16 +1,14 @@
 import type { Server as HttpServer } from 'http';
 import { createRequire } from 'module';
 import net from 'net';
+import { WebSocketServer, WebSocket } from 'ws';
 import * as FonosterSDK from '@fonoster/sdk';
-import { VoiceServer, type Session as FonosterVoiceSession } from '@fonoster/voice';
-import { PCM16_SAMPLE_RATE, synthesizePcm16 } from './tts.ts';
 import {
-  GoertzelDtmfDetector,
-  Pcm16CallRecorder,
-  Pcm16VadAmdDetector,
-  streamPcm16Frames,
-} from './audioDsp.ts';
-import { broadcastMonitorAudio, closeMonitorSubscribers } from './audioMonitor.ts';
+  synthesizeTelephonyAudio,
+  computeFrameRms,
+  type TelephonyCodec,
+  type TelephonyRate,
+} from './tts.ts';
 
 const requireFromHere = createRequire(import.meta.url);
 let cachedGrpcModule: any = null;
@@ -42,22 +40,28 @@ export interface FonosterCredentials {
   allowInsecure?: boolean;
 }
 
+export interface FonosterStreamTransport {
+  protocol: 'twilio' | 'fonoster';
+  codec: TelephonyCodec;
+  sampleRate: TelephonyRate;
+  ended: boolean;
+  sendAudioFrame: (frame: Buffer) => void;
+  clearAudio: () => void;
+  sendMark: (name: string) => Promise<{ cleared: boolean }>;
+  hangup: () => Promise<void>;
+}
+
 export interface FonosterSessionState {
-  voiceSession: FonosterVoiceSession;
+  transport: FonosterStreamTransport;
   callId: string;
   voice?: string;
   digitBuffer: string;
   greetStarted: boolean;
   amdResolved: boolean;
+  playbackEpoch: number;
+  isInterruptible: boolean;
+  hasSentAudio: boolean;
   amdFallbackTimer?: ReturnType<typeof setTimeout>;
-  playbackAbort?: AbortController;
-  playbackStartedAt?: number;
-  currentPlaybackInterruptible: boolean;
-  recorder?: Pcm16CallRecorder;
-  recorderFinalized: boolean;
-  dtmfDetector: GoertzelDtmfDetector;
-  vadAmd: Pcm16VadAmdDetector;
-  lastDigit?: { key: string; source: 'rfc2833' | 'inband-pcm16'; at: number };
 }
 
 type FonosterTransportMode = 'tls' | 'tls-no-verify' | 'insecure';
@@ -282,6 +286,22 @@ async function loginWithTimeout(
 }
 
 export function buildFonosterStreamUrl(appBaseUrl: string): string {
+  const override = (process.env.FONOSTER_STREAM_URL || '').trim();
+  if (override) {
+    let normalized = override.replace(/\/+$/, '');
+    if (normalized.startsWith('https://')) {
+      normalized = `wss://${normalized.slice('https://'.length)}`;
+    } else if (normalized.startsWith('http://')) {
+      normalized = `ws://${normalized.slice('http://'.length)}`;
+    } else if (!normalized.startsWith('ws://') && !normalized.startsWith('wss://')) {
+      normalized = `wss://${normalized}`;
+    }
+    if (!normalized.includes('/api/fonoster/stream')) {
+      normalized = `${normalized}/api/fonoster/stream`;
+    }
+    return normalized;
+  }
+
   const clean = appBaseUrl.replace(/\/+$/, '');
   if (clean.startsWith('https://')) {
     return `wss://${clean.slice('https://'.length)}/api/fonoster/stream`;
@@ -295,6 +315,14 @@ export function buildFonosterStreamUrl(appBaseUrl: string): string {
 export function isLocalStreamUrl(url: string): boolean {
   const lower = url.toLowerCase();
   return lower.includes('localhost') || lower.includes('127.0.0.1') || lower.includes('0.0.0.0');
+}
+
+export function isCookieGatedPreviewUrl(url: string): boolean {
+  const lower = url.toLowerCase();
+  return (
+    (lower.includes('ais-dev-') || lower.includes('ais-pre-')) &&
+    lower.includes('.run.app')
+  );
 }
 
 function isAuthDeniedError(err: any): boolean {
@@ -548,90 +576,64 @@ export async function createAuthenticatedFonosterClient(
   throw lastErr;
 }
 
-function hasAnySpeechVendorConfig(app: any): boolean {
-  if (!app || typeof app !== 'object') return false;
-  const s = app.speech;
-  if (!s || typeof s !== 'object') return false;
-  return Object.values(s).some((val) => {
-    if (val === undefined || val === null || val === false || val === '') return false;
-    if (typeof val === 'string' && val.trim().toLowerCase() === 'none') return false;
-    return true;
-  });
-}
-
-function buildVoiceDropStreamAppPayload(name: string, url: string) {
-  // Speech is intentionally OMITTED so Fonoster enforces Speech Voice = None, Vendor = None, Transcriber = None.
-  // VoiceDrop handles 100% of TTS, VAD/AMD, recording, monitoring, and DTMF directly over PCM16 16kHz WebSocket.
-  return {
-    name: name || 'VoiceDrop Stream',
-    type: FonosterSDK.ApplicationType.STREAM,
-    url,
-    protocol: 'fonoster' as const,
-    audio: {
-      codec: 'pcm16' as const,
-      rate: PCM16_SAMPLE_RATE,
-    },
-    recording: '' as const,
-    amd: { enabled: false },
-  };
-}
-
 export async function ensureFonosterVoiceApp(
   client: FonosterSDK.Client,
   appBaseUrl: string,
   preferredAppRef?: string,
-  _recordCall = true
+  recordCall = true
 ): Promise<{ appRef: string; streamUrl: string; created: boolean; updated: boolean }> {
   const appsApi = new FonosterSDK.Applications(client);
   const streamUrl = buildFonosterStreamUrl(appBaseUrl);
   const canSyncUrl = !isLocalStreamUrl(streamUrl);
+  const recordingPolicy = recordCall ? ('on' as const) : ('off' as const);
 
   const listRes = await appsApi.listApplications({ pageSize: 50 });
   const existingApps = Array.isArray(listRes?.items) ? listRes.items : [];
   console.log(
     `[Fonoster Apps] Found ${existingApps.length} application(s) in workspace (streamUrl=${streamUrl}, canSyncUrl=${canSyncUrl}):`,
-    existingApps.map((a: any) => ({
-      ref: a.ref,
-      name: a.name,
-      type: a.type,
-      url: a.url,
-      protocol: a.protocol,
-      audio: a.audio,
-      hasSpeech: hasAnySpeechVendorConfig(a),
-    }))
+    existingApps.map((a) => ({ ref: a.ref, name: a.name, type: a.type, url: a.url }))
   );
 
   const tryUpdateStreamApp = async (target: any): Promise<boolean> => {
-    const targetUrl = canSyncUrl ? streamUrl : target.url;
-    if (!targetUrl || isLocalStreamUrl(targetUrl)) return false;
+    if (!canSyncUrl) return false;
+    const hasSpeechDefaults = Boolean(
+      target.speech &&
+        (target.speech.voice ||
+          target.speech.language ||
+          target.speech.sttModel ||
+          target.speech.ttsModel)
+    );
+    const hasAmdEnabled = Boolean(target.amd?.enabled);
+    const isTwilioProtocol = String(target.protocol || '').toLowerCase() === 'twilio';
 
-    const alreadyClean =
-      target.url === targetUrl &&
-      target.protocol === 'fonoster' &&
-      target.audio?.codec === 'pcm16' &&
-      Number(target.audio?.rate) === PCM16_SAMPLE_RATE &&
-      !hasAnySpeechVendorConfig(target) &&
-      !target.amd?.enabled &&
-      (!target.recording || target.recording === 'off');
-
-    if (alreadyClean) {
+    if (
+      target.url === streamUrl &&
+      target.recording === recordingPolicy &&
+      isTwilioProtocol &&
+      !hasSpeechDefaults &&
+      !hasAmdEnabled
+    ) {
       return false;
     }
-
-    const fullPayload = {
-      ref: target.ref,
-      ...buildVoiceDropStreamAppPayload(target.name || 'VoiceDrop Stream', targetUrl),
-    };
-
     try {
-      await appsApi.updateApplication(fullPayload);
+      // Use protocol: 'twilio' and omit `speech`, `amd`, and `audio` so Fonoster completely
+      // removes Deepgram / Aura 2 defaults (Speech -> None) and streams raw 8kHz μ-law audio
+      // + DTMF directly over standard Twilio Media Streams WebSocket with zero Vendor Keys!
+      await appsApi.updateApplication({
+        ref: target.ref,
+        name: target.name || 'VoiceDrop Stream',
+        type: FonosterSDK.ApplicationType.STREAM,
+        url: streamUrl,
+        protocol: 'twilio',
+        recording: recordingPolicy,
+      });
       console.log(
-        `[Fonoster Apps] Synced Stream app ref=${target.ref} -> ${targetUrl} (protocol=fonoster, audio=pcm16@16000, speech=None, amd=local)`
+        `[Fonoster Apps] Updated Stream app ref=${target.ref} -> ${streamUrl} (protocol=twilio, Speech/Deepgram completely removed)`
       );
       return true;
     } catch (updateErr: any) {
       console.warn(
-        `[Fonoster Apps] Full updateApplication failed for ref=${target.ref}, retrying speech=None PCM16 update:`,
+        `[Fonoster Apps] Full updateApplication failed for ref=${target.ref}, retrying minimal Twilio STREAM update:`,
         formatFonosterError(updateErr)
       );
       try {
@@ -639,12 +641,11 @@ export async function ensureFonosterVoiceApp(
           ref: target.ref,
           name: target.name || 'VoiceDrop Stream',
           type: FonosterSDK.ApplicationType.STREAM,
-          url: targetUrl,
-          protocol: 'fonoster',
-          audio: { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
+          url: streamUrl,
+          protocol: 'twilio',
         } as any);
         console.log(
-          `[Fonoster Apps] Compact updateApplication succeeded for ref=${target.ref} (speech=None, pcm16@16000)`
+          `[Fonoster Apps] Minimal Twilio updateApplication succeeded for ref=${target.ref}`
         );
         return true;
       } catch (minUpdateErr: any) {
@@ -688,11 +689,7 @@ export async function ensureFonosterVoiceApp(
     const fallbackApp =
       existingApps.find((a) => a.type === FonosterSDK.ApplicationType.STREAM) || existingApps[0];
     if (fallbackApp?.ref) {
-      const updated =
-        fallbackApp.type === FonosterSDK.ApplicationType.STREAM
-          ? await tryUpdateStreamApp(fallbackApp)
-          : false;
-      return { appRef: fallbackApp.ref, streamUrl, created: false, updated };
+      return { appRef: fallbackApp.ref, streamUrl, created: false, updated: false };
     }
     throw new Error(
       'Cannot auto-create a Fonoster Stream Application with a localhost URL. Open the app via its public HTTPS URL or create an application in Fonoster.'
@@ -700,19 +697,24 @@ export async function ensureFonosterVoiceApp(
   }
 
   try {
-    const createdRes = await appsApi.createApplication(
-      buildVoiceDropStreamAppPayload(managedName, streamUrl)
-    );
+    // Create Twilio-protocol Stream app so Fonoster has ZERO Deepgram / Speech dependency (Voice: None)
+    const createdRes = await appsApi.createApplication({
+      name: managedName,
+      type: FonosterSDK.ApplicationType.STREAM,
+      url: streamUrl,
+      protocol: 'twilio',
+      recording: recordingPolicy,
+    });
     if (!createdRes?.ref) {
       throw new Error('Fonoster createApplication returned an empty application ref.');
     }
     console.log(
-      `[Fonoster Apps] Auto-created Stream app ref=${createdRes.ref} url=${streamUrl} (protocol=fonoster, audio=pcm16@16000, speech=None)`
+      `[Fonoster Apps] Auto-created Stream app ref=${createdRes.ref} url=${streamUrl} (protocol=twilio, Speech/Deepgram removed)`
     );
     return { appRef: createdRes.ref, streamUrl, created: true, updated: false };
   } catch (createErr: any) {
     console.warn(
-      '[Fonoster Apps] Full createApplication failed, retrying compact speech=None STREAM payload:',
+      '[Fonoster Apps] Full createApplication failed, retrying minimal Twilio STREAM payload:',
       formatFonosterError(createErr)
     );
     try {
@@ -720,18 +722,15 @@ export async function ensureFonosterVoiceApp(
         name: managedName,
         type: FonosterSDK.ApplicationType.STREAM,
         url: streamUrl,
-        protocol: 'fonoster',
-        audio: { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
+        protocol: 'twilio',
       } as any);
       if (minimalRes?.ref) {
-        console.log(
-          `[Fonoster Apps] Compact createApplication succeeded ref=${minimalRes.ref} (speech=None, pcm16@16000)`
-        );
+        console.log(`[Fonoster Apps] Minimal Twilio createApplication succeeded ref=${minimalRes.ref}`);
         return { appRef: minimalRes.ref, streamUrl, created: true, updated: false };
       }
     } catch (minCreateErr: any) {
       console.error(
-        '[Fonoster Apps] Compact createApplication also failed:',
+        '[Fonoster Apps] Minimal createApplication also failed:',
         formatFonosterError(minCreateErr)
       );
     }
@@ -774,14 +773,11 @@ export async function verifyFonosterConnection(
     numbersApi.listNumbers({ pageSize: 50 }).catch(() => ({ items: [] })),
   ]);
 
-  const applications = (appsRes?.items || []).map((a: any) => ({
+  const applications = (appsRes?.items || []).map((a) => ({
     ref: a.ref,
     name: a.name,
     type: a.type,
     url: a.url,
-    protocol: a.protocol || 'fonoster',
-    audio: a.audio || { codec: 'pcm16', rate: PCM16_SAMPLE_RATE },
-    speechVendor: hasAnySpeechVendorConfig(a) ? 'configured' : 'None',
     recording: a.recording,
     amdEnabled: Boolean(a.amd?.enabled),
   }));
@@ -793,19 +789,21 @@ export async function verifyFonosterConnection(
     appRef: n.appRef,
   }));
 
+  const warning = isLocalStreamUrl(streamUrl)
+    ? 'Server is currently addressed via localhost; Fonoster requires a public wss:// URL to connect back to voice streams.'
+    : isCookieGatedPreviewUrl(streamUrl)
+    ? 'AI Studio preview URLs require browser login cookies and block external Fonoster WebSockets (HTTP 302). Deploy VoiceDrop to your public server (e.g. Coolify) or set FONOSTER_STREAM_URL so calls stay connected upon pickup.'
+    : undefined;
+
   return {
     ok: true,
     endpoint: resolvedEndpoint,
     streamUrl,
     syncedAppRef,
     appAction,
-    audioFormat: `pcm16@${PCM16_SAMPLE_RATE}`,
-    speechVendor: 'None',
     applications,
     numbers,
-    warning: isLocalStreamUrl(streamUrl)
-      ? 'Server is currently addressed via localhost; Fonoster requires a public wss:// URL to connect back to voice streams.'
-      : undefined,
+    warning,
   };
 }
 
@@ -1013,26 +1011,29 @@ export function getActiveFonosterState(callId: string): FonosterSessionState | u
   return activeFonosterCalls.get(callId);
 }
 
-export function interruptFonosterPlayback(callId: string): void {
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function stopFonosterPlayback(callId: string): void {
   const state = activeFonosterCalls.get(callId);
   if (!state) return;
-  if (state.playbackAbort) {
+  state.playbackEpoch += 1;
+  state.isInterruptible = false;
+  if (!state.transport.ended) {
     try {
-      state.playbackAbort.abort();
-    } catch {}
-    state.playbackAbort = undefined;
-  }
-  state.playbackStartedAt = undefined;
-  if (!state.voiceSession.ended) {
-    try {
-      state.voiceSession.audio.clear();
-    } catch {}
+      state.transport.clearAudio();
+    } catch {
+      // Ignore clear error on closing socket
+    }
   }
 }
 
 /**
- * Synthesizes speech with VoiceDrop's built-in PCM16 16kHz TTS engine (zero Deepgram/external Fonoster vendor)
- * and streams 20ms (640-byte) PCM16 frames directly into Fonoster's WebSocket audio stream.
+ * Speaks custom text over a live Fonoster call by synthesizing neural speech locally in VoiceDrop
+ * and streaming raw PCMU / PCM16 frames directly over the active WebSocket transport
+ * (Twilio Media Streams JSON OR Fonoster Session v1 binary).
+ * Completely bypasses Fonoster's Speech layer (Deepgram TTS/STT) and requires zero Vendor Keys!
  */
 export async function sayOnFonosterCall(
   callId: string,
@@ -1041,84 +1042,124 @@ export async function sayOnFonosterCall(
 ): Promise<boolean> {
   const state = activeFonosterCalls.get(callId);
   const cleanText = String(text || '').trim();
-  if (!state || state.voiceSession.ended || !cleanText) return false;
+  if (!state || state.transport.ended || !cleanText) return false;
 
   const preempt = options?.preempt ?? true;
   const interruptible = options?.interruptible ?? true;
 
   if (preempt) {
-    interruptFonosterPlayback(callId);
+    state.playbackEpoch += 1;
+    if (state.hasSentAudio) {
+      try {
+        state.transport.clearAudio();
+      } catch {
+        // Ignore clear error
+      }
+    }
   }
+  const myEpoch = state.playbackEpoch;
+  state.isInterruptible = interruptible;
 
-  const controller = new AbortController();
-  state.playbackAbort = controller;
-  state.currentPlaybackInterruptible = interruptible;
-  state.playbackStartedAt = Date.now();
+  const negotiatedCodec: TelephonyCodec = state.transport.codec;
+  const negotiatedRate: TelephonyRate = state.transport.sampleRate;
 
   try {
-    const synthesized = await synthesizePcm16(cleanText, {
+    const synthesized = await synthesizeTelephonyAudio(cleanText, {
       voice: options?.voice || state.voice,
+      codec: negotiatedCodec,
+      sampleRate: negotiatedRate,
     });
 
-    if (controller.signal.aborted || state.voiceSession.ended || synthesized.pcm16.length === 0) {
+    if (state.transport.ended || state.playbackEpoch !== myEpoch) {
       return false;
     }
 
-    const result = await streamPcm16Frames(synthesized.pcm16, {
-      signal: controller.signal,
-      sendFrame: (frame) => {
-        if (!state.voiceSession.ended) {
-          try {
-            state.voiceSession.audio.send(frame);
-          } catch {}
-        }
-      },
-      onFrameSent: (frame) => {
-        state.recorder?.pushOutbound(frame);
-        broadcastMonitorAudio(callId, frame, 0.35);
-      },
-    });
+    const bytesPerSample = synthesized.codec === 'pcmu' ? 1 : 2;
+    const frameMs = 20;
+    const frameBytes = Math.round((synthesized.sampleRate * frameMs) / 1000) * bytesPerSample;
+    const audioBuf = synthesized.audio;
+    const totalFrames = Math.ceil(audioBuf.length / frameBytes);
 
-    return result.framesSent > 0;
-  } catch (err) {
-    console.error(`[Fonoster PCM16 TTS] Playback failed for ${callId}:`, err);
-    return false;
-  } finally {
-    if (state.playbackAbort === controller) {
-      state.playbackAbort = undefined;
-      state.playbackStartedAt = undefined;
+    console.log(
+      `[Fonoster Audio] Streaming TTS callId=${callId} proto=${state.transport.protocol} engine=${synthesized.engine} voice=${synthesized.voice} cached=${synthesized.cached} codec=${synthesized.codec}/${synthesized.sampleRate}Hz duration=${synthesized.durationMs}ms frames=${totalFrames}`
+    );
+
+    // Pre-buffer 5 frames (100ms) for smooth jitter-free playout, then pace steadily every 20ms
+    const prebufferFrames = 5;
+    const startTime = Date.now();
+
+    for (let i = 0; i < totalFrames; i++) {
+      if (state.transport.ended || state.playbackEpoch !== myEpoch) {
+        return false;
+      }
+
+      const start = i * frameBytes;
+      const end = Math.min(start + frameBytes, audioBuf.length);
+      let frame = audioBuf.subarray(start, end);
+      if (frame.length < frameBytes) {
+        const padded = Buffer.alloc(frameBytes, synthesized.codec === 'pcmu' ? 0xff : 0);
+        frame.copy(padded);
+        frame = padded;
+      }
+
+      state.hasSentAudio = true;
+      state.transport.sendAudioFrame(frame);
+
+      if (i + 1 >= prebufferFrames) {
+        const targetElapsedMs = (i + 1 - prebufferFrames) * frameMs;
+        const waitMs = targetElapsedMs - (Date.now() - startTime);
+        if (waitMs > 1) {
+          await sleepMs(waitMs);
+        }
+      }
     }
+
+    if (state.transport.ended || state.playbackEpoch !== myEpoch) {
+      return false;
+    }
+
+    // Wait for AppBridge playout confirmation via mark (with safe timeout fallback)
+    const markName = `tts-${myEpoch}-${Date.now()}`;
+    const playoutMarginMs = prebufferFrames * frameMs + 700;
+    await Promise.race([
+      state.transport.sendMark(markName).catch(() => ({ cleared: false })),
+      sleepMs(playoutMarginMs),
+    ]);
+
+    if (state.playbackEpoch === myEpoch) {
+      state.isInterruptible = false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`[Fonoster Audio] Raw TTS stream failed for ${callId}:`, err);
+    return false;
   }
 }
 
 export async function hangupFonosterCall(callId: string): Promise<boolean> {
   const state = activeFonosterCalls.get(callId);
   if (!state) return false;
-  interruptFonosterPlayback(callId);
+  state.playbackEpoch += 1;
   if (state.amdFallbackTimer) {
     clearTimeout(state.amdFallbackTimer);
     state.amdFallbackTimer = undefined;
   }
-  if (state.voiceSession.ended) {
-    closeMonitorSubscribers(callId);
+  if (state.transport.ended) {
     activeFonosterCalls.delete(callId);
     return true;
   }
   try {
-    await state.voiceSession.hangup();
-    closeMonitorSubscribers(callId);
+    await state.transport.hangup();
     activeFonosterCalls.delete(callId);
     return true;
   } catch (err) {
     console.error(`Fonoster hangup failed for ${callId}:`, err);
-    closeMonitorSubscribers(callId);
     activeFonosterCalls.delete(callId);
     return false;
   }
 }
 
 export interface FonosterVoiceBridgeHooks {
-  recordingsDir: string;
   resolveSession: (meta: { callId?: string; callRef: string; to: string }) => any | undefined;
   onSessionConnected: (session: any, callRef: string) => void;
   onAmdResult: (
@@ -1128,274 +1169,506 @@ export interface FonosterVoiceBridgeHooks {
   ) => Promise<void>;
   onStartHumanGreeting: (session: any, state: FonosterSessionState) => Promise<void>;
   onSpeechTurn: (session: any, text: string, confidence?: number) => Promise<boolean>;
-  onDigitKeypress?: (
-    session: any,
-    digit: string,
-    currentBuffer: string,
-    source: 'rfc2833' | 'inband-pcm16'
-  ) => void;
   onDigitsSubmitted: (
     session: any,
     digits: string,
     submittedViaPound: boolean,
     state: FonosterSessionState
   ) => Promise<void>;
-  onLocalRecordingReady?: (
-    session: any,
-    recording: { filePath: string; ext: string; durationSec: number; sizeBytes: number }
-  ) => void;
+  onSessionError?: (session: any, err: { code?: string; message?: string; fatal?: boolean }) => void;
   onSessionEnded: (session: any, reason: string) => Promise<void>;
   getMaxDigits: (numDigits?: number) => number;
 }
 
+/**
+ * Dual-protocol WebSocket server mounted on `/api/fonoster/stream`.
+ * Automatically handles BOTH:
+ *   1. Twilio Media Streams (`protocol: 'twilio'`) — zero Deepgram, Speech=None in Fonoster UI, 8kHz μ-law JSON
+ *   2. Fonoster Session v1 (`protocol: 'fonoster'`) — backward-compatible binary PCM16/PCMU
+ */
 export function attachFonosterVoiceServer(
   httpServer: HttpServer,
   hooks: FonosterVoiceBridgeHooks
-): VoiceServer {
-  const voiceServer = new VoiceServer({
-    path: '/api/fonoster/stream',
-    verifySignature: false,
+): WebSocketServer {
+  const wss = new WebSocketServer({ noServer: true });
+
+  httpServer.on('upgrade', (req, socket, head) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname !== '/api/fonoster/stream') return;
+
+    console.log(
+      '[Fonoster Voice] Incoming WebSocket upgrade request:',
+      JSON.stringify({
+        url: req.url,
+        host: req.headers.host,
+        forwardedHost: req.headers['x-forwarded-host'],
+        forwardedProto: req.headers['x-forwarded-proto'],
+        protocol: req.headers['sec-websocket-protocol'],
+        remoteAddress: req.socket?.remoteAddress,
+      })
+    );
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      handleDualProtocolSocket(ws, hooks);
+    });
   });
 
-  voiceServer.attach(httpServer, async (voiceSession: FonosterVoiceSession) => {
-    const metaCallId =
-      typeof voiceSession.metadata?.callId === 'string' ? voiceSession.metadata.callId : undefined;
+  return wss;
+}
+
+function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks): void {
+  let initialized = false;
+  let activeState: FonosterSessionState | null = null;
+  let activeSessionObj: any = null;
+  let detectedProtocol: 'twilio' | 'fonoster' | null = null;
+  let twilioStreamSid = '';
+  let negotiatedCodec: TelephonyCodec = 'pcmu';
+  let negotiatedRate: TelephonyRate = 8000;
+  let connectedAt = Date.now();
+  let voiceFramesSeen = 0;
+  let silenceAfterVoiceFrames = 0;
+  let ended = false;
+
+  const markWaiters = new Map<string, Array<(res: { cleared: boolean }) => void>>();
+
+  const resolveMark = (name: string, cleared = false) => {
+    const list = markWaiters.get(name);
+    const fn = list?.shift();
+    if (list && list.length === 0) markWaiters.delete(name);
+    fn?.({ cleared });
+  };
+
+  const clearAllMarks = () => {
+    for (const list of markWaiters.values()) {
+      for (const fn of list) fn({ cleared: true });
+    }
+    markWaiters.clear();
+  };
+
+  const sendJson = (payload: Record<string, any>) => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  };
+
+  // Keepalive ping every 15s so half-open sockets terminate cleanly
+  let isAlive = true;
+  ws.on('pong', () => {
+    isAlive = true;
+  });
+  const pingTimer = setInterval(() => {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!isAlive) {
+      ws.terminate();
+      return;
+    }
+    isAlive = false;
+    try {
+      ws.ping();
+    } catch {}
+  }, 15000);
+
+  // Guard against silent connections that never send start/session.start
+  const startTimeout = setTimeout(() => {
+    if (!initialized && ws.readyState === WebSocket.OPEN) {
+      console.warn('[Fonoster Voice] Closing idle WebSocket: no start / session.start within 8s');
+      ws.close(1008, 'no start message');
+    }
+  }, 8000);
+
+  const transport: FonosterStreamTransport = {
+    get protocol() {
+      return detectedProtocol || 'twilio';
+    },
+    get codec() {
+      return negotiatedCodec;
+    },
+    get sampleRate() {
+      return negotiatedRate;
+    },
+    get ended() {
+      return ended || ws.readyState !== WebSocket.OPEN;
+    },
+    sendAudioFrame: (frame: Buffer) => {
+      if (ended || ws.readyState !== WebSocket.OPEN) return;
+      if (detectedProtocol === 'twilio') {
+        sendJson({
+          event: 'media',
+          streamSid: twilioStreamSid,
+          media: {
+            payload: frame.toString('base64'),
+          },
+        });
+      } else {
+        ws.send(frame, { binary: true });
+      }
+    },
+    clearAudio: () => {
+      if (ended || ws.readyState !== WebSocket.OPEN) return;
+      if (detectedProtocol === 'twilio') {
+        sendJson({ event: 'clear', streamSid: twilioStreamSid });
+      } else {
+        sendJson({ type: 'clear' });
+      }
+    },
+    sendMark: (name: string) =>
+      new Promise((resolve) => {
+        if (ended || ws.readyState !== WebSocket.OPEN) {
+          resolve({ cleared: true });
+          return;
+        }
+        const list = markWaiters.get(name) || [];
+        list.push(resolve);
+        markWaiters.set(name, list);
+        if (detectedProtocol === 'twilio') {
+          sendJson({
+            event: 'mark',
+            streamSid: twilioStreamSid,
+            mark: { name },
+          });
+        } else {
+          sendJson({ type: 'mark', name });
+        }
+      }),
+    hangup: async () => {
+      if (ended) return;
+      if (ws.readyState === WebSocket.OPEN) {
+        if (detectedProtocol === 'fonoster') {
+          sendJson({ type: 'hangup' });
+        }
+        try {
+          ws.close(1000, 'hangup');
+        } catch {}
+      }
+    },
+  };
+
+  const triggerGreetingOnce = async (sourceLabel = 'raw_audio_pickup') => {
+    if (!activeState || !activeSessionObj || activeState.greetStarted || ended) return;
+    if (activeSessionObj.answeredBy === 'voicemail' && !activeSessionObj.humanPickedUpAfterVoicemail) {
+      return;
+    }
+    activeState.greetStarted = true;
+    if (activeState.amdFallbackTimer) {
+      clearTimeout(activeState.amdFallbackTimer);
+      activeState.amdFallbackTimer = undefined;
+    }
+    if (!activeState.amdResolved) {
+      activeState.amdResolved = true;
+      await hooks.onAmdResult(activeSessionObj, 'human', sourceLabel);
+    }
+    await hooks.onStartHumanGreeting(activeSessionObj, activeState);
+  };
+
+  const handleInboundAudioFrame = (frame: Buffer) => {
+    if (!activeState || activeState.greetStarted || ended) return;
+    const elapsed = Date.now() - connectedAt;
+    if (elapsed < 220) return;
+
+    const rms = computeFrameRms(frame, negotiatedCodec);
+    if (rms >= 0.025) {
+      voiceFramesSeen += 1;
+      silenceAfterVoiceFrames = 0;
+    } else if (voiceFramesSeen >= 4) {
+      silenceAfterVoiceFrames += 1;
+      if (silenceAfterVoiceFrames >= 9) {
+        void triggerGreetingOnce('local_vad_human_pickup');
+      }
+    }
+  };
+
+  const handleDtmfDigit = (rawDigit: string) => {
+    if (!activeState || !activeSessionObj || ended) return;
+    const key = String(rawDigit || '').trim();
+    if (!key) return;
+
+    console.log(`[Fonoster DTMF] callId=${activeSessionObj.id} proto=${detectedProtocol} digit=${key}`);
+
+    if (activeState.isInterruptible) {
+      stopFonosterPlayback(activeSessionObj.id);
+    }
+
+    if (activeSessionObj.answeredBy === 'voicemail' && !activeSessionObj.humanPickedUpAfterVoicemail) {
+      activeSessionObj.humanPickedUpAfterVoicemail = true;
+      void hooks
+        .onAmdResult(activeSessionObj, 'human', 'dtmf_human_pickup')
+        .then(() => triggerGreetingOnce('dtmf_human_pickup'));
+    } else if (!activeState.greetStarted) {
+      activeState.amdResolved = true;
+      void hooks.onAmdResult(activeSessionObj, 'human', 'dtmf_confirmed_human');
+    }
+
+    if (key === '#') {
+      if (activeState.digitBuffer.length >= 1) {
+        const submitted = activeState.digitBuffer;
+        activeState.digitBuffer = '';
+        void hooks.onDigitsSubmitted(activeSessionObj, submitted, true, activeState);
+      }
+      return;
+    }
+
+    if (/^[0-9*]$/.test(key)) {
+      activeState.digitBuffer += key;
+      const maxDigits = hooks.getMaxDigits(activeSessionObj.numDigits);
+      if (activeState.digitBuffer.length >= maxDigits) {
+        const submitted = activeState.digitBuffer.slice(0, maxDigits);
+        activeState.digitBuffer = '';
+        void hooks.onDigitsSubmitted(activeSessionObj, submitted, false, activeState);
+      }
+    }
+  };
+
+  const startVoiceSession = (meta: {
+    protocol: 'twilio' | 'fonoster';
+    callId?: string;
+    callRef: string;
+    from: string;
+    to: string;
+    codec: TelephonyCodec;
+    sampleRate: TelephonyRate;
+    streamSid?: string;
+  }) => {
+    if (initialized) return;
+    initialized = true;
+    clearTimeout(startTimeout);
+
+    detectedProtocol = meta.protocol;
+    twilioStreamSid = meta.streamSid || '';
+    negotiatedCodec = meta.codec;
+    negotiatedRate = meta.sampleRate;
+    connectedAt = Date.now();
+
     const session = hooks.resolveSession({
-      callId: metaCallId,
-      callRef: voiceSession.callRef,
-      to: voiceSession.to,
+      callId: meta.callId,
+      callRef: meta.callRef,
+      to: meta.to,
     });
 
     if (!session) {
       console.warn(
-        `[Fonoster Voice] Incoming stream for unknown callRef=${voiceSession.callRef} to=${voiceSession.to}`
+        `[Fonoster Voice] Incoming ${meta.protocol} stream for unknown callId=${meta.callId || ''} callRef=${meta.callRef} to=${meta.to}`
       );
-      try {
-        await voiceSession.hangup();
-      } catch {}
+      void transport.hangup();
       return;
     }
 
-    let state!: FonosterSessionState;
+    activeSessionObj = session;
+    console.log(
+      `[Fonoster Voice] Stream session connected (protocol=${meta.protocol}, Deepgram bypassed):`,
+      JSON.stringify({
+        callId: session.id,
+        callRef: meta.callRef,
+        streamSid: twilioStreamSid || undefined,
+        from: meta.from,
+        to: meta.to,
+        codec: negotiatedCodec,
+        sampleRate: negotiatedRate,
+      })
+    );
 
-    const triggerGreetingOnce = async () => {
-      if (!state || state.greetStarted || voiceSession.ended) return;
-      if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
-        return;
-      }
-      state.greetStarted = true;
-      if (state.amdFallbackTimer) {
-        clearTimeout(state.amdFallbackTimer);
-        state.amdFallbackTimer = undefined;
-      }
-      await hooks.onStartHumanGreeting(session, state);
-    };
-
-    const handleIncomingDigit = (rawDigit: string, source: 'rfc2833' | 'inband-pcm16') => {
-      const key = String(rawDigit || '').trim();
-      if (!key || !/^[0-9*#]$/.test(key) || voiceSession.ended) return;
-
-      const now = Date.now();
-      // Deduplicate same tone detected by both RFC 2833 and in-band Goertzel within 400ms
-      if (
-        state.lastDigit &&
-        state.lastDigit.key === key &&
-        state.lastDigit.source !== source &&
-        now - state.lastDigit.at < 400
-      ) {
-        return;
-      }
-      state.lastDigit = { key, source, at: now };
-
-      // Immediate barge-in when caller starts keying digits during an interruptible prompt
-      if (state.playbackAbort && state.currentPlaybackInterruptible) {
-        interruptFonosterPlayback(session.id);
-      }
-
-      // Any keypress confirms a live human on the handset
-      if (session.answeredBy === 'voicemail' && !session.humanPickedUpAfterVoicemail) {
-        session.humanPickedUpAfterVoicemail = true;
-        state.amdResolved = true;
-        state.vadAmd.markResolvedExternally('human');
-        void hooks
-          .onAmdResult(session, 'human', `dtmf_human_pickup_${source}`)
-          .then(() => triggerGreetingOnce());
-      } else if (!state.amdResolved) {
-        state.amdResolved = true;
-        state.vadAmd.markResolvedExternally('human');
-        void hooks.onAmdResult(session, 'human', `dtmf_confirmed_human_${source}`);
-      }
-
-      if (key === '#') {
-        hooks.onDigitKeypress?.(session, '#', state.digitBuffer, source);
-        if (state.digitBuffer.length >= 1) {
-          const submitted = state.digitBuffer;
-          state.digitBuffer = '';
-          void hooks.onDigitsSubmitted(session, submitted, true, state);
-        }
-        return;
-      }
-
-      state.digitBuffer += key;
-      hooks.onDigitKeypress?.(session, key, state.digitBuffer, source);
-
-      const maxDigits = hooks.getMaxDigits(session.numDigits);
-      if (state.digitBuffer.length >= maxDigits) {
-        const submitted = state.digitBuffer.slice(0, maxDigits);
-        state.digitBuffer = '';
-        void hooks.onDigitsSubmitted(session, submitted, false, state);
-      }
-    };
-
-    const vadAmd = new Pcm16VadAmdDetector({
-      onAmdClassified: (status, reason) => {
-        if (state.amdResolved || voiceSession.ended) return;
-        state.amdResolved = true;
-        if (state.amdFallbackTimer) {
-          clearTimeout(state.amdFallbackTimer);
-          state.amdFallbackTimer = undefined;
-        }
-        void hooks.onAmdResult(session, status, reason).then(async () => {
-          if (status === 'human') {
-            await triggerGreetingOnce();
-          }
-        });
-      },
-      onVoiceActivity: (speaking, rms) => {
-        // Optional speech barge-in only on strong live caller voice after initial 700ms playback
-        if (
-          speaking &&
-          rms >= 0.085 &&
-          state.playbackAbort &&
-          state.currentPlaybackInterruptible &&
-          state.playbackStartedAt &&
-          Date.now() - state.playbackStartedAt > 700 &&
-          state.digitBuffer.length > 0
-        ) {
-          interruptFonosterPlayback(session.id);
-        }
-      },
-      onHumanPickupAfterVoicemail: () => {
-        if (voiceSession.ended || session.humanPickedUpAfterVoicemail) return;
-        session.humanPickedUpAfterVoicemail = true;
-        void hooks
-          .onAmdResult(session, 'human', 'pcm16_vad_human_pickup')
-          .then(() => triggerGreetingOnce());
-      },
-    });
-
-    const dtmfDetector = new GoertzelDtmfDetector((digit) => {
-      handleIncomingDigit(digit, 'inband-pcm16');
-    });
-
-    const recorder = session.recordCall !== false ? new Pcm16CallRecorder(session.id) : undefined;
-
-    state = {
-      voiceSession,
+    const state: FonosterSessionState = {
+      transport,
       callId: session.id,
       voice: session.voice,
       digitBuffer: '',
       greetStarted: Boolean(session.promptsStarted),
       amdResolved: false,
-      currentPlaybackInterruptible: true,
-      recorder,
-      recorderFinalized: false,
-      dtmfDetector,
-      vadAmd,
+      playbackEpoch: 0,
+      isInterruptible: false,
+      hasSentAudio: false,
     };
 
+    activeState = state;
     activeFonosterCalls.set(session.id, state);
-    hooks.onSessionConnected(session, voiceSession.callRef);
+    hooks.onSessionConnected(session, meta.callRef);
 
-    // IMPORTANT: We NEVER call voiceSession.listen() or voiceSession.say() so Fonoster never invokes Deepgram.
-    // Instead, consume raw bidirectional PCM16 16kHz frames directly from the WebSocket stream.
-    voiceSession.audio.onFrame((frame: Buffer) => {
-      if (!frame || frame.length === 0 || voiceSession.ended) return;
-      state.recorder?.pushInbound(frame);
-      broadcastMonitorAudio(session.id, frame, 1.0);
-      state.vadAmd.pushPcm16(frame);
-      state.dtmfDetector.pushPcm16(frame);
-    });
-
-    // Safety fallback: if no audio frames or AMD classification finishes within 3.8s, proceed with live human greeting
+    // Crisp fallback: start greeting smoothly at 750ms even if callee answered quietly
     state.amdFallbackTimer = setTimeout(() => {
-      if (!state.amdResolved && !state.greetStarted && !voiceSession.ended) {
-        if (session.answeredBy !== 'voicemail') {
-          state.amdResolved = true;
-          state.vadAmd.markResolvedExternally('human');
-          void hooks
-            .onAmdResult(session, 'human', 'pcm16_timeout_human')
-            .then(() => triggerGreetingOnce());
-        }
+      if (!state.greetStarted && !ended) {
+        void triggerGreetingOnce('immediate_pickup_cadence');
       }
-    }, 3800);
+    }, 750);
+  };
 
-    // Still handle native Fonoster RFC 2833 DTMF events (primary) alongside in-band Goertzel backup
-    voiceSession.on('dtmf', ({ digit }) => {
-      handleIncomingDigit(String(digit || ''), 'rfc2833');
-    });
+  const finishSession = (reason: string) => {
+    if (ended) return;
+    ended = true;
+    clearTimeout(startTimeout);
+    clearInterval(pingTimer);
+    clearAllMarks();
 
-    // Optional passthrough if Fonoster ever emits AMD/turn events without vendor dependency
-    voiceSession.on('amd.result', (amd) => {
-      if (state.amdResolved) return;
-      state.amdResolved = true;
-      if (state.amdFallbackTimer) {
-        clearTimeout(state.amdFallbackTimer);
-        state.amdFallbackTimer = undefined;
+    if (activeState) {
+      activeState.playbackEpoch += 1;
+      if (activeState.amdFallbackTimer) {
+        clearTimeout(activeState.amdFallbackTimer);
+        activeState.amdFallbackTimer = undefined;
       }
+      activeFonosterCalls.delete(activeState.callId);
+    }
 
-      const rawStatus = String(amd.status || 'unknown').toLowerCase();
-      const mapped: 'human' | 'voicemail' | 'fax' | 'unknown' =
-        rawStatus === 'human'
-          ? 'human'
-          : rawStatus === 'voicemail' || rawStatus === 'machine' || rawStatus === 'ivr'
-          ? 'voicemail'
-          : 'unknown';
+    if (activeSessionObj) {
+      console.log(
+        `[Fonoster Voice] Session ended callId=${activeSessionObj.id} proto=${detectedProtocol} reason=${reason}`
+      );
+      void hooks.onSessionEnded(activeSessionObj, reason);
+    }
+  };
 
-      state.vadAmd.markResolvedExternally(mapped === 'voicemail' ? 'voicemail' : 'human');
-      const rawLabel = `fonoster_${rawStatus}${amd.reason ? `_${amd.reason}` : ''}`;
-      void hooks.onAmdResult(session, mapped, rawLabel).then(async () => {
-        if (mapped === 'human' || (mapped === 'unknown' && session.answeredBy !== 'voicemail')) {
-          await triggerGreetingOnce();
-        }
-      });
-    });
-
-    voiceSession.on('turn.ended', (turn) => {
-      const text = (turn.text || '').trim();
-      if (!text) return;
-      void hooks.onSpeechTurn(session, text, turn.confidence).then(async (shouldWakeHuman) => {
-        if (shouldWakeHuman) {
-          await triggerGreetingOnce();
-        }
-      });
-    });
-
-    voiceSession.on('error', (err) => {
-      console.error(`[Fonoster Voice] Session error (${session.id}):`, err);
-    });
-
-    voiceSession.on('end', ({ reason }) => {
-      interruptFonosterPlayback(session.id);
-      if (state.amdFallbackTimer) {
-        clearTimeout(state.amdFallbackTimer);
-        state.amdFallbackTimer = undefined;
+  ws.on('message', (raw, isBinary) => {
+    if (isBinary) {
+      // Fonoster Session v1 binary audio frame: first byte is trackId, rest is PCM16/PCMU payload
+      const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
+      if (buf.length > 1) {
+        handleInboundAudioFrame(buf.subarray(1));
       }
-      closeMonitorSubscribers(session.id);
-      activeFonosterCalls.delete(session.id);
+      return;
+    }
 
-      void (async () => {
-        if (state.recorder && !state.recorderFinalized) {
-          state.recorderFinalized = true;
-          const saved = await state.recorder.finalize(hooks.recordingsDir);
-          if (saved) {
-            hooks.onLocalRecordingReady?.(session, saved);
+    let msg: any;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    // --- 1. Twilio Media Streams protocol (`protocol: 'twilio'`) ---
+    if (typeof msg.event === 'string') {
+      if (msg.event === 'connected') {
+        detectedProtocol = 'twilio';
+        return;
+      }
+      if (msg.event === 'start') {
+        const s = msg.start || {};
+        const custom = s.customParameters || msg.customParameters || {};
+        const streamSid = String(msg.streamSid || s.streamSid || '');
+        const callRef = String(s.callSid || msg.callSid || custom.callRef || '');
+        const callId = typeof custom.callId === 'string' ? custom.callId : undefined;
+        const from = String(custom.from || s.from || '');
+        const to = String(custom.to || s.to || '');
+        const encoding = String(s.mediaFormat?.encoding || '').toLowerCase();
+        const codec: TelephonyCodec = encoding.includes('pcm') && !encoding.includes('mulaw') ? 'pcm16' : 'pcmu';
+        const rawRate = Number(s.mediaFormat?.sampleRate || 8000);
+        const sampleRate: TelephonyRate =
+          codec === 'pcmu' ? 8000 : rawRate === 16000 || rawRate === 24000 ? (rawRate as TelephonyRate) : 8000;
+
+        startVoiceSession({
+          protocol: 'twilio',
+          callId,
+          callRef,
+          from,
+          to,
+          codec,
+          sampleRate,
+          streamSid,
+        });
+        return;
+      }
+      if (msg.event === 'media') {
+        const b64 = msg.media?.payload;
+        if (typeof b64 === 'string' && b64.length > 0) {
+          handleInboundAudioFrame(Buffer.from(b64, 'base64'));
+        }
+        return;
+      }
+      if (msg.event === 'dtmf') {
+        handleDtmfDigit(msg.dtmf?.digit ?? msg.digit ?? '');
+        return;
+      }
+      if (msg.event === 'mark') {
+        const name = String(msg.mark?.name || msg.name || '');
+        if (name) resolveMark(name, false);
+        return;
+      }
+      if (msg.event === 'stop') {
+        finishSession('twilio_stream_stop');
+        return;
+      }
+      return;
+    }
+
+    // --- 2. Fonoster Session v1 protocol (`protocol: 'fonoster'`) ---
+    if (typeof msg.type === 'string') {
+      if (msg.type === 'session.start') {
+        const codec: TelephonyCodec = msg.audio?.codec === 'pcmu' ? 'pcmu' : 'pcm16';
+        const rawRate = Number(msg.audio?.rate || 16000);
+        const sampleRate: TelephonyRate =
+          codec === 'pcmu' ? 8000 : rawRate === 8000 || rawRate === 24000 ? (rawRate as TelephonyRate) : 16000;
+        const metaCallId = typeof msg.metadata?.callId === 'string' ? msg.metadata.callId : undefined;
+        startVoiceSession({
+          protocol: 'fonoster',
+          callId: metaCallId,
+          callRef: String(msg.callRef || ''),
+          from: String(msg.from || ''),
+          to: String(msg.to || ''),
+          codec,
+          sampleRate,
+        });
+        return;
+      }
+      if (msg.type === 'dtmf') {
+        handleDtmfDigit(msg.digit ?? '');
+        return;
+      }
+      if (msg.type === 'mark') {
+        if (msg.name) resolveMark(String(msg.name), msg.cleared === true);
+        return;
+      }
+      if (msg.type === 'amd.result' && activeSessionObj && activeState && !activeState.greetStarted) {
+        activeState.amdResolved = true;
+        if (activeState.amdFallbackTimer) {
+          clearTimeout(activeState.amdFallbackTimer);
+          activeState.amdFallbackTimer = undefined;
+        }
+        const rawStatus = String(msg.status || 'unknown').toLowerCase();
+        const mapped: 'human' | 'voicemail' | 'fax' | 'unknown' =
+          rawStatus === 'human'
+            ? 'human'
+            : rawStatus === 'voicemail' || rawStatus === 'machine' || rawStatus === 'ivr'
+            ? 'voicemail'
+            : 'unknown';
+        const rawLabel = `fonoster_${rawStatus}${msg.reason ? `_${msg.reason}` : ''}`;
+        void hooks.onAmdResult(activeSessionObj, mapped, rawLabel).then(async () => {
+          if (mapped === 'human' || (mapped === 'unknown' && activeSessionObj.answeredBy !== 'voicemail')) {
+            await triggerGreetingOnce(rawLabel);
           }
+        });
+        return;
+      }
+      if (msg.type === 'turn.ended' && activeSessionObj) {
+        const text = String(msg.text || '').trim();
+        if (text) {
+          void hooks.onSpeechTurn(activeSessionObj, text, msg.confidence).then(async (shouldWake) => {
+            if (shouldWake) await triggerGreetingOnce('speech_human_pickup');
+          });
         }
-        await hooks.onSessionEnded(session, reason || 'ended');
-      })();
-    });
+        return;
+      }
+      if (msg.type === 'error' && activeSessionObj) {
+        console.error(`[Fonoster Voice] Session error (${activeSessionObj.id}):`, msg);
+        hooks.onSessionError?.(activeSessionObj, {
+          code: msg.code,
+          message: msg.message,
+          fatal: msg.fatal === true,
+        });
+        if (msg.fatal === true) {
+          finishSession('error');
+        }
+        return;
+      }
+      if (msg.type === 'session.end') {
+        finishSession(String(msg.reason || 'ended'));
+        return;
+      }
+    }
   });
 
-  return voiceServer;
+  ws.on('close', (code, reasonBuf) => {
+    const reasonText = reasonBuf?.toString()?.trim();
+    finishSession(reasonText ? `closed_${code}_${reasonText}` : `closed_${code}`);
+  });
+
+  ws.on('error', (err) => {
+    console.error('[Fonoster Voice] WebSocket error:', err);
+    finishSession('socket_error');
+  });
 }

@@ -288,42 +288,14 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
     setSavedSuccess(`${activeCarrierTab.toUpperCase()} credentials saved successfully!`);
     setTimeout(() => setSavedSuccess(null), 2500);
 
-    // Automatically enforce Speech=None & PCM16 16kHz on the Fonoster Stream App whenever Fonoster settings are saved
+    // Automatically sync Fonoster Stream App on save so Speech/Vendor/Transcriber stay None & PCM16 16kHz
     if (
       activeCarrierTab === 'fonoster' &&
       updated.fonoster?.projectId &&
       updated.fonoster?.accessKeyId &&
       updated.fonoster?.accessKeySecret
     ) {
-      void fetch('/api/fonoster/verify', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...getDeviceHeaders(),
-        },
-        body: JSON.stringify({
-          projectId: updated.fonoster.projectId,
-          accessKeyId: updated.fonoster.accessKeyId,
-          accessKeySecret: updated.fonoster.accessKeySecret,
-          appRef: updated.fonoster.appRef || undefined,
-          endpoint: updated.fonoster.endpoint || undefined,
-          syncApp: true,
-        }),
-      })
-        .then((r) => r.json())
-        .then((data) => {
-          if (data?.ok && typeof data.syncedAppRef === 'string' && data.syncedAppRef.trim()) {
-            const nextFonoster: FonosterConfig = {
-              ...updated.fonoster!,
-              appRef: data.syncedAppRef.trim(),
-            };
-            setFonoster(nextFonoster);
-            onSaveCarriersConfig({ ...updated, fonoster: nextFonoster });
-          }
-        })
-        .catch(() => {
-          // Silent background sync on save; user can still click Test Connection & Sync for detailed diagnostics
-        });
+      void handleVerifyFonoster();
     }
   };
 
@@ -405,10 +377,11 @@ export const CarrierSettingsView: React.FC<CarrierSettingsViewProps> = ({
 
       const numCount = Array.isArray(data.numbers) ? data.numbers.length : 0;
       const endpointNote = data.endpoint ? ` Endpoint: ${data.endpoint}.` : '';
+      const audioSummary = ` Protocol: Fonoster · Audio: ${data.audioFormat || 'PCM16 16 kHz'} · Speech/Transcriber: None (Internal TTS).`;
       setFonosterTestResult({
         ok: true,
         message: `Connected to Fonoster! ${appLabel}.`,
-        detail: `${numCount} workspace number${numCount === 1 ? '' : 's'} found.${endpointNote}${
+        detail: `${numCount} workspace number${numCount === 1 ? '' : 's'} found.${endpointNote}${audioSummary}${
           data.warning ? ` Note: ${data.warning}` : ''
         }`,
       });

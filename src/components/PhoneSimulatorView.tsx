@@ -454,6 +454,10 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
       }, 1000);
     } else {
       setCallDuration(0);
+      setIsSpeaking(false);
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
       if (mediaRecorderRef.current || activeRecordingCallIdRef.current) {
         void stopAndUploadMicRecording(activeRecordingCallIdRef.current || session?.id);
       }
@@ -461,9 +465,9 @@ export const PhoneSimulatorView: React.FC<PhoneSimulatorViewProps> = ({
     return () => clearInterval(interval);
   }, [session?.id, session?.status]);
 
-  // Voice speech synthesis helper with deduplication & mute guard
+  // Voice speech synthesis helper with deduplication & mute guard (simulator mode only — live PSTN calls stream audio directly on the phone)
   const speakText = (text: string, onEnd?: () => void) => {
-    if (!text || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+    if (!session?.isSimulated || !text || typeof window === 'undefined' || !('speechSynthesis' in window)) {
       if (onEnd) onEnd();
       return;
     }

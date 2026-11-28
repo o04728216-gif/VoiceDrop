@@ -2,7 +2,125 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
-import { PCM16_BYTES_PER_FRAME, PCM16_FRAME_MS, PCM16_SAMPLE_RATE } from './tts.ts';
+import {
+  PCM16_BYTES_PER_FRAME,
+  PCM16_FRAME_MS,
+  PCM16_SAMPLE_RATE,
+  resolveFfmpegBin,
+} from './tts.ts';
+
+// ---------------------------------------------------------------------------
+// 0. Negotiated Session Audio Codec & Resampler (pcm16@8k/16k/24k & pcmu@8k)
+// ---------------------------------------------------------------------------
+export interface SessionAudioFormat {
+  codec: 'pcm16' | 'pcmu';
+  rate: number;
+}
+
+export function normalizeSessionAudioFormat(raw?: {
+  codec?: string;
+  rate?: number;
+}): SessionAudioFormat {
+  const codec = String(raw?.codec || 'pcm16').toLowerCase() === 'pcmu' ? 'pcmu' : 'pcm16';
+  const rawRate = Number(raw?.rate);
+  if (codec === 'pcmu') {
+    return { codec: 'pcmu', rate: 8000 };
+  }
+  const rate =
+    rawRate === 8000 || rawRate === 16000 || rawRate === 24000 ? rawRate : PCM16_SAMPLE_RATE;
+  return { codec: 'pcm16', rate };
+}
+
+function linearToMuLawByte(sample: number): number {
+  const MULAW_MAX = 0x1fff;
+  const MULAW_BIAS = 33;
+  let sign = 0;
+  let s = sample;
+  if (s < 0) {
+    sign = 0x80;
+    s = -s;
+  }
+  if (s > 32767) s = 32767;
+  s = (s >> 2) + MULAW_BIAS;
+  if (s > MULAW_MAX) s = MULAW_MAX;
+
+  let exponent = 7;
+  for (let expMask = 0x1000; (s & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {
+    // Find highest bit
+  }
+  const mantissa = (s >> (exponent + 3)) & 0x0f;
+  return ~(sign | (exponent << 4) | mantissa) & 0xff;
+}
+
+const MULAW_DECODE_TABLE = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  const inv = ~i & 0xff;
+  const sign = inv & 0x80;
+  const exponent = (inv >> 4) & 0x07;
+  const mantissa = inv & 0x0f;
+  let magnitude = ((mantissa << 3) + 0x84) << exponent;
+  magnitude -= 0x84;
+  MULAW_DECODE_TABLE[i] = sign ? -magnitude : magnitude;
+}
+
+export function resamplePcm16(pcm16: Buffer, fromRate: number, toRate: number): Buffer {
+  if (!pcm16 || pcm16.length < 2 || fromRate === toRate) return pcm16;
+  const inSamples = pcm16.length >> 1;
+  const outSamples = Math.max(1, Math.round((inSamples * toRate) / fromRate));
+  const out = Buffer.allocUnsafe(outSamples * 2);
+  const ratio = fromRate / toRate;
+
+  for (let i = 0; i < outSamples; i++) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const s0 = pcm16.readInt16LE(Math.min(idx, inSamples - 1) * 2);
+    const s1 = pcm16.readInt16LE(Math.min(idx + 1, inSamples - 1) * 2);
+    const interp = Math.round(s0 + (s1 - s0) * frac);
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, interp)), i * 2);
+  }
+  return out;
+}
+
+export function encodePcm16ForSession(
+  pcm16At16k: Buffer,
+  format: SessionAudioFormat
+): { encoded: Buffer; bytesPer20ms: number } {
+  if (format.codec === 'pcmu') {
+    const pcm8k = resamplePcm16(pcm16At16k, PCM16_SAMPLE_RATE, 8000);
+    const count = pcm8k.length >> 1;
+    const ulaw = Buffer.allocUnsafe(count);
+    for (let i = 0; i < count; i++) {
+      ulaw[i] = linearToMuLawByte(pcm8k.readInt16LE(i * 2));
+    }
+    return { encoded: ulaw, bytesPer20ms: 160 };
+  }
+
+  const targetRate = format.rate || PCM16_SAMPLE_RATE;
+  const resampled =
+    targetRate === PCM16_SAMPLE_RATE
+      ? pcm16At16k
+      : resamplePcm16(pcm16At16k, PCM16_SAMPLE_RATE, targetRate);
+  const bytesPer20ms = ((targetRate * PCM16_FRAME_MS) / 1000) * 2;
+  return { encoded: resampled, bytesPer20ms };
+}
+
+export function decodeSessionFrameToPcm16At16k(
+  frame: Buffer,
+  format: SessionAudioFormat
+): Buffer {
+  if (!frame || frame.length === 0) return Buffer.alloc(0);
+  if (format.codec === 'pcmu') {
+    const pcm8k = Buffer.allocUnsafe(frame.length * 2);
+    for (let i = 0; i < frame.length; i++) {
+      pcm8k.writeInt16LE(MULAW_DECODE_TABLE[frame[i]], i * 2);
+    }
+    return resamplePcm16(pcm8k, 8000, PCM16_SAMPLE_RATE);
+  }
+  const srcRate = format.rate || PCM16_SAMPLE_RATE;
+  if (srcRate === PCM16_SAMPLE_RATE) return frame;
+  return resamplePcm16(frame, srcRate, PCM16_SAMPLE_RATE);
+}
 
 // ---------------------------------------------------------------------------
 // 1. In-Band Goertzel DTMF Detector (PCM16 16kHz Mono — Backup to RFC 2833)
@@ -16,7 +134,11 @@ const DTMF_KEYPAD: string[][] = [
   ['*', '0', '#', 'D'],
 ];
 
-function goertzelPower(samples: Int16Array, targetFreq: number, sampleRate = PCM16_SAMPLE_RATE): number {
+function goertzelPower(
+  samples: Int16Array,
+  targetFreq: number,
+  sampleRate = PCM16_SAMPLE_RATE
+): number {
   const n = samples.length;
   const k = Math.round((n * targetFreq) / sampleRate);
   const omega = (2 * Math.PI * k) / n;
@@ -55,7 +177,8 @@ export class GoertzelDtmfDetector {
       this.processFrame(frameBuf);
     }
 
-    this.residual = offset < combined.length ? Buffer.from(combined.subarray(offset)) : Buffer.alloc(0);
+    this.residual =
+      offset < combined.length ? Buffer.from(combined.subarray(offset)) : Buffer.alloc(0);
   }
 
   private processFrame(frameBuf: Buffer): void {
@@ -128,21 +251,17 @@ export class GoertzelDtmfDetector {
       }
     }
 
-    // Both tone peaks must strongly dominate other DTMF bins
     if (lowMax <= 0.15 || highMax <= 0.15) return null;
     if (lowSecond > 0 && lowMax / lowSecond < 5.0) return null;
     if (highSecond > 0 && highMax / highSecond < 5.0) return null;
 
-    // Twist check (difference between low and high group amplitudes)
     const twistRatio = highMax / lowMax;
     if (twistRatio > 6.5 || twistRatio < 0.15) return null;
 
-    // Second-harmonic rejection (voice has strong 2nd harmonics; pure DTMF tones do not)
     const low2nd = goertzelPower(samples, DTMF_LOW_FREQS[lowIdx] * 2);
     const high2nd = goertzelPower(samples, DTMF_HIGH_FREQS[highIdx] * 2);
     if (low2nd > lowMax * 0.35 || high2nd > highMax * 0.35) return null;
 
-    // Combined DTMF tone energy must represent a significant fraction of frame energy (reject broadband speech/noise)
     const expectedBinScale = samples.length / 2;
     const toneEnergyRatio = (lowMax + highMax) / (totalEnergy * expectedBinScale + 1e-9);
     if (toneEnergyRatio < 0.42) return null;
@@ -163,7 +282,7 @@ export interface VadAmdHooks {
 export class Pcm16VadAmdDetector {
   private readonly hooks: VadAmdHooks;
   private residual = Buffer.alloc(0);
-  private noiseFloor = 0.008;
+  private noiseFloor = 0.015;
   private isSpeaking = false;
   private totalElapsedMs = 0;
   private currentSpeechMs = 0;
@@ -205,7 +324,8 @@ export class Pcm16VadAmdDetector {
       this.processFrame(frame);
     }
 
-    this.residual = offset < combined.length ? Buffer.from(combined.subarray(offset)) : Buffer.alloc(0);
+    this.residual =
+      offset < combined.length ? Buffer.from(combined.subarray(offset)) : Buffer.alloc(0);
   }
 
   private processFrame(frame: Buffer): void {
@@ -229,21 +349,21 @@ export class Pcm16VadAmdDetector {
     const rms = Math.sqrt(sumSq / n);
     this.totalElapsedMs += PCM16_FRAME_MS;
 
-    // Adaptive noise floor tracking during quiet frames
-    if (rms < this.noiseFloor * 1.8) {
-      this.noiseFloor = this.noiseFloor * 0.94 + rms * 0.06;
-      this.noiseFloor = Math.max(0.004, Math.min(0.035, this.noiseFloor));
+    // Adaptive noise floor tracking (resilient to PSTN/mobile background hum)
+    if (rms < this.noiseFloor * 1.9) {
+      this.noiseFloor = this.noiseFloor * 0.92 + rms * 0.08;
+      this.noiseFloor = Math.max(0.008, Math.min(0.055, this.noiseFloor));
     }
 
-    const speechThreshold = Math.max(0.018, this.noiseFloor * 2.8);
+    const speechThreshold = Math.max(0.032, this.noiseFloor * 3.2);
     const frameActive = rms >= speechThreshold;
 
-    // Voicemail beep detection (sustained narrow-band tone 440–1300Hz with steady zero-crossings)
+    // Strict voicemail beep detection: pure sine tone strictly in 800-1250 Hz (excludes 440/480Hz ringback & voice)
     const zcrHz = (zeroCrossings * PCM16_SAMPLE_RATE) / (2 * n);
-    if (rms >= 0.04 && zcrHz >= 400 && zcrHz <= 1400) {
+    if (rms >= 0.06 && zcrHz >= 800 && zcrHz <= 1250) {
       const tonePwr = goertzelPower(samples, zcrHz);
       const ratio = tonePwr / (sumSq * (n / 2) + 1e-9);
-      if (ratio > 0.72) {
+      if (ratio > 0.85) {
         this.beepStreakMs += PCM16_FRAME_MS;
       } else {
         this.beepStreakMs = 0;
@@ -274,31 +394,31 @@ export class Pcm16VadAmdDetector {
       }
     }
 
-    // ---- AMD Classification Logic ----
+    // ---- AMD Classification Logic (Fast human pickup, strict voicemail guard) ----
     if (!this.amdClassified) {
-      // 1. Voicemail beep detected (>= 260ms pure sine tone)
-      if (this.beepStreakMs >= 260) {
+      // 1. Unmistakable voicemail beep (>= 400ms pure 800-1250 Hz sine tone)
+      if (this.beepStreakMs >= 400) {
         this.amdClassified = true;
         this.classifiedAs = 'voicemail';
         this.hooks.onAmdClassified('voicemail', 'pcm16_vad_beep_detected');
         return;
       }
 
-      // 2. Continuous unbroken monologue >= 3100ms (classic voicemail greeting)
-      if (this.currentSpeechMs >= 3100) {
+      // 2. Continuous unbroken monologue >= 4200ms (classic long voicemail greeting)
+      if (this.currentSpeechMs >= 4200) {
         this.amdClassified = true;
         this.classifiedAs = 'voicemail';
         this.hooks.onAmdClassified('voicemail', 'pcm16_vad_long_greeting');
         return;
       }
 
-      // 3. Natural human pickup ("Hello?" / "Yes?" — short 160ms..2300ms burst followed by >= 500ms silence)
+      // 3. Natural human pickup ("Hello?" — short 120ms..2400ms burst followed by >= 320ms silence)
       if (
         this.speechBurstCount >= 1 &&
-        this.longestSpeechBurstMs >= 160 &&
-        this.longestSpeechBurstMs <= 2300 &&
-        this.currentSilenceMs >= 500 &&
-        this.totalElapsedMs >= 700
+        this.longestSpeechBurstMs >= 120 &&
+        this.longestSpeechBurstMs <= 2400 &&
+        this.currentSilenceMs >= 320 &&
+        this.totalElapsedMs >= 500
       ) {
         this.amdClassified = true;
         this.classifiedAs = 'human';
@@ -306,32 +426,39 @@ export class Pcm16VadAmdDetector {
         return;
       }
 
-      // 4. Silent pickup timeout (3400ms with no long voicemail monologue -> treat as live human)
-      if (this.totalElapsedMs >= 3400) {
-        const isMachine = this.longestSpeechBurstMs >= 2500;
+      // 4. Quiet pickup: if no active continuous speech after 1400ms, immediately treat as live human so custom prompts play right away
+      if (this.totalElapsedMs >= 1400 && !this.isSpeaking && this.longestSpeechBurstMs < 2400) {
+        this.amdClassified = true;
+        this.classifiedAs = 'human';
+        this.hooks.onAmdClassified('human', 'pcm16_vad_quick_human_pickup');
+        return;
+      }
+
+      // 5. Hard cap at 4500ms if caller is still talking continuously
+      if (this.totalElapsedMs >= 4500) {
+        const isMachine = this.longestSpeechBurstMs >= 3600;
         this.amdClassified = true;
         this.classifiedAs = isMachine ? 'voicemail' : 'human';
         this.hooks.onAmdClassified(
           this.classifiedAs,
-          isMachine ? 'pcm16_vad_window_machine' : 'pcm16_vad_silent_human_pickup'
+          isMachine ? 'pcm16_vad_window_machine' : 'pcm16_vad_window_human'
         );
         return;
       }
     } else if (this.classifiedAs === 'voicemail' && !this.humanWakeSent) {
-      // Monitor for live human pickup after voicemail greeting pauses
       if (!frameActive) {
         this.silenceSinceVoicemailMs += PCM16_FRAME_MS;
         if (
-          this.silenceSinceVoicemailMs >= 550 &&
-          this.postVoicemailSpeechMs >= 220 &&
-          this.postVoicemailSpeechMs <= 2000
+          this.silenceSinceVoicemailMs >= 500 &&
+          this.postVoicemailSpeechMs >= 180 &&
+          this.postVoicemailSpeechMs <= 2200
         ) {
           this.humanWakeSent = true;
           this.classifiedAs = 'human';
           this.hooks.onHumanPickupAfterVoicemail?.();
         }
       } else {
-        if (this.silenceSinceVoicemailMs >= 900) {
+        if (this.silenceSinceVoicemailMs >= 800) {
           this.postVoicemailSpeechMs += PCM16_FRAME_MS;
         }
         this.silenceSinceVoicemailMs = 0;
@@ -355,13 +482,13 @@ function createWavHeader(pcmDataBytes: number, sampleRate = PCM16_SAMPLE_RATE): 
   header.writeUInt32LE(36 + pcmDataBytes, 4);
   header.write('WAVE', 8);
   header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16); // PCM fmt chunk size
-  header.writeUInt16LE(1, 20); // PCM linear
-  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
   header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * 2, 28); // byte rate
-  header.writeUInt16LE(2, 32); // block align
-  header.writeUInt16LE(16, 34); // bits per sample
+  header.writeUInt32LE(sampleRate * 2, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
   header.write('data', 36);
   header.writeUInt32LE(pcmDataBytes, 40);
   return header;
@@ -384,13 +511,11 @@ export class Pcm16CallRecorder {
     this.writeStream = fs.createWriteStream(this.tempRawPath);
     this.writeStream.on('error', () => {});
 
-    // Mix inbound + outbound queues every 20ms so caller and TTS stay aligned on one timeline
     this.mixTimer = setInterval(() => this.flushMixTick(), PCM16_FRAME_MS);
   }
 
   public pushInbound(frame: Buffer): void {
     if (this.finalized || !frame || frame.length === 0) return;
-    // Slice into 640-byte 20ms blocks
     let off = 0;
     while (off + PCM16_BYTES_PER_FRAME <= frame.length) {
       this.inboundQueue.push(Buffer.from(frame.subarray(off, off + PCM16_BYTES_PER_FRAME)));
@@ -401,7 +526,6 @@ export class Pcm16CallRecorder {
       frame.copy(padded, 0, off);
       this.inboundQueue.push(padded);
     }
-    // Cap queue depth to 2s to avoid drift
     if (this.inboundQueue.length > 100) this.inboundQueue.splice(0, this.inboundQueue.length - 100);
   }
 
@@ -417,7 +541,8 @@ export class Pcm16CallRecorder {
       frame.copy(padded, 0, off);
       this.outboundQueue.push(padded);
     }
-    if (this.outboundQueue.length > 100) this.outboundQueue.splice(0, this.outboundQueue.length - 100);
+    if (this.outboundQueue.length > 100)
+      this.outboundQueue.splice(0, this.outboundQueue.length - 100);
   }
 
   private flushMixTick(): void {
@@ -425,7 +550,6 @@ export class Pcm16CallRecorder {
     const inBuf = this.inboundQueue.shift();
     const outBuf = this.outboundQueue.shift();
 
-    // Only write silence once audio has actually started flowing
     if (!inBuf && !outBuf && this.totalMixedBytes === 0) return;
 
     const mixed = Buffer.alloc(PCM16_BYTES_PER_FRAME);
@@ -450,7 +574,6 @@ export class Pcm16CallRecorder {
       this.mixTimer = undefined;
     }
 
-    // Drain any remaining queued frames
     while (this.inboundQueue.length > 0 || this.outboundQueue.length > 0) {
       const inBuf = this.inboundQueue.shift();
       const outBuf = this.outboundQueue.shift();
@@ -483,11 +606,18 @@ export class Pcm16CallRecorder {
       const safeId = this.callId.replace(/[^a-zA-Z0-9_-]/g, '');
       const durationSec = Math.max(1, Math.round(this.totalMixedBytes / 2 / PCM16_SAMPLE_RATE));
       const mp3Path = path.join(recordingsDir, `${safeId}.mp3`);
+      const ffmpegBin = resolveFfmpegBin();
 
-      // Prefer compact HD MP3 via ffmpeg; fall back to lossless 16kHz WAV if ffmpeg fails
       const mp3Ok = await new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(ok);
+        };
         const proc = spawn(
-          'ffmpeg',
+          ffmpegBin,
           [
             '-y',
             '-hide_banner',
@@ -509,8 +639,16 @@ export class Pcm16CallRecorder {
           ],
           { stdio: 'ignore' }
         );
-        proc.on('error', () => resolve(false));
-        proc.on('close', (code) => resolve(code === 0 && fs.existsSync(mp3Path) && fs.statSync(mp3Path).size > 256));
+        const timer = setTimeout(() => {
+          try {
+            proc.kill('SIGKILL');
+          } catch {}
+          finish(false);
+        }, 15000);
+        proc.on('error', () => finish(false));
+        proc.on('close', (code) =>
+          finish(code === 0 && fs.existsSync(mp3Path) && fs.statSync(mp3Path).size > 256)
+        );
       });
 
       if (mp3Ok) {
@@ -541,23 +679,30 @@ export class Pcm16CallRecorder {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Real-Time 20ms (640-byte) PCM16 Frame Pacer with Instant Barge-In Support
+// 4. Real-Time 20ms Audio Frame Pacer with Instant Barge-In Support
 // ---------------------------------------------------------------------------
 export async function streamPcm16Frames(
-  pcm16: Buffer,
+  encodedAudio: Buffer,
   options: {
     signal: AbortSignal;
     sendFrame: (frame: Buffer) => void;
-    onFrameSent?: (frame: Buffer) => void;
+    onFrameSent?: (frame: Buffer, frameIndex: number) => void;
+    bytesPerFrame?: number;
     prebufferFrames?: number;
   }
 ): Promise<{ interrupted: boolean; framesSent: number }> {
-  const { signal, sendFrame, onFrameSent, prebufferFrames = 3 } = options;
-  if (!pcm16 || pcm16.length === 0) {
+  const {
+    signal,
+    sendFrame,
+    onFrameSent,
+    bytesPerFrame = PCM16_BYTES_PER_FRAME,
+    prebufferFrames = 3,
+  } = options;
+  if (!encodedAudio || encodedAudio.length === 0) {
     return { interrupted: false, framesSent: 0 };
   }
 
-  const totalFrames = Math.ceil(pcm16.length / PCM16_BYTES_PER_FRAME);
+  const totalFrames = Math.ceil(encodedAudio.length / bytesPerFrame);
   const startTime = performance.now();
   let framesSent = 0;
 
@@ -566,21 +711,20 @@ export async function streamPcm16Frames(
       return { interrupted: true, framesSent };
     }
 
-    const start = i * PCM16_BYTES_PER_FRAME;
-    const end = Math.min(start + PCM16_BYTES_PER_FRAME, pcm16.length);
+    const start = i * bytesPerFrame;
+    const end = Math.min(start + bytesPerFrame, encodedAudio.length);
     let frame: Buffer;
-    if (end - start === PCM16_BYTES_PER_FRAME) {
-      frame = pcm16.subarray(start, end);
+    if (end - start === bytesPerFrame) {
+      frame = encodedAudio.subarray(start, end);
     } else {
-      frame = Buffer.alloc(PCM16_BYTES_PER_FRAME);
-      pcm16.copy(frame, 0, start, end);
+      frame = Buffer.alloc(bytesPerFrame);
+      encodedAudio.copy(frame, 0, start, end);
     }
 
     sendFrame(frame);
-    onFrameSent?.(frame);
+    onFrameSent?.(frame, i);
     framesSent++;
 
-    // Pre-buffer the first few frames immediately so telephony jitter buffer never underruns
     if (i >= prebufferFrames) {
       const targetElapsedMs = (i - prebufferFrames + 1) * PCM16_FRAME_MS;
       const waitMs = targetElapsedMs - (performance.now() - startTime);
