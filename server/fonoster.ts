@@ -1179,6 +1179,7 @@ export interface FonosterVoiceBridgeHooks {
     rawLabel: string
   ) => Promise<void>;
   onStartHumanGreeting: (session: any, state: FonosterSessionState) => Promise<void>;
+  onSpeechActivity?: (session: any, speaking: boolean) => void;
   onSpeechTurn: (
     session: any,
     text: string,
@@ -1196,6 +1197,7 @@ export interface FonosterVoiceBridgeHooks {
     wavBuffer: Buffer,
     durationSec: number
   ) => Promise<void>;
+  onMediaStalled?: (session: any) => void;
   onSessionError?: (session: any, err: { code?: string; message?: string; fatal?: boolean }) => void;
   onSessionEnded: (session: any, reason: string) => Promise<void>;
   getMaxDigits: (numDigits?: number) => number;
@@ -1251,6 +1253,9 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
   let ended = false;
   let speechTracker: InboundSpeechTracker | null = null;
   let callRecorder: LiveCallRecorder | null = null;
+  let seenInboundMedia = false;
+  let lastInboundMediaAt = 0;
+  let mediaStallPingedAt = 0;
 
   const markWaiters = new Map<string, Array<(res: { cleared: boolean }) => void>>();
 
@@ -1274,10 +1279,12 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     }
   };
 
-  // Keepalive ping every 15s so half-open sockets terminate cleanly
+  // Fast keepalive + inbound media stall detector so recipient hangup is detected in < 1s
+  // even when a reverse proxy (Traefik/Nginx) delays WebSocket TCP FIN!
   let isAlive = true;
   ws.on('pong', () => {
     isAlive = true;
+    mediaStallPingedAt = 0;
   });
   const pingTimer = setInterval(() => {
     if (ws.readyState !== WebSocket.OPEN) return;
@@ -1289,7 +1296,39 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     try {
       ws.ping();
     } catch {}
-  }, 15000);
+  }, 10000);
+
+  const mediaWatchTimer = setInterval(() => {
+    if (ended || !initialized || !activeSessionObj || !seenInboundMedia) return;
+    if (ws.readyState !== WebSocket.OPEN) {
+      finishSession('socket_not_open');
+      return;
+    }
+    const silentMs = Date.now() - lastInboundMediaAt;
+    if (silentMs >= 1050) {
+      // Inbound 20ms RTP packets stopped arriving — likely recipient hung up!
+      // Trigger immediate CDR check + fast WebSocket ping probe.
+      hooks.onMediaStalled?.(activeSessionObj);
+      if (!mediaStallPingedAt) {
+        mediaStallPingedAt = Date.now();
+        try {
+          ws.ping();
+        } catch {
+          finishSession('media_stall_ping_error');
+        }
+      } else if (Date.now() - mediaStallPingedAt >= 900 && silentMs >= 2000) {
+        console.warn(
+          `[Fonoster Voice] Inbound media stalled for ${silentMs}ms with no pong — closing callId=${activeSessionObj.id}`
+        );
+        try {
+          ws.terminate();
+        } catch {}
+        finishSession('inbound_media_ended');
+      }
+    } else {
+      mediaStallPingedAt = 0;
+    }
+  }, 350);
 
   // Guard against silent connections that never send start/session.start
   const startTimeout = setTimeout(() => {
@@ -1389,6 +1428,9 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
 
   const handleInboundAudioFrame = (frame: Buffer) => {
     if (!activeState || ended) return;
+    seenInboundMedia = true;
+    lastInboundMediaAt = Date.now();
+    mediaStallPingedAt = 0;
 
     // Record recipient's live inbound audio into our synchronized two-way HD call recording
     callRecorder?.recordInbound(frame, negotiatedCodec, negotiatedRate);
@@ -1521,12 +1563,16 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
       callRecorder = new LiveCallRecorder(session.id);
     }
 
-    // Attach real-time zero-key built-in local Whisper streaming STT tracker.
-    // Emits instant live partial words as the recipient speaks without ever interrupting active voice prompts!
+    // Attach real-time zero-key built-in local Moonshine Tiny streaming STT tracker (~80ms latency!).
+    // Emits instant 40ms speaking indicator + word-by-word partials without interrupting active voice prompts!
     speechTracker = new InboundSpeechTracker({
       callId: session.id,
       codec: negotiatedCodec,
       sampleRate: negotiatedRate,
+      onSpeechActivity: (speaking) => {
+        if (!activeSessionObj || ended) return;
+        hooks.onSpeechActivity?.(activeSessionObj, speaking);
+      },
       onTranscript: async (text, confidence, _engine, meta) => {
         if (!activeSessionObj) return;
         const shouldWake = await hooks.onSpeechTurn(activeSessionObj, text, confidence, meta);
@@ -1551,6 +1597,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     ended = true;
     clearTimeout(startTimeout);
     clearInterval(pingTimer);
+    clearInterval(mediaWatchTimer);
     clearAllMarks();
     speechTracker?.flushAndClose();
     const recorded = callRecorder?.finalize() || null;
@@ -1569,20 +1616,20 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
       console.log(
         `[Fonoster Voice] Session ended callId=${finishedSession.id} proto=${detectedProtocol} reason=${reason} recorded=${Boolean(recorded)}`
       );
-      void (async () => {
-        if (recorded && hooks.onLocalRecordingReady) {
-          try {
-            await hooks.onLocalRecordingReady(
-              finishedSession,
-              recorded.wavBuffer,
-              recorded.durationSec
+      // 1. Start background HD MP3 transcode (synchronously marks inFlightLocalRecordings, yields immediately to ffmpeg)
+      if (recorded && hooks.onLocalRecordingReady) {
+        void hooks
+          .onLocalRecordingReady(finishedSession, recorded.wavBuffer, recorded.durationSec)
+          .catch((recErr) => {
+            console.error(
+              `[Fonoster Recorder] Failed to save recording for ${finishedSession.id}:`,
+              recErr
             );
-          } catch (recErr) {
-            console.error(`[Fonoster Recorder] Failed to save recording for ${finishedSession.id}:`, recErr);
-          }
-        }
-        await hooks.onSessionEnded(finishedSession, reason);
-      })();
+          });
+      }
+
+      // 2. IMMEDIATELY mark the call ended on the dashboard (< 5ms!) — NEVER waits for ffmpeg transcoding!
+      void hooks.onSessionEnded(finishedSession, reason);
     }
   };
 

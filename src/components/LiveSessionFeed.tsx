@@ -718,10 +718,16 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
             <div className="bg-slate-950 border border-slate-800 rounded-xl p-3.5 space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800">
                 <div className="flex items-center gap-2">
-                  <Mic className="w-3.5 h-3.5 text-cyan-400" />
+                  <Mic className={`w-3.5 h-3.5 ${session.isRecipientSpeaking ? 'text-emerald-400 animate-pulse' : 'text-cyan-400'}`} />
                   <h4 className="text-xs font-bold uppercase tracking-wider text-slate-200">
                     Caller Voice &amp; Talks + HD Audio Recording
                   </h4>
+                  {isCallActive && session.isRecipientSpeaking && (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[10px] font-mono font-semibold text-emerald-300">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                      Speaking...
+                    </span>
+                  )}
                 </div>
                 <span className="text-[10px] font-mono text-slate-400">
                   {session.recordingUrl
@@ -770,6 +776,14 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                       </span>
                     </div>
                   ))}
+                  {isCallActive &&
+                    session.isRecipientSpeaking &&
+                    !speechTranscripts.some((t) => t.isPartial) && (
+                      <div className="p-2 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-xs text-emerald-300 flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                        <span className="italic">Recipient is speaking...</span>
+                      </div>
+                    )}
                   <div ref={speechEndRef} />
                 </div>
               ) : session.capturedSpeech ? (
@@ -778,8 +792,15 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
                   <span>"{session.capturedSpeech}"</span>
                 </div>
               ) : isCallActive ? (
-                <p className="text-xs text-slate-500 italic">
-                  Listening for spoken words from recipient... Any speech or talks will appear here live.
+                <p className={`text-xs italic ${session.isRecipientSpeaking ? 'text-emerald-300 flex items-center gap-2' : 'text-slate-500'}`}>
+                  {session.isRecipientSpeaking ? (
+                    <>
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
+                      <span>Recipient is speaking...</span>
+                    </>
+                  ) : (
+                    'Listening for spoken words from recipient... Any speech or talks will appear here live.'
+                  )}
                 </p>
               ) : null}
 

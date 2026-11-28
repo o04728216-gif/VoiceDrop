@@ -175,6 +175,7 @@ export interface CallSession {
   recordingStatus?: 'recording' | 'completed' | 'failed';
   localRecordingExt?: string;
   speechTranscripts?: SpeechTranscriptEntry[];
+  isRecipientSpeaking?: boolean;
   introGreeting: string;
   script: string;
   verificationMode: 'manual' | 'auto';
@@ -338,6 +339,8 @@ interface StoredCallCredentials {
 const sessions = new Map<string, CallSession>();
 const providerSidToCallId = new Map<string, string>();
 const callCredentialsMap = new Map<string, StoredCallCredentials>();
+const inFlightLocalRecordings = new Set<string>();
+const fonosterImmediateCdrCheckers = new Map<string, () => void>();
 
 function getRequestDeviceId(req: Request): string | null {
   const headerVal = req.headers['x-device-id'];
@@ -503,12 +506,17 @@ app.get('/api/call/events/:callId', (req: Request, res: Response) => {
     return res.status(403).json({ error: 'Access denied for this device session.' });
   }
 
+  try {
+    req.socket.setNoDelay(true);
+  } catch {}
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
+  res.flushHeaders?.();
 
   res.write(`data: ${JSON.stringify({ type: 'connected', callId })}\n\n`);
 
@@ -1239,58 +1247,81 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                   });
                 }
 
-                // Post-answer watchdog: Fonoster TrackCall ends at ANSWER and does NOT stream hangup events.
-                // Poll Fonoster CDR (Calls.GetCall) quickly right after answer and verify AppBridge connected
-                // to /api/fonoster/stream so VoiceDrop immediately stops counting if the phone drops on pickup!
+                // Fast post-answer watchdog: Fonoster TrackCall ends at ANSWER and does NOT stream hangup events.
+                // Poll Fonoster CDR (Calls.GetCall) every 650ms AND support instant on-demand checks when
+                // inbound media stalls so VoiceDrop hangs up right alongside the recipient (< 1s)!
                 void (async () => {
                   const maxWatchMs = 10 * 60 * 1000;
-                  const fastInitialDelays = [1200, 1300, 1500, 1500];
-                  const steadyPollMs = 2500;
+                  const fastInitialDelays = [750, 850, 950];
+                  const steadyPollMs = 650;
                   const wsConnectTimeoutMs = 5200;
                   let checkIndex = 0;
+                  let wakeNow: (() => void) | null = null;
 
-                  while (Date.now() - answeredAtMs < maxWatchMs) {
-                    const delay =
-                      checkIndex < fastInitialDelays.length
-                        ? fastInitialDelays[checkIndex]
-                        : steadyPollMs;
-                    checkIndex += 1;
-                    await new Promise((r) => setTimeout(r, delay));
+                  fonosterImmediateCdrCheckers.set(callId, () => {
+                    const fn = wakeNow;
+                    wakeNow = null;
+                    fn?.();
+                  });
 
-                    const live = getSessionById(callId);
-                    if (
-                      !live ||
-                      ['completed', 'failed', 'busy', 'no-answer'].includes(live.status)
-                    ) {
-                      break;
-                    }
+                  try {
+                    while (Date.now() - answeredAtMs < maxWatchMs) {
+                      const delay =
+                        checkIndex < fastInitialDelays.length
+                          ? fastInitialDelays[checkIndex]
+                          : steadyPollMs;
+                      checkIndex += 1;
+                      await new Promise<void>((resolve) => {
+                        const t = setTimeout(() => {
+                          wakeNow = null;
+                          resolve();
+                        }, delay);
+                        wakeNow = () => {
+                          clearTimeout(t);
+                          resolve();
+                        };
+                      });
 
-                    const activeVoice = getActiveFonosterState(callId);
-                    const cdr = await dispatched.getCallRecord(dispatched.ref);
-                    const cdrStatus = cdr?.status ? String(cdr.status).toUpperCase() : '';
-                    const cdrEnded = Boolean(
-                      cdr &&
-                        ((typeof cdr.endedAt === 'number' && cdr.endedAt > 0) ||
-                          (cdrStatus && cdrStatus !== 'UNKNOWN'))
-                    );
-
-                    if (cdrEnded) {
-                      const isNormal = cdrStatus === 'NORMAL_CLEARING';
-                      stopFonosterPlayback(callId);
-                      if (activeVoice) {
-                        void hangupFonosterCall(callId);
+                      const live = getSessionById(callId);
+                      if (
+                        !live ||
+                        ['completed', 'failed', 'busy', 'no-answer'].includes(live.status)
+                      ) {
+                        break;
                       }
-                      live.status = isNormal ? 'completed' : 'failed';
-                      live.completedAt = new Date().toISOString();
-                      if (typeof cdr?.duration === 'number' && cdr.duration > 0) {
-                        live.duration = cdr.duration;
-                      } else if (live.answeredAt) {
-                        live.duration = Math.max(
-                          1,
-                          Math.round((Date.now() - new Date(live.answeredAt).getTime()) / 1000)
-                        );
-                      }
-                      persistSessionsToDisk();
+
+                      const activeVoice = getActiveFonosterState(callId);
+                      const cdr = await dispatched.getCallRecord(dispatched.ref);
+                      const cdrStatus = cdr?.status ? String(cdr.status).toUpperCase() : '';
+                      const cdrEnded = Boolean(
+                        cdr &&
+                          ((typeof cdr.endedAt === 'number' && cdr.endedAt > 0) ||
+                            (cdrStatus && cdrStatus !== 'UNKNOWN'))
+                      );
+
+                      if (cdrEnded) {
+                        const isNormal = cdrStatus === 'NORMAL_CLEARING';
+                        stopFonosterPlayback(callId);
+                        live.isRecipientSpeaking = false;
+                        if (Array.isArray(live.speechTranscripts)) {
+                          for (const t of live.speechTranscripts) {
+                            if (t.isPartial) t.isPartial = false;
+                          }
+                        }
+                        live.status = isNormal ? 'completed' : 'failed';
+                        live.completedAt = new Date().toISOString();
+                        if (typeof cdr?.duration === 'number' && cdr.duration > 0) {
+                          live.duration = cdr.duration;
+                        } else if (live.answeredAt) {
+                          live.duration = Math.max(
+                            1,
+                            Math.round((Date.now() - new Date(live.answeredAt).getTime()) / 1000)
+                          );
+                        }
+                        if (activeVoice) {
+                          void hangupFonosterCall(callId);
+                        }
+                        persistSessionsToDisk();
 
                       const neverConnectedWs = !activeVoice && !live.promptsStarted;
                       const isAisPreview = /ais-(dev|pre)-.*\.run\.app/i.test(dispatched.streamUrl);
@@ -1354,6 +1385,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                       void finalizeCallRecording(live);
                       break;
                     }
+                  }
+                  } finally {
+                    fonosterImmediateCdrCheckers.delete(callId);
                   }
                 })();
               } else if (rawStatus === 'BUSY') {
@@ -2290,6 +2324,11 @@ async function finalizeCallRecording(
     return;
   }
 
+  // Local dual-leg HD recorder is already transcoding in background (~150ms)
+  if (inFlightLocalRecordings.has(session.id)) {
+    return;
+  }
+
   if (inFlightFinalizers.has(session.id)) {
     return inFlightFinalizers.get(session.id)!;
   }
@@ -2471,8 +2510,12 @@ async function finalizeCallRecording(
         }
       }
 
-      // If no recording exists after polling completed (e.g. unanswered/0s call), clear stuck 'recording' badge!
-      if (!findCachedRecordingPath(session.id) && session.recordingStatus === 'recording') {
+      // If no recording exists after polling completed (and no local transcode is still finishing), clear stuck 'recording' badge!
+      if (
+        !findCachedRecordingPath(session.id) &&
+        !inFlightLocalRecordings.has(session.id) &&
+        session.recordingStatus === 'recording'
+      ) {
         session.recordingStatus = undefined;
         persistSessionsToDisk();
         broadcastEvent(session.id, 'session-update', session);
@@ -4812,6 +4855,11 @@ function startServer() {
         }
       }
     },
+    onSpeechActivity: (session: CallSession, speaking: boolean) => {
+      if (Boolean(session.isRecipientSpeaking) === speaking) return;
+      session.isRecipientSpeaking = speaking;
+      broadcastEvent(session.id, 'session-update', session);
+    },
     onSpeechTurn: async (
       session: CallSession,
       text: string,
@@ -4914,22 +4962,31 @@ function startServer() {
       durationSec: number
     ) => {
       if (session.recordCall === false || !wavBuffer || wavBuffer.length < 256) return;
-      const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
-      const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
-      const transcoded = await transcodeToCompactHdMp3(wavBuffer, 'wav', mp3OutPath);
-      if (transcoded.ok) {
-        markRecordingCompleted(
-          session,
-          mp3OutPath,
-          'mp3',
-          transcoded.durationSec || durationSec
-        );
-        return;
+      inFlightLocalRecordings.add(session.id);
+      try {
+        const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+        const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
+        const transcoded = await transcodeToCompactHdMp3(wavBuffer, 'wav', mp3OutPath);
+        if (transcoded.ok) {
+          markRecordingCompleted(
+            session,
+            mp3OutPath,
+            'mp3',
+            transcoded.durationSec || durationSec
+          );
+          return;
+        }
+        // Instant WAV fallback if ffmpeg is unavailable
+        const wavOutPath = path.join(RECORDINGS_DIR, `${safeId}.wav`);
+        fs.writeFileSync(wavOutPath, wavBuffer);
+        markRecordingCompleted(session, wavOutPath, 'wav', durationSec);
+      } finally {
+        inFlightLocalRecordings.delete(session.id);
       }
-      // Instant WAV fallback if ffmpeg is unavailable
-      const wavOutPath = path.join(RECORDINGS_DIR, `${safeId}.wav`);
-      fs.writeFileSync(wavOutPath, wavBuffer);
-      markRecordingCompleted(session, wavOutPath, 'wav', durationSec);
+    },
+    onMediaStalled: (session: CallSession) => {
+      // Trigger an immediate on-demand Fonoster CDR check so recipient hangup reflects in < 1s
+      fonosterImmediateCdrCheckers.get(session.id)?.();
     },
     onSessionError: (session: CallSession, err) => {
       addSessionEvent(session, {
@@ -4942,6 +4999,8 @@ function startServer() {
       });
     },
     onSessionEnded: async (session: CallSession, reason: string) => {
+      fonosterImmediateCdrCheckers.delete(session.id);
+      session.isRecipientSpeaking = false;
       if (Array.isArray(session.speechTranscripts)) {
         for (const t of session.speechTranscripts) {
           if (t.isPartial) t.isPartial = false;
@@ -4961,6 +5020,8 @@ function startServer() {
           title: 'Call Completed (Fonoster)',
           description: `Voice stream closed (${reason}).`,
         });
+      } else {
+        broadcastEvent(session.id, 'session-update', session);
       }
       void finalizeCallRecording(session);
     },

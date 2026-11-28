@@ -46,6 +46,7 @@ export interface CallSession {
   recordingSizeBytes?: number;
   recordingStatus?: 'recording' | 'completed' | 'failed';
   speechTranscripts?: SpeechTranscriptEntry[];
+  isRecipientSpeaking?: boolean;
   introGreeting: string;
   script: string;
   verificationMode: 'manual' | 'auto';

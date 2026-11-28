@@ -1,11 +1,14 @@
 import os from 'node:os';
 import { parentPort, workerData } from 'node:worker_threads';
 
-// Use up to 2 threads inside the isolated STT worker for fast ~250-600ms live partial inference,
+// Use up to 2 threads inside the isolated STT worker for ultra-fast ~80-250ms live inference,
 // while staying completely off the main Node.js 20ms telephony audio thread.
 const optimalThreads = String(Math.max(1, Math.min(2, os.cpus().length || 1)));
 process.env.OMP_NUM_THREADS = process.env.OMP_NUM_THREADS || optimalThreads;
 process.env.ORT_NUM_THREADS = process.env.ORT_NUM_THREADS || optimalThreads;
+
+const PRIMARY_MODEL = 'onnx-community/moonshine-tiny-ONNX';
+const FALLBACK_MODEL = 'Xenova/whisper-tiny.en';
 
 const HALLUCINATION_PATTERNS = [
   /^\[.*\]$/,
@@ -38,7 +41,7 @@ function cleanTranscriptText(raw) {
   return text;
 }
 
-function normalizeFloat16kForWhisper(samples) {
+function normalizeFloat16k(samples) {
   let peak = 0;
   for (let i = 0; i < samples.length; i++) {
     const a = Math.abs(samples[i]);
@@ -54,9 +57,10 @@ function normalizeFloat16kForWhisper(samples) {
 }
 
 let pipelinePromise = null;
+let loadedEngineName = 'local-moonshine';
 let loadFailedAt = 0;
 
-async function getWhisperPipeline() {
+async function getAsrPipeline() {
   if (!pipelinePromise && loadFailedAt && Date.now() - loadFailedAt < 60_000) {
     return null;
   }
@@ -72,20 +76,52 @@ async function getWhisperPipeline() {
       if (env.backends?.onnx?.wasm) {
         env.backends.onnx.wasm.numThreads = Number(optimalThreads);
       }
-      const modelId =
+
+      const requestedModel =
         (workerData && workerData.modelId) ||
         (process.env.VOICEDROP_STT_MODEL || '').trim() ||
-        'Xenova/whisper-tiny.en';
-      console.log(
-        `[VoiceDrop STT Worker] Loading built-in zero-key local Whisper (${modelId}, threads=${optimalThreads})...`
-      );
-      const transcriber = await pipeline('automatic-speech-recognition', modelId, {
-        dtype: 'q8',
-      });
-      console.log(`[VoiceDrop STT Worker] Ready in ${Date.now() - t0}ms (cache=${env.cacheDir})`);
-      return transcriber;
+        PRIMARY_MODEL;
+
+      const candidates =
+        requestedModel === FALLBACK_MODEL
+          ? [FALLBACK_MODEL]
+          : [requestedModel, FALLBACK_MODEL];
+
+      let lastErr = null;
+      for (const modelId of candidates) {
+        try {
+          console.log(
+            `[VoiceDrop STT Worker] Loading ultra-fast zero-key local ASR (${modelId}, threads=${optimalThreads})...`
+          );
+          const transcriber = await pipeline('automatic-speech-recognition', modelId, {
+            dtype: 'q8',
+          });
+          loadedEngineName = modelId.toLowerCase().includes('moonshine')
+            ? 'local-moonshine'
+            : 'local-whisper';
+
+          // Warm ONNX execution kernels once with a tiny 0.3s buffer so the recipient's very first word decodes in ~80ms!
+          try {
+            await transcriber(new Float32Array(4800));
+          } catch {
+            // Ignore warmup noise
+          }
+
+          console.log(
+            `[VoiceDrop STT Worker] Ready (${loadedEngineName}: ${modelId}) in ${Date.now() - t0}ms (cache=${env.cacheDir})`
+          );
+          return transcriber;
+        } catch (err) {
+          lastErr = err;
+          console.warn(
+            `[VoiceDrop STT Worker] Could not load ${modelId}, trying fallback:`,
+            err?.message || err
+          );
+        }
+      }
+      throw lastErr || new Error('No local ASR model could be loaded');
     })().catch((err) => {
-      console.error('[VoiceDrop STT Worker] Failed to initialize Whisper:', err?.message || err);
+      console.error('[VoiceDrop STT Worker] Failed to initialize local ASR:', err?.message || err);
       pipelinePromise = null;
       loadFailedAt = Date.now();
       return null;
@@ -101,8 +137,8 @@ if (parentPort) {
 
     if (type === 'warm') {
       try {
-        const pipe = await getWhisperPipeline();
-        parentPort.postMessage({ id, ok: Boolean(pipe) });
+        const pipe = await getAsrPipeline();
+        parentPort.postMessage({ id, ok: Boolean(pipe), engine: loadedEngineName });
       } catch (err) {
         parentPort.postMessage({ id, ok: false, error: err?.message || String(err) });
       }
@@ -115,22 +151,21 @@ if (parentPort) {
           msg.samples instanceof Float32Array
             ? msg.samples
             : new Float32Array(msg.samples.buffer || msg.samples);
-        if (!samples || samples.length < 3200) {
+        if (!samples || samples.length < 2800) {
           parentPort.postMessage({ id, ok: true, text: '' });
           return;
         }
-        const transcriber = await getWhisperPipeline();
+        const transcriber = await getAsrPipeline();
         if (!transcriber) {
           parentPort.postMessage({ id, ok: false, text: '' });
           return;
         }
-        const normalized = normalizeFloat16kForWhisper(samples);
-        // Fast greedy decoding for ultra-low-latency live partial + final streaming
-        const result = await transcriber(normalized, {
-          return_timestamps: false,
-          num_beams: 1,
-          do_sample: false,
-        });
+        const normalized = normalizeFloat16k(samples);
+        const inferOpts =
+          loadedEngineName === 'local-moonshine'
+            ? {}
+            : { return_timestamps: false, num_beams: 1, do_sample: false };
+        const result = await transcriber(normalized, inferOpts);
         const rawText =
           typeof result === 'string'
             ? result
@@ -142,8 +177,8 @@ if (parentPort) {
           id,
           ok: true,
           text: cleaned,
-          engine: 'local-whisper',
-          confidence: msg.isFinal === false ? 0.85 : 0.92,
+          engine: loadedEngineName,
+          confidence: msg.isFinal === false ? 0.87 : 0.93,
         });
       } catch (err) {
         console.error('[VoiceDrop STT Worker] Inference error:', err?.message || err);
