@@ -1,3 +1,4 @@
+import { Worker } from 'node:worker_threads';
 import type { TelephonyCodec, TelephonyRate } from './tts.ts';
 
 // Precomputed exact ITU-T G.711 u-law -> Float32 lookup table (-1.0 .. +1.0)
@@ -14,7 +15,7 @@ for (let i = 0; i < 256; i++) {
 
 /**
  * Decodes a raw telephony frame (`pcmu` @ 8kHz or `pcm16` @ 8k/16k/24kHz) into
- * mono Float32 samples at 16,000 Hz (the native sample rate expected by Whisper).
+ * mono Float32 samples at 16,000 Hz (native sample rate expected by Whisper).
  */
 export function decodeFrameToFloat16k(
   frame: Buffer,
@@ -52,7 +53,6 @@ export function decodeFrameToFloat16k(
     return out;
   }
 
-  // General linear resampler (e.g., 24kHz -> 16kHz)
   const ratio = sampleRate / 16000;
   const outLen = Math.max(1, Math.round(src.length / ratio));
   const out = new Float32Array(outLen);
@@ -67,123 +67,145 @@ export function decodeFrameToFloat16k(
   return out;
 }
 
-function normalizeFloat16kForWhisper(samples: Float32Array): Float32Array {
-  let peak = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const a = Math.abs(samples[i]);
-    if (a > peak) peak = a;
-  }
-  if (peak <= 0.01 || peak >= 0.7) return samples;
-  const gain = Math.min(4.0, 0.78 / peak);
-  const out = new Float32Array(samples.length);
-  for (let i = 0; i < samples.length; i++) {
-    out[i] = Math.max(-1, Math.min(1, samples[i] * gain));
-  }
-  return out;
+// --- Isolated Worker Thread Client (zero main-thread blocking!) ---
+
+interface PendingRequest {
+  resolve: (value: any) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
-const HALLUCINATION_PATTERNS: RegExp[] = [
-  /^\[.*\]$/,
-  /^\(.*\)$/,
-  /^(blank[_\s-]?audio|silence|inaudible|unintelligible|music|static|beep|beeping|ringing|applause|laughter|sigh|cough|breathing|no speech|you\.?|thank you\.?)$/i,
-  /^(thanks for watching|thank you for watching|please subscribe|subtitles by|amara\.org)\.?$/i,
-];
+let sttWorker: Worker | null = null;
+let nextReqId = 1;
+const pendingRequests = new Map<number, PendingRequest>();
 
-function cleanTranscriptText(raw: string): string {
-  if (!raw) return '';
-  let text = raw
-    .replace(/\[[^\]]*\]/g, ' ')
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/[♪♫]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!text) return '';
-  if (
-    (text.startsWith('"') && text.endsWith('"')) ||
-    (text.startsWith("'") && text.endsWith("'"))
-  ) {
-    text = text.slice(1, -1).trim();
+function clearPendingRequests() {
+  for (const [id, req] of pendingRequests.entries()) {
+    clearTimeout(req.timer);
+    req.resolve(null);
+    pendingRequests.delete(id);
   }
-  if (!text || text.length < 2) return '';
-  if (!/[a-z0-9]/i.test(text)) return '';
-  for (const rx of HALLUCINATION_PATTERNS) {
-    if (rx.test(text)) return '';
-  }
-  return text;
 }
 
-let whisperPipelinePromise: Promise<any> | null = null;
-let whisperLoadFailedAt = 0;
+function getOrStartSttWorker(): Worker | null {
+  if (sttWorker) return sttWorker;
+  try {
+    const workerUrl = new URL('./sttWorker.mjs', import.meta.url);
+    const worker = new Worker(workerUrl, {
+      execArgv: [],
+      workerData: {
+        cacheDir: (process.env.STT_CACHE_DIR || '').trim() || '/tmp/voicedrop-stt-cache',
+        modelId: (process.env.VOICEDROP_STT_MODEL || '').trim() || 'Xenova/whisper-tiny.en',
+      },
+    });
+    // Don't keep Node process alive solely for the background worker
+    worker.unref();
 
-/**
- * Loads the built-in zero-key local neural Whisper model (`Xenova/whisper-tiny.en`, q8 ONNX)
- * directly inside Node.js — no Gemini key, no Deepgram key, no external STT API required.
- */
-async function getLocalWhisperPipeline(): Promise<any | null> {
-  // Retry after 60s if an earlier download failed temporarily
-  if (!whisperPipelinePromise && whisperLoadFailedAt && Date.now() - whisperLoadFailedAt < 60_000) {
+    worker.on('message', (msg: any) => {
+      if (!msg || typeof msg.id !== 'number') return;
+      const req = pendingRequests.get(msg.id);
+      if (!req) return;
+      clearTimeout(req.timer);
+      pendingRequests.delete(msg.id);
+      req.resolve(msg);
+    });
+
+    worker.on('error', (err) => {
+      console.error('[VoiceDrop STT] Worker thread error (non-fatal to live calls):', err?.message || err);
+      if (sttWorker === worker) sttWorker = null;
+      clearPendingRequests();
+    });
+
+    worker.on('exit', (code) => {
+      if (code !== 0) {
+        console.warn(`[VoiceDrop STT] Worker thread exited with code ${code}; will respawn on next call.`);
+      }
+      if (sttWorker === worker) sttWorker = null;
+      clearPendingRequests();
+    });
+
+    sttWorker = worker;
+    return worker;
+  } catch (err: any) {
+    console.error('[VoiceDrop STT] Could not spawn STT worker thread:', err?.message || err);
     return null;
   }
-  if (!whisperPipelinePromise) {
-    whisperPipelinePromise = (async () => {
-      const t0 = Date.now();
-      const { pipeline, env } = await import('@huggingface/transformers');
-      env.cacheDir = (process.env.STT_CACHE_DIR || '').trim() || '/tmp/voicedrop-stt-cache';
-      env.allowLocalModels = true;
-      const modelId = (process.env.VOICEDROP_STT_MODEL || '').trim() || 'Xenova/whisper-tiny.en';
-      console.log(`[VoiceDrop STT] Loading built-in zero-key local Whisper model (${modelId})...`);
-      const transcriber = await pipeline('automatic-speech-recognition', modelId, {
-        dtype: 'q8',
-      });
-      console.log(`[VoiceDrop STT] Built-in local Whisper model ready in ${Date.now() - t0}ms`);
-      return transcriber;
-    })().catch((err) => {
-      console.error('[VoiceDrop STT] Failed to initialize built-in local Whisper model:', err);
-      whisperPipelinePromise = null;
-      whisperLoadFailedAt = Date.now();
-      return null;
-    });
-  }
-  return whisperPipelinePromise;
 }
 
+let warmInFlight: Promise<void> | null = null;
+
 /**
- * Pre-warms the built-in zero-key local Whisper STT model on server boot & call dial
- * so the recipient's very first "Hello?" transcribes immediately out of the box.
+ * Pre-warms VoiceDrop's built-in zero-key local Whisper STT model inside the background
+ * worker thread so it NEVER stalls the main telephony event loop.
  */
 export async function warmSttEngine(): Promise<void> {
-  await getLocalWhisperPipeline();
+  if (warmInFlight) return warmInFlight;
+  warmInFlight = (async () => {
+    const worker = getOrStartSttWorker();
+    if (!worker) return;
+    const id = nextReqId++;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        pendingRequests.delete(id);
+        resolve();
+      }, 90_000);
+      pendingRequests.set(id, {
+        resolve: () => resolve(),
+        timer,
+      });
+      try {
+        worker.postMessage({ id, type: 'warm' });
+      } catch {
+        clearTimeout(timer);
+        pendingRequests.delete(id);
+        resolve();
+      }
+    });
+  })().finally(() => {
+    warmInFlight = null;
+  });
+  return warmInFlight;
 }
 
 /**
- * Transcribes a 16kHz mono Float32 speech segment from a live phone call using
- * VoiceDrop's built-in zero-key local neural Whisper engine (`Xenova/whisper-tiny.en`, q8 ONNX).
+ * Transcribes a 16kHz mono Float32 speech segment off the main thread using
+ * VoiceDrop's built-in zero-key local neural Whisper worker (`Xenova/whisper-tiny.en`, q8).
  */
 export async function transcribeTelephonySpeech(
   pcm16kFloat: Float32Array
 ): Promise<{ text: string; engine: 'local-whisper'; confidence: number } | null> {
-  if (!pcm16kFloat || pcm16kFloat.length < 4000) return null; // < 250ms
+  if (!pcm16kFloat || pcm16kFloat.length < 3800) return null; // < ~237ms
 
-  const transcriber = await getLocalWhisperPipeline();
-  if (!transcriber) return null;
+  const worker = getOrStartSttWorker();
+  if (!worker) return null;
 
-  try {
-    const normalized = normalizeFloat16kForWhisper(pcm16kFloat);
-    const result = await transcriber(normalized);
-    const rawText =
-      typeof result === 'string'
-        ? result
-        : Array.isArray(result)
-        ? result.map((r: any) => r?.text || '').join(' ')
-        : String(result?.text || '');
-    const cleaned = cleanTranscriptText(rawText);
-    if (!cleaned) return null;
-    return { text: cleaned, engine: 'local-whisper', confidence: 0.91 };
-  } catch (err: any) {
-    console.error('[VoiceDrop STT] Local Whisper inference failed:', err?.message || err);
-    return null;
+  const id = nextReqId++;
+  // Copy into a standalone transferable Float32Array so postMessage is zero-copy
+  const transferable = new Float32Array(pcm16kFloat);
+
+  const response = await new Promise<any>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      resolve(null);
+    }, 25_000);
+    pendingRequests.set(id, { resolve, timer });
+    try {
+      worker.postMessage({ id, type: 'transcribe', samples: transferable }, [transferable.buffer]);
+    } catch (err: any) {
+      clearTimeout(timer);
+      pendingRequests.delete(id);
+      console.error('[VoiceDrop STT] Failed to post audio chunk to worker:', err?.message || err);
+      resolve(null);
+    }
+  });
+
+  if (response && response.ok && typeof response.text === 'string' && response.text.trim()) {
+    return {
+      text: response.text.trim(),
+      engine: 'local-whisper',
+      confidence: typeof response.confidence === 'number' ? response.confidence : 0.91,
+    };
   }
+  return null;
 }
 
 export interface InboundSpeechTrackerOptions {
@@ -193,10 +215,16 @@ export interface InboundSpeechTrackerOptions {
   onTranscript: (text: string, confidence: number, engine: string) => Promise<void> | void;
 }
 
+interface SpeechChunkEntry {
+  samples: Float32Array;
+  durationMs: number;
+}
+
 /**
- * Real-time Voice Activity Detector + utterance segmenter + async local Whisper STT queue.
- * Continuously listens to inbound recipient audio frames and emits transcribed words live
- * without interrupting any voice prompt playback.
+ * Real-time Voice Activity Detector + utterance segmenter + async worker STT queue.
+ * Uses exact millisecond timing (works with 10ms, 20ms, 40ms, 100ms, or variable packets)
+ * and PSTN-tuned adaptive thresholds so quiet or short phone utterances transcribe live
+ * without EVER interrupting active voice prompts.
  */
 export class InboundSpeechTracker {
   private readonly callId: string;
@@ -204,19 +232,22 @@ export class InboundSpeechTracker {
   private readonly sampleRate: TelephonyRate;
   private readonly onTranscript: InboundSpeechTrackerOptions['onTranscript'];
 
-  private readonly preRoll: Float32Array[] = [];
-  private readonly maxPreRollFrames = 10; // ~200ms pre-roll so first syllable is never clipped
+  private readonly preRoll: SpeechChunkEntry[] = [];
+  private preRollMs = 0;
+  private readonly maxPreRollMs = 220;
 
-  private speechFrames: Float32Array[] = [];
+  private speechChunks: SpeechChunkEntry[] = [];
   private isSpeaking = false;
-  private onsetFrames = 0;
-  private voicedFramesInUtterance = 0;
-  private trailingSilenceFrames = 0;
+  private onsetMs = 0;
+  private voicedMsInUtterance = 0;
+  private trailingSilenceMs = 0;
+  private totalMsInUtterance = 0;
   private peakRmsInUtterance = 0;
-  private totalSamplesInUtterance = 0;
-  private noiseFloor = 0.008;
+  private noiseFloor = 0.006;
   private closed = false;
   private loggedFirstFrame = false;
+  private framesSeen = 0;
+  private maxRmsSeen = 0;
 
   private readonly pendingQueue: Float32Array[] = [];
   private processingQueue = false;
@@ -231,72 +262,73 @@ export class InboundSpeechTracker {
   public pushFrame(rawFrame: Buffer): void {
     if (this.closed || !rawFrame || rawFrame.length === 0) return;
 
-    if (!this.loggedFirstFrame) {
-      this.loggedFirstFrame = true;
-      console.log(
-        `[VoiceDrop STT] Inbound audio active for callId=${this.callId} (codec=${this.codec}, rate=${this.sampleRate}Hz, frameBytes=${rawFrame.length})`
-      );
-    }
-
     const samples = decodeFrameToFloat16k(rawFrame, this.codec, this.sampleRate);
     if (samples.length === 0) return;
 
+    const frameMs = (samples.length / 16000) * 1000;
     let sumSq = 0;
     for (let i = 0; i < samples.length; i++) {
       sumSq += samples[i] * samples[i];
     }
     const rms = Math.sqrt(sumSq / samples.length);
 
-    const speechThreshold = Math.max(0.016, Math.min(0.055, this.noiseFloor * 2.5));
+    this.framesSeen += 1;
+    if (rms > this.maxRmsSeen) this.maxRmsSeen = rms;
+
+    if (!this.loggedFirstFrame) {
+      this.loggedFirstFrame = true;
+      console.log(
+        `[VoiceDrop STT] Inbound audio stream active callId=${this.callId} codec=${this.codec} rate=${this.sampleRate}Hz bytes=${rawFrame.length} frameMs=${frameMs.toFixed(1)} initialRms=${rms.toFixed(4)}`
+      );
+    }
+
+    // PSTN-sensitive adaptive speech threshold: catches quiet -36dBFS mobile/landline voices
+    const speechThreshold = Math.max(0.008, Math.min(0.045, this.noiseFloor * 2.2));
     const isVoice = rms >= speechThreshold;
 
     if (!this.isSpeaking) {
-      // Maintain rolling 200ms pre-speech buffer
-      this.preRoll.push(samples);
-      if (this.preRoll.length > this.maxPreRollFrames) {
-        this.preRoll.shift();
+      this.preRoll.push({ samples, durationMs: frameMs });
+      this.preRollMs += frameMs;
+      while (this.preRollMs > this.maxPreRollMs && this.preRoll.length > 1) {
+        const dropped = this.preRoll.shift()!;
+        this.preRollMs -= dropped.durationMs;
       }
 
       if (isVoice) {
-        this.onsetFrames += 1;
-        if (this.onsetFrames >= 3) {
-          // Confirmed speech onset (~60ms): seed utterance with pre-roll so start of word is intact
+        this.onsetMs += frameMs;
+        if (this.onsetMs >= 55) {
           this.isSpeaking = true;
-          this.speechFrames = [...this.preRoll];
-          this.totalSamplesInUtterance = this.speechFrames.reduce((acc, f) => acc + f.length, 0);
-          this.voicedFramesInUtterance = this.onsetFrames;
-          this.trailingSilenceFrames = 0;
+          this.speechChunks = [...this.preRoll];
+          this.totalMsInUtterance = this.preRollMs;
+          this.voicedMsInUtterance = this.onsetMs;
+          this.trailingSilenceMs = 0;
           this.peakRmsInUtterance = rms;
           this.preRoll.length = 0;
+          this.preRollMs = 0;
         }
       } else {
-        this.onsetFrames = 0;
-        // Gently adapt background noise floor during silence
+        this.onsetMs = 0;
         this.noiseFloor = this.noiseFloor * 0.96 + rms * 0.04;
       }
       return;
     }
 
-    // Currently inside a spoken utterance
-    this.speechFrames.push(samples);
-    this.totalSamplesInUtterance += samples.length;
+    // Inside an active spoken utterance
+    this.speechChunks.push({ samples, durationMs: frameMs });
+    this.totalMsInUtterance += frameMs;
     if (rms > this.peakRmsInUtterance) {
       this.peakRmsInUtterance = rms;
     }
 
     if (isVoice) {
-      this.voicedFramesInUtterance += 1;
-      this.trailingSilenceFrames = 0;
+      this.voicedMsInUtterance += frameMs;
+      this.trailingSilenceMs = 0;
     } else {
-      this.trailingSilenceFrames += 1;
+      this.trailingSilenceMs += frameMs;
     }
 
-    const utteranceMs = (this.totalSamplesInUtterance / 16000) * 1000;
-
-    // Flush utterance when:
-    // 1. Caller pauses for ~600ms (30 x 20ms frames), OR
-    // 2. Caller speaks continuously for 5.5s (live rolling transcript for long sentences/voicemails!)
-    if (this.trailingSilenceFrames >= 30 || utteranceMs >= 5500) {
+    // Flush utterance when caller pauses for >= 580ms OR speaks continuously for 5.5s
+    if (this.trailingSilenceMs >= 580 || this.totalMsInUtterance >= 5500) {
       this.flushCurrentUtterance();
     }
   }
@@ -306,45 +338,54 @@ export class InboundSpeechTracker {
     if (this.isSpeaking) {
       this.flushCurrentUtterance();
     }
+    console.log(
+      `[VoiceDrop STT] Closed tracker callId=${this.callId} frames=${this.framesSeen} peakRms=${this.maxRmsSeen.toFixed(4)}`
+    );
     this.closed = true;
   }
 
   private flushCurrentUtterance(): void {
-    const rawFrames = this.speechFrames;
-    const voicedFrames = this.voicedFramesInUtterance;
+    const rawChunks = this.speechChunks;
+    const voicedMs = this.voicedMsInUtterance;
     const peakRms = this.peakRmsInUtterance;
-    const trailingSilence = this.trailingSilenceFrames;
+    const trailingSilenceMs = this.trailingSilenceMs;
 
-    this.speechFrames = [];
+    this.speechChunks = [];
     this.isSpeaking = false;
-    this.onsetFrames = 0;
-    this.voicedFramesInUtterance = 0;
-    this.trailingSilenceFrames = 0;
+    this.onsetMs = 0;
+    this.voicedMsInUtterance = 0;
+    this.trailingSilenceMs = 0;
+    this.totalMsInUtterance = 0;
     this.peakRmsInUtterance = 0;
-    this.totalSamplesInUtterance = 0;
 
-    // Trim excessive trailing silence down to ~160ms (8 frames) so Whisper runs crisp & fast
-    const trimCount = Math.max(0, trailingSilence - 8);
-    const frames = trimCount > 0 && rawFrames.length > trimCount
-      ? rawFrames.slice(0, rawFrames.length - trimCount)
-      : rawFrames;
+    // Trim excess trailing silence beyond ~160ms so Whisper stays crisp & fast
+    let trimBudgetMs = Math.max(0, trailingSilenceMs - 160);
+    let endIdx = rawChunks.length;
+    while (endIdx > 1 && trimBudgetMs >= rawChunks[endIdx - 1].durationMs) {
+      trimBudgetMs -= rawChunks[endIdx - 1].durationMs;
+      endIdx -= 1;
+    }
+    const chunks = rawChunks.slice(0, endIdx);
 
     let totalSamples = 0;
-    for (const f of frames) totalSamples += f.length;
+    let totalMs = 0;
+    for (const c of chunks) {
+      totalSamples += c.samples.length;
+      totalMs += c.durationMs;
+    }
 
-    // Require >= ~160ms of voiced energy (8 frames) and real vocal volume to filter clicks/pops
-    if (voicedFrames < 8 || peakRms < 0.022 || totalSamples < 4800) {
+    // Require >= 140ms voiced energy, >= 240ms total clip, and real vocal volume
+    if (voicedMs < 140 || peakRms < 0.012 || totalMs < 240 || totalSamples < 3800) {
       return;
     }
 
     const merged = new Float32Array(totalSamples);
     let offset = 0;
-    for (const f of frames) {
-      merged.set(f, offset);
-      offset += f.length;
+    for (const c of chunks) {
+      merged.set(c.samples, offset);
+      offset += c.samples.length;
     }
 
-    // Bound queue depth to avoid unbounded memory on slower CPUs
     if (this.pendingQueue.length >= 4) {
       this.pendingQueue.shift();
     }

@@ -4668,16 +4668,32 @@ function startServer() {
         const byRef = getSessionById(callRef);
         if (byRef) return byRef;
       }
-      const normTo = normalizeCallerId(to);
-      if (!normTo) return undefined;
+      // Strip SIP URI wrapper if present (e.g., sip:+18473509138@host)
+      const cleanedTo = String(to || '')
+        .replace(/^sip:/i, '')
+        .split('@')[0];
+      const normTo = normalizeCallerId(cleanedTo);
+      const activeStatuses = ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'];
+      if (normTo) {
+        const byNumber = Array.from(sessions.values())
+          .filter(
+            (s) =>
+              s.carrier === 'fonoster' &&
+              s.to === normTo &&
+              activeStatuses.includes(s.status)
+          )
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+        if (byNumber) return byNumber;
+      }
+      // Last-resort fallback: attach to the single most recent unattached active Fonoster call (within 90s)
+      const cutoff = Date.now() - 90_000;
       return Array.from(sessions.values())
         .filter(
           (s) =>
             s.carrier === 'fonoster' &&
-            s.to === normTo &&
-            ['queued', 'initiating', 'ringing', 'in-progress', 'collecting-input', 'awaiting-operator'].includes(
-              s.status
-            )
+            activeStatuses.includes(s.status) &&
+            !getActiveFonosterState(s.id) &&
+            new Date(s.createdAt).getTime() >= cutoff
         )
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
     },
@@ -4700,7 +4716,7 @@ function startServer() {
     onAmdResult: async (session: CallSession, status, rawLabel) => {
       await applyAmdResult(session, status, rawLabel);
     },
-    onStartHumanGreeting: async (session: CallSession) => {
+    onStartHumanGreeting: async (session: CallSession, state: FonosterSessionState) => {
       session.promptsStarted = true;
       session.status = 'collecting-input';
       addSessionEvent(session, {
@@ -4717,7 +4733,18 @@ function startServer() {
       if (promptText) {
         // First 2 custom prompts (introGreeting + script) are strictly non-interruptible so recipient
         // speech NEVER cuts them off while live STT continues transcribing every word in parallel!
-        await sayOnFonosterCall(session.id, promptText, { interruptible: false, preempt: true });
+        const ok = await sayOnFonosterCall(session.id, promptText, {
+          interruptible: false,
+          preempt: true,
+        });
+        if (!ok && !state.transport.ended) {
+          addSessionEvent(session, {
+            type: 'error',
+            title: 'Voice Prompt Audio Synthesis Failed',
+            description:
+              'VoiceDrop could not stream the voice prompt audio over Fonoster. Check server TTS logs.',
+          });
+        }
       }
     },
     onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {

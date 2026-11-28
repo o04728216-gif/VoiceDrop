@@ -1085,9 +1085,10 @@ export async function sayOnFonosterCall(
       `[Fonoster Audio] Streaming TTS callId=${callId} proto=${state.transport.protocol} engine=${synthesized.engine} voice=${synthesized.voice} cached=${synthesized.cached} codec=${synthesized.codec}/${synthesized.sampleRate}Hz duration=${synthesized.durationMs}ms frames=${totalFrames}`
     );
 
-    // Pre-buffer 5 frames (100ms) for smooth jitter-free playout, then pace steadily every 20ms
-    const prebufferFrames = 5;
-    const startTime = Date.now();
+    // Pre-buffer 4 frames (80ms) for smooth jitter-free playout, then pace steadily every 20ms
+    // using incremental non-bursting scheduling so a delayed timer tick NEVER floods Fonoster's jitter buffer!
+    const prebufferFrames = 4;
+    let nextFrameAt = Date.now();
 
     for (let i = 0; i < totalFrames; i++) {
       if (state.transport.ended || state.playbackEpoch !== myEpoch) {
@@ -1107,10 +1108,18 @@ export async function sayOnFonosterCall(
       state.transport.sendAudioFrame(frame);
 
       if (i + 1 >= prebufferFrames) {
-        const targetElapsedMs = (i + 1 - prebufferFrames) * frameMs;
-        const waitMs = targetElapsedMs - (Date.now() - startTime);
+        if (i + 1 === prebufferFrames) {
+          nextFrameAt = Date.now() + frameMs;
+        } else {
+          nextFrameAt += frameMs;
+        }
+        const now = Date.now();
+        const waitMs = nextFrameAt - now;
         if (waitMs > 1) {
           await sleepMs(waitMs);
+        } else if (waitMs < -60) {
+          // Resync clock smoothly instead of burst-dumping frames into the SIP jitter buffer
+          nextFrameAt = now;
         }
       }
     }
@@ -1294,13 +1303,16 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     sendAudioFrame: (frame: Buffer) => {
       if (ended || ws.readyState !== WebSocket.OPEN) return;
       if (detectedProtocol === 'twilio') {
-        sendJson({
+        const payloadObj: Record<string, any> = {
           event: 'media',
-          streamSid: twilioStreamSid,
           media: {
             payload: frame.toString('base64'),
           },
-        });
+        };
+        if (twilioStreamSid) {
+          payloadObj.streamSid = twilioStreamSid;
+        }
+        sendJson(payloadObj);
       } else {
         ws.send(frame, { binary: true });
       }
@@ -1562,6 +1574,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
         return;
       }
       if (msg.event === 'start') {
+        console.log('[Fonoster Voice] Raw Twilio start message:', JSON.stringify(msg));
         const s = msg.start || {};
         const custom = s.customParameters || msg.customParameters || {};
         const streamSid = String(msg.streamSid || s.streamSid || '');
@@ -1570,7 +1583,14 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
         const from = String(custom.from || s.from || '');
         const to = String(custom.to || s.to || '');
         const encoding = String(s.mediaFormat?.encoding || '').toLowerCase();
-        const codec: TelephonyCodec = encoding.includes('pcm') && !encoding.includes('mulaw') ? 'pcm16' : 'pcmu';
+        // IMPORTANT: "audio/pcmu" contains "pcm" — only select pcm16 for explicit linear PCM!
+        // Twilio Media Streams defaults to 8kHz G.711 mu-law (pcmu).
+        const isLinearPcm =
+          encoding.includes('pcm16') ||
+          encoding.includes('l16') ||
+          encoding.includes('linear') ||
+          encoding.includes('slin');
+        const codec: TelephonyCodec = isLinearPcm ? 'pcm16' : 'pcmu';
         const rawRate = Number(s.mediaFormat?.sampleRate || 8000);
         const sampleRate: TelephonyRate =
           codec === 'pcmu' ? 8000 : rawRate === 16000 || rawRate === 24000 ? (rawRate as TelephonyRate) : 8000;
@@ -1588,8 +1608,11 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
         return;
       }
       if (msg.event === 'media') {
+        if (!twilioStreamSid && msg.streamSid) {
+          twilioStreamSid = String(msg.streamSid);
+        }
         const track = String(msg.media?.track || 'inbound').toLowerCase();
-        if (track.includes('outbound')) return;
+        if (track === 'outbound' || track === 'outbound_track') return;
         const b64 = msg.media?.payload;
         if (typeof b64 === 'string' && b64.length > 0) {
           handleInboundAudioFrame(Buffer.from(b64, 'base64'));
