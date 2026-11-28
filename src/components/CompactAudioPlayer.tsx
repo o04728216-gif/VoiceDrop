@@ -49,6 +49,9 @@ export const CompactAudioPlayer: React.FC<CompactAudioPlayerProps> = ({
     if (durationHint && durationHint > 0) {
       setDuration(durationHint);
     }
+    if (audioRef.current) {
+      audioRef.current.load();
+    }
   }, [src, durationHint]);
 
   useEffect(() => {

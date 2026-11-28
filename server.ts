@@ -148,6 +148,7 @@ export interface SpeechTranscriptEntry {
   text: string;
   confidence?: number;
   timestamp: string;
+  isPartial?: boolean;
 }
 
 export interface CallSession {
@@ -1276,6 +1277,9 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
                     if (cdrEnded) {
                       const isNormal = cdrStatus === 'NORMAL_CLEARING';
                       stopFonosterPlayback(callId);
+                      if (activeVoice) {
+                        void hangupFonosterCall(callId);
+                      }
                       live.status = isNormal ? 'completed' : 'failed';
                       live.completedAt = new Date().toISOString();
                       if (typeof cdr?.duration === 'number' && cdr.duration > 0) {
@@ -1939,7 +1943,8 @@ function appendSpeechTranscript(
   session: CallSession,
   text: string,
   confidence?: number,
-  contextLabel?: string
+  contextLabel?: string,
+  opts?: { utteranceId?: string; isFinal?: boolean }
 ) {
   const cleaned = text.trim();
   if (!cleaned) return;
@@ -1948,14 +1953,32 @@ function appendSpeechTranscript(
     session.speechTranscripts = [];
   }
 
-  const entry: SpeechTranscriptEntry = {
-    id: `sp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    text: cleaned,
-    confidence,
-    timestamp: new Date().toISOString(),
-  };
+  const isPartial = opts?.isFinal === false;
+  const entryId =
+    opts?.utteranceId || `sp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+  const nowIso = new Date().toISOString();
 
-  session.speechTranscripts.push(entry);
+  const existingIdx = opts?.utteranceId
+    ? session.speechTranscripts.findIndex((t) => t.id === entryId)
+    : -1;
+
+  if (existingIdx >= 0) {
+    session.speechTranscripts[existingIdx] = {
+      ...session.speechTranscripts[existingIdx],
+      text: cleaned,
+      confidence,
+      isPartial,
+    };
+  } else {
+    session.speechTranscripts.push({
+      id: entryId,
+      text: cleaned,
+      confidence,
+      timestamp: nowIso,
+      isPartial,
+    });
+  }
+
   session.capturedSpeech = session.speechTranscripts.map((t) => t.text).join(' | ');
   if (confidence !== undefined && !Number.isNaN(confidence)) {
     session.confidence = confidence;
@@ -1965,15 +1988,49 @@ function appendSpeechTranscript(
     confidence !== undefined && !Number.isNaN(confidence)
       ? ` (Confidence: ${Math.round(confidence * 100)}%)`
       : '';
+  const liveTag = isPartial ? ' • Live' : '';
+  const eventId = `evt_${entryId}`;
+  const eventTitle = `Caller Spoke${contextLabel ? ` (${contextLabel}${liveTag})` : isPartial ? ' (Live)' : ''}: "${cleaned}"`;
+  const eventDesc = isPartial
+    ? 'Streaming live words as recipient speaks...'
+    : `Live voice recognition captured spoken audio${confSuffix}.`;
 
-  addSessionEvent(session, {
-    type: 'speech',
-    title: `Caller Spoke${contextLabel ? ` (${contextLabel})` : ''}: "${cleaned}"`,
-    description: `Live voice recognition captured spoken audio${confSuffix}.`,
-    data: { speech: cleaned, confidence },
-  });
+  const existingEvtIdx = opts?.utteranceId
+    ? session.events.findIndex((e) => e.id === eventId)
+    : -1;
 
-  if (isVoicemailGreetingSpeech(cleaned)) {
+  if (existingEvtIdx >= 0) {
+    session.events[existingEvtIdx] = {
+      ...session.events[existingEvtIdx],
+      title: eventTitle,
+      description: eventDesc,
+      data: { speech: cleaned, confidence, isPartial },
+    };
+    if (!isPartial) {
+      persistSessionsToDisk();
+    }
+    broadcastEvent(session.id, 'session-update', session);
+  } else if (isPartial) {
+    // Push live speech row without hitting disk on every partial tick for ultra-low latency
+    session.events.push({
+      id: eventId,
+      timestamp: nowIso,
+      type: 'speech',
+      title: eventTitle,
+      description: eventDesc,
+      data: { speech: cleaned, confidence, isPartial: true },
+    });
+    broadcastEvent(session.id, 'session-update', session);
+  } else {
+    addSessionEvent(session, {
+      type: 'speech',
+      title: eventTitle,
+      description: eventDesc,
+      data: { speech: cleaned, confidence, isPartial: false },
+    });
+  }
+
+  if (!isPartial && isVoicemailGreetingSpeech(cleaned)) {
     session.voicemailGreetingComplete = true;
     if (!session.promptsStarted && !session.humanPickedUpAfterVoicemail && session.answeredBy !== 'voicemail') {
       void applyAmdResult(session, 'voicemail', 'voicemail_greeting_speech');
@@ -3388,8 +3445,14 @@ app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
 
   if (range) {
     const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    let start = parts[0] ? parseInt(parts[0], 10) : 0;
+    let end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    if (Number.isNaN(start) || start < 0) start = 0;
+    if (Number.isNaN(end) || end >= fileSize) end = fileSize - 1;
+    if (start > end || start >= fileSize) {
+      res.writeHead(416, { 'Content-Range': `bytes */${fileSize}` });
+      return res.end();
+    }
     const chunkSize = end - start + 1;
     const stream = fs.createReadStream(cached.filePath, { start, end });
     res.writeHead(206, {
@@ -3397,6 +3460,7 @@ app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
       'Accept-Ranges': 'bytes',
       'Content-Length': chunkSize,
       'Content-Type': cached.mimeType,
+      'Cache-Control': 'private, max-age=300',
     });
     stream.pipe(res);
   } else {
@@ -3404,6 +3468,7 @@ app.get('/api/calls/:callId/recording', async (req: Request, res: Response) => {
       'Content-Length': fileSize,
       'Accept-Ranges': 'bytes',
       'Content-Type': cached.mimeType,
+      'Cache-Control': 'private, max-age=300',
     });
     fs.createReadStream(cached.filePath).pipe(res);
   }
@@ -4747,10 +4812,16 @@ function startServer() {
         }
       }
     },
-    onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {
+    onSpeechTurn: async (
+      session: CallSession,
+      text: string,
+      confidence?: number,
+      meta?: { utteranceId?: string; isFinal?: boolean }
+    ) => {
       const ctx = session.status === 'awaiting-operator' ? 'On Hold' : 'Live Call';
-      appendSpeechTranscript(session, text, confidence, ctx);
+      appendSpeechTranscript(session, text, confidence, ctx, meta);
       if (
+        meta?.isFinal !== false &&
         session.answeredBy === 'voicemail' &&
         !session.humanPickedUpAfterVoicemail &&
         checkHumanPickupOnVoicemail(session, text)
@@ -4837,6 +4908,29 @@ function startServer() {
         }
       }
     },
+    onLocalRecordingReady: async (
+      session: CallSession,
+      wavBuffer: Buffer,
+      durationSec: number
+    ) => {
+      if (session.recordCall === false || !wavBuffer || wavBuffer.length < 256) return;
+      const safeId = session.id.replace(/[^a-zA-Z0-9_-]/g, '');
+      const mp3OutPath = path.join(RECORDINGS_DIR, `${safeId}.mp3`);
+      const transcoded = await transcodeToCompactHdMp3(wavBuffer, 'wav', mp3OutPath);
+      if (transcoded.ok) {
+        markRecordingCompleted(
+          session,
+          mp3OutPath,
+          'mp3',
+          transcoded.durationSec || durationSec
+        );
+        return;
+      }
+      // Instant WAV fallback if ffmpeg is unavailable
+      const wavOutPath = path.join(RECORDINGS_DIR, `${safeId}.wav`);
+      fs.writeFileSync(wavOutPath, wavBuffer);
+      markRecordingCompleted(session, wavOutPath, 'wav', durationSec);
+    },
     onSessionError: (session: CallSession, err) => {
       addSessionEvent(session, {
         type: 'error',
@@ -4848,6 +4942,11 @@ function startServer() {
       });
     },
     onSessionEnded: async (session: CallSession, reason: string) => {
+      if (Array.isArray(session.speechTranscripts)) {
+        for (const t of session.speechTranscripts) {
+          if (t.isPartial) t.isPartial = false;
+        }
+      }
       if (!['completed', 'failed', 'busy', 'no-answer'].includes(session.status)) {
         session.status = 'completed';
         session.completedAt = new Date().toISOString();

@@ -15,7 +15,7 @@ for (let i = 0; i < 256; i++) {
 
 /**
  * Decodes a raw telephony frame (`pcmu` @ 8kHz or `pcm16` @ 8k/16k/24kHz) into
- * mono Float32 samples at 16,000 Hz (native sample rate expected by Whisper).
+ * mono Float32 samples at 16,000 Hz (native sample rate expected by Whisper & CallRecorder).
  */
 export function decodeFrameToFloat16k(
   frame: Buffer,
@@ -97,7 +97,6 @@ function getOrStartSttWorker(): Worker | null {
         modelId: (process.env.VOICEDROP_STT_MODEL || '').trim() || 'Xenova/whisper-tiny.en',
       },
     });
-    // Don't keep Node process alive solely for the background worker
     worker.unref();
 
     worker.on('message', (msg: any) => {
@@ -171,25 +170,28 @@ export async function warmSttEngine(): Promise<void> {
  * VoiceDrop's built-in zero-key local neural Whisper worker (`Xenova/whisper-tiny.en`, q8).
  */
 export async function transcribeTelephonySpeech(
-  pcm16kFloat: Float32Array
+  pcm16kFloat: Float32Array,
+  isFinal = true
 ): Promise<{ text: string; engine: 'local-whisper'; confidence: number } | null> {
-  if (!pcm16kFloat || pcm16kFloat.length < 3800) return null; // < ~237ms
+  if (!pcm16kFloat || pcm16kFloat.length < 3200) return null; // < 200ms
 
   const worker = getOrStartSttWorker();
   if (!worker) return null;
 
   const id = nextReqId++;
-  // Copy into a standalone transferable Float32Array so postMessage is zero-copy
   const transferable = new Float32Array(pcm16kFloat);
 
   const response = await new Promise<any>((resolve) => {
     const timer = setTimeout(() => {
       pendingRequests.delete(id);
       resolve(null);
-    }, 25_000);
+    }, 20_000);
     pendingRequests.set(id, { resolve, timer });
     try {
-      worker.postMessage({ id, type: 'transcribe', samples: transferable }, [transferable.buffer]);
+      worker.postMessage(
+        { id, type: 'transcribe', samples: transferable, isFinal },
+        [transferable.buffer]
+      );
     } catch (err: any) {
       clearTimeout(timer);
       pendingRequests.delete(id);
@@ -208,11 +210,21 @@ export async function transcribeTelephonySpeech(
   return null;
 }
 
+export interface SpeechTranscriptMeta {
+  utteranceId: string;
+  isFinal: boolean;
+}
+
 export interface InboundSpeechTrackerOptions {
   callId: string;
   codec: TelephonyCodec;
   sampleRate: TelephonyRate;
-  onTranscript: (text: string, confidence: number, engine: string) => Promise<void> | void;
+  onTranscript: (
+    text: string,
+    confidence: number,
+    engine: string,
+    meta: SpeechTranscriptMeta
+  ) => Promise<void> | void;
 }
 
 interface SpeechChunkEntry {
@@ -220,11 +232,16 @@ interface SpeechChunkEntry {
   durationMs: number;
 }
 
+interface SttJob {
+  utteranceId: string;
+  isFinal: boolean;
+  audio: Float32Array;
+}
+
 /**
- * Real-time Voice Activity Detector + utterance segmenter + async worker STT queue.
- * Uses exact millisecond timing (works with 10ms, 20ms, 40ms, 100ms, or variable packets)
- * and PSTN-tuned adaptive thresholds so quiet or short phone utterances transcribe live
- * without EVER interrupting active voice prompts.
+ * Real-time Streaming Voice Activity Detector + progressive interim/final STT dispatcher.
+ * Emits LIVE partial words AS the recipient is speaking (~380ms first word, updating every ~480ms)
+ * and finalizes cleanly on a crisp ~340ms pause — with zero interruption to active voice prompts!
  */
 export class InboundSpeechTracker {
   private readonly callId: string;
@@ -234,23 +251,30 @@ export class InboundSpeechTracker {
 
   private readonly preRoll: SpeechChunkEntry[] = [];
   private preRollMs = 0;
-  private readonly maxPreRollMs = 220;
+  private readonly maxPreRollMs = 180;
 
   private speechChunks: SpeechChunkEntry[] = [];
   private isSpeaking = false;
+  private utteranceSeq = 0;
+  private currentUtteranceId = '';
   private onsetMs = 0;
   private voicedMsInUtterance = 0;
   private trailingSilenceMs = 0;
   private totalMsInUtterance = 0;
   private peakRmsInUtterance = 0;
+  private lastPartialSentAtMs = 0;
   private noiseFloor = 0.006;
   private closed = false;
   private loggedFirstFrame = false;
   private framesSeen = 0;
   private maxRmsSeen = 0;
 
-  private readonly pendingQueue: Float32Array[] = [];
+  // Priority queue: final utterances always run in order; interim partial uses latest-wins coalescing
+  // so Whisper NEVER wastes time on stale partial snapshots!
+  private readonly finalQueue: SttJob[] = [];
+  private latestPartialJob: SttJob | null = null;
   private processingQueue = false;
+  private readonly lastEmittedTextByUtterance = new Map<string, string>();
 
   constructor(opts: InboundSpeechTrackerOptions) {
     this.callId = opts.callId;
@@ -278,7 +302,7 @@ export class InboundSpeechTracker {
     if (!this.loggedFirstFrame) {
       this.loggedFirstFrame = true;
       console.log(
-        `[VoiceDrop STT] Inbound audio stream active callId=${this.callId} codec=${this.codec} rate=${this.sampleRate}Hz bytes=${rawFrame.length} frameMs=${frameMs.toFixed(1)} initialRms=${rms.toFixed(4)}`
+        `[VoiceDrop STT] Live streaming STT active callId=${this.callId} codec=${this.codec} rate=${this.sampleRate}Hz bytes=${rawFrame.length} frameMs=${frameMs.toFixed(1)}`
       );
     }
 
@@ -296,13 +320,16 @@ export class InboundSpeechTracker {
 
       if (isVoice) {
         this.onsetMs += frameMs;
-        if (this.onsetMs >= 55) {
+        if (this.onsetMs >= 50) {
+          this.utteranceSeq += 1;
+          this.currentUtteranceId = `utt_${this.callId}_${this.utteranceSeq}`;
           this.isSpeaking = true;
           this.speechChunks = [...this.preRoll];
           this.totalMsInUtterance = this.preRollMs;
           this.voicedMsInUtterance = this.onsetMs;
           this.trailingSilenceMs = 0;
           this.peakRmsInUtterance = rms;
+          this.lastPartialSentAtMs = 0;
           this.preRoll.length = 0;
           this.preRollMs = 0;
         }
@@ -327,8 +354,24 @@ export class InboundSpeechTracker {
       this.trailingSilenceMs += frameMs;
     }
 
-    // Flush utterance when caller pauses for >= 580ms OR speaks continuously for 5.5s
-    if (this.trailingSilenceMs >= 580 || this.totalMsInUtterance >= 5500) {
+    // INSTANT LIVE PARTIAL STREAMING:
+    // As soon as recipient has spoken >= 380ms (and every ~480ms thereafter while still talking),
+    // immediately push a latest-wins live snapshot to the Whisper worker so words appear AS they speak!
+    const msSinceLastPartial = this.totalMsInUtterance - this.lastPartialSentAtMs;
+    const readyForFirstPartial = this.lastPartialSentAtMs === 0 && this.voicedMsInUtterance >= 240 && this.totalMsInUtterance >= 380;
+    const readyForNextPartial = this.lastPartialSentAtMs > 0 && msSinceLastPartial >= 480 && this.trailingSilenceMs < 240;
+
+    if (
+      (readyForFirstPartial || readyForNextPartial) &&
+      this.peakRmsInUtterance >= 0.012 &&
+      this.totalMsInUtterance < 4300
+    ) {
+      this.lastPartialSentAtMs = this.totalMsInUtterance;
+      this.schedulePartialSnapshot();
+    }
+
+    // Finalize utterance crisply on ~340ms pause OR 4.5s continuous speech
+    if (this.trailingSilenceMs >= 340 || this.totalMsInUtterance >= 4500) {
       this.flushCurrentUtterance();
     }
   }
@@ -338,13 +381,41 @@ export class InboundSpeechTracker {
     if (this.isSpeaking) {
       this.flushCurrentUtterance();
     }
+    this.latestPartialJob = null;
     console.log(
       `[VoiceDrop STT] Closed tracker callId=${this.callId} frames=${this.framesSeen} peakRms=${this.maxRmsSeen.toFixed(4)}`
     );
     this.closed = true;
   }
 
+  private mergeChunks(chunks: SpeechChunkEntry[]): Float32Array {
+    let totalSamples = 0;
+    for (const c of chunks) totalSamples += c.samples.length;
+    const merged = new Float32Array(totalSamples);
+    let offset = 0;
+    for (const c of chunks) {
+      merged.set(c.samples, offset);
+      offset += c.samples.length;
+    }
+    return merged;
+  }
+
+  private schedulePartialSnapshot(): void {
+    if (!this.currentUtteranceId || this.speechChunks.length === 0) return;
+    const merged = this.mergeChunks(this.speechChunks);
+    if (merged.length < 3600) return;
+
+    // Overwrite any older unstarted partial snapshot (latest-wins!) so UI always gets freshest words
+    this.latestPartialJob = {
+      utteranceId: this.currentUtteranceId,
+      isFinal: false,
+      audio: merged,
+    };
+    void this.drainQueue();
+  }
+
   private flushCurrentUtterance(): void {
+    const utteranceId = this.currentUtteranceId;
     const rawChunks = this.speechChunks;
     const voicedMs = this.voicedMsInUtterance;
     const peakRms = this.peakRmsInUtterance;
@@ -352,14 +423,21 @@ export class InboundSpeechTracker {
 
     this.speechChunks = [];
     this.isSpeaking = false;
+    this.currentUtteranceId = '';
     this.onsetMs = 0;
     this.voicedMsInUtterance = 0;
     this.trailingSilenceMs = 0;
     this.totalMsInUtterance = 0;
     this.peakRmsInUtterance = 0;
+    this.lastPartialSentAtMs = 0;
 
-    // Trim excess trailing silence beyond ~160ms so Whisper stays crisp & fast
-    let trimBudgetMs = Math.max(0, trailingSilenceMs - 160);
+    // Discard any pending partial for this utterance since we now have its final audio
+    if (this.latestPartialJob?.utteranceId === utteranceId) {
+      this.latestPartialJob = null;
+    }
+
+    // Trim excess trailing silence beyond ~120ms for crisp fast Whisper decoding
+    let trimBudgetMs = Math.max(0, trailingSilenceMs - 120);
     let endIdx = rawChunks.length;
     while (endIdx > 1 && trimBudgetMs >= rawChunks[endIdx - 1].durationMs) {
       trimBudgetMs -= rawChunks[endIdx - 1].durationMs;
@@ -367,29 +445,24 @@ export class InboundSpeechTracker {
     }
     const chunks = rawChunks.slice(0, endIdx);
 
-    let totalSamples = 0;
     let totalMs = 0;
-    for (const c of chunks) {
-      totalSamples += c.samples.length;
-      totalMs += c.durationMs;
-    }
+    for (const c of chunks) totalMs += c.durationMs;
 
-    // Require >= 140ms voiced energy, >= 240ms total clip, and real vocal volume
-    if (voicedMs < 140 || peakRms < 0.012 || totalMs < 240 || totalSamples < 3800) {
+    if (voicedMs < 130 || peakRms < 0.012 || totalMs < 220) {
       return;
     }
 
-    const merged = new Float32Array(totalSamples);
-    let offset = 0;
-    for (const c of chunks) {
-      merged.set(c.samples, offset);
-      offset += c.samples.length;
-    }
+    const merged = this.mergeChunks(chunks);
+    if (merged.length < 3200) return;
 
-    if (this.pendingQueue.length >= 4) {
-      this.pendingQueue.shift();
+    if (this.finalQueue.length >= 4) {
+      this.finalQueue.shift();
     }
-    this.pendingQueue.push(merged);
+    this.finalQueue.push({
+      utteranceId,
+      isFinal: true,
+      audio: merged,
+    });
     void this.drainQueue();
   }
 
@@ -398,15 +471,43 @@ export class InboundSpeechTracker {
     this.processingQueue = true;
 
     try {
-      while (this.pendingQueue.length > 0) {
-        const chunk = this.pendingQueue.shift()!;
+      while (this.finalQueue.length > 0 || this.latestPartialJob !== null) {
+        // Prioritize finalized utterances; otherwise process the freshest live partial snapshot
+        let job: SttJob;
+        if (this.finalQueue.length > 0) {
+          job = this.finalQueue.shift()!;
+        } else {
+          job = this.latestPartialJob!;
+          this.latestPartialJob = null;
+        }
+
         const t0 = Date.now();
-        const result = await transcribeTelephonySpeech(chunk);
+        const result = await transcribeTelephonySpeech(job.audio, job.isFinal);
         if (result && result.text) {
+          const prevText = this.lastEmittedTextByUtterance.get(job.utteranceId);
+          // Skip identical partial text to avoid pointless SSE churn, but ALWAYS emit final
+          if (!job.isFinal && prevText === result.text) {
+            continue;
+          }
+          // Never regress a partial to a shorter stale result if utterance already finalized
+          if (!job.isFinal && this.currentUtteranceId !== job.utteranceId) {
+            continue;
+          }
+          this.lastEmittedTextByUtterance.set(job.utteranceId, result.text);
+          if (job.isFinal) {
+            // Keep map bounded
+            if (this.lastEmittedTextByUtterance.size > 40) {
+              const oldest = this.lastEmittedTextByUtterance.keys().next().value;
+              if (oldest) this.lastEmittedTextByUtterance.delete(oldest);
+            }
+          }
           console.log(
-            `[VoiceDrop STT] callId=${this.callId} engine=${result.engine} ms=${Date.now() - t0} text="${result.text}"`
+            `[VoiceDrop STT] callId=${this.callId} ${job.isFinal ? 'FINAL' : 'LIVE'} ms=${Date.now() - t0} text="${result.text}"`
           );
-          await this.onTranscript(result.text, result.confidence, result.engine);
+          await this.onTranscript(result.text, result.confidence, result.engine, {
+            utteranceId: job.utteranceId,
+            isFinal: job.isFinal,
+          });
         }
       }
     } catch (err) {

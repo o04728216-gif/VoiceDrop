@@ -53,6 +53,7 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   const [customCueText, setCustomCueText] = useState('');
   const [isSendingCue, setIsSendingCue] = useState(false);
   const eventsEndRef = useRef<HTMLDivElement>(null);
+  const speechEndRef = useRef<HTMLDivElement>(null);
 
   // Pre-register already-completed sessions on mount/load so historical records don't fire confetti
   useEffect(() => {
@@ -85,6 +86,10 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session?.events]);
+
+  useEffect(() => {
+    speechEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [session?.speechTranscripts, session?.capturedSpeech]);
 
   const copyTranscript = () => {
     if (!session) return;
@@ -737,21 +742,35 @@ export const LiveSessionFeed: React.FC<LiveSessionFeedProps> = ({
 
               {/* Spoken Voice Transcripts */}
               {speechTranscripts.length > 0 ? (
-                <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                <div className="space-y-1.5 max-h-36 overflow-y-auto pr-1">
                   {speechTranscripts.map((item) => (
                     <div
                       key={item.id}
-                      className="p-2 rounded-lg bg-cyan-950/25 border border-cyan-500/25 text-xs flex items-start justify-between gap-2"
+                      className={`p-2 rounded-lg text-xs flex items-start justify-between gap-2 transition-colors ${
+                        item.isPartial
+                          ? 'bg-cyan-950/45 border border-cyan-400/50'
+                          : 'bg-cyan-950/25 border border-cyan-500/25'
+                      }`}
                     >
-                      <div className="text-cyan-200">
-                        <span className="font-semibold text-cyan-400 mr-1.5">Caller:</span>
-                        <span>"{item.text}"</span>
+                      <div className="text-cyan-200 flex items-start gap-1.5 flex-wrap">
+                        {item.isPartial && (
+                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-cyan-500/20 text-[9px] font-mono font-bold text-cyan-300 uppercase tracking-wider shrink-0 mt-0.5">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>
+                            Live
+                          </span>
+                        )}
+                        <span className="font-semibold text-cyan-400">Caller:</span>
+                        <span>
+                          "{item.text}
+                          {item.isPartial ? '...' : ''}"
+                        </span>
                       </div>
                       <span className="text-[10px] font-mono text-slate-500 shrink-0">
                         {new Date(item.timestamp).toLocaleTimeString()}
                       </span>
                     </div>
                   ))}
+                  <div ref={speechEndRef} />
                 </div>
               ) : session.capturedSpeech ? (
                 <div className="p-2 rounded-lg bg-cyan-950/25 border border-cyan-500/25 text-xs text-cyan-200">

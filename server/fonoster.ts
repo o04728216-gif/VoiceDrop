@@ -9,7 +9,8 @@ import {
   type TelephonyCodec,
   type TelephonyRate,
 } from './tts.ts';
-import { InboundSpeechTracker } from './stt.ts';
+import { InboundSpeechTracker, type SpeechTranscriptMeta } from './stt.ts';
+import { LiveCallRecorder } from './callRecorder.ts';
 
 const requireFromHere = createRequire(import.meta.url);
 let cachedGrpcModule: any = null;
@@ -1178,12 +1179,22 @@ export interface FonosterVoiceBridgeHooks {
     rawLabel: string
   ) => Promise<void>;
   onStartHumanGreeting: (session: any, state: FonosterSessionState) => Promise<void>;
-  onSpeechTurn: (session: any, text: string, confidence?: number) => Promise<boolean>;
+  onSpeechTurn: (
+    session: any,
+    text: string,
+    confidence?: number,
+    meta?: SpeechTranscriptMeta
+  ) => Promise<boolean>;
   onDigitsSubmitted: (
     session: any,
     digits: string,
     submittedViaPound: boolean,
     state: FonosterSessionState
+  ) => Promise<void>;
+  onLocalRecordingReady?: (
+    session: any,
+    wavBuffer: Buffer,
+    durationSec: number
   ) => Promise<void>;
   onSessionError?: (session: any, err: { code?: string; message?: string; fatal?: boolean }) => void;
   onSessionEnded: (session: any, reason: string) => Promise<void>;
@@ -1239,6 +1250,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
   let silenceAfterVoiceFrames = 0;
   let ended = false;
   let speechTracker: InboundSpeechTracker | null = null;
+  let callRecorder: LiveCallRecorder | null = null;
 
   const markWaiters = new Map<string, Array<(res: { cleared: boolean }) => void>>();
 
@@ -1302,6 +1314,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     },
     sendAudioFrame: (frame: Buffer) => {
       if (ended || ws.readyState !== WebSocket.OPEN) return;
+      callRecorder?.recordOutbound(frame, negotiatedCodec, negotiatedRate);
       if (detectedProtocol === 'twilio') {
         const payloadObj: Record<string, any> = {
           event: 'media',
@@ -1377,7 +1390,10 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
   const handleInboundAudioFrame = (frame: Buffer) => {
     if (!activeState || ended) return;
 
-    // Continuously feed every inbound recipient audio frame into live STT (before, during, and after prompts!)
+    // Record recipient's live inbound audio into our synchronized two-way HD call recording
+    callRecorder?.recordInbound(frame, negotiatedCodec, negotiatedRate);
+
+    // Continuously feed every inbound recipient audio frame into live streaming STT (before, during, and after prompts!)
     speechTracker?.pushFrame(frame);
 
     if (activeState.greetStarted) return;
@@ -1500,15 +1516,20 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     activeState = state;
     activeFonosterCalls.set(session.id, state);
 
-    // Attach real-time zero-key built-in local Whisper STT tracker.
-    // Continuously transcribes recipient speech live without ever interrupting active voice prompts!
+    // Start real-time dual-leg call audio recorder (records BOTH VoiceDrop prompts & recipient voice smoothly!)
+    if (session.recordCall !== false) {
+      callRecorder = new LiveCallRecorder(session.id);
+    }
+
+    // Attach real-time zero-key built-in local Whisper streaming STT tracker.
+    // Emits instant live partial words as the recipient speaks without ever interrupting active voice prompts!
     speechTracker = new InboundSpeechTracker({
       callId: session.id,
       codec: negotiatedCodec,
       sampleRate: negotiatedRate,
-      onTranscript: async (text, confidence) => {
+      onTranscript: async (text, confidence, _engine, meta) => {
         if (!activeSessionObj) return;
-        const shouldWake = await hooks.onSpeechTurn(activeSessionObj, text, confidence);
+        const shouldWake = await hooks.onSpeechTurn(activeSessionObj, text, confidence, meta);
         if (shouldWake) {
           await triggerGreetingOnce('speech_human_pickup');
         }
@@ -1532,6 +1553,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     clearInterval(pingTimer);
     clearAllMarks();
     speechTracker?.flushAndClose();
+    const recorded = callRecorder?.finalize() || null;
 
     if (activeState) {
       activeState.playbackEpoch += 1;
@@ -1543,10 +1565,24 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     }
 
     if (activeSessionObj) {
+      const finishedSession = activeSessionObj;
       console.log(
-        `[Fonoster Voice] Session ended callId=${activeSessionObj.id} proto=${detectedProtocol} reason=${reason}`
+        `[Fonoster Voice] Session ended callId=${finishedSession.id} proto=${detectedProtocol} reason=${reason} recorded=${Boolean(recorded)}`
       );
-      void hooks.onSessionEnded(activeSessionObj, reason);
+      void (async () => {
+        if (recorded && hooks.onLocalRecordingReady) {
+          try {
+            await hooks.onLocalRecordingReady(
+              finishedSession,
+              recorded.wavBuffer,
+              recorded.durationSec
+            );
+          } catch (recErr) {
+            console.error(`[Fonoster Recorder] Failed to save recording for ${finishedSession.id}:`, recErr);
+          }
+        }
+        await hooks.onSessionEnded(finishedSession, reason);
+      })();
     }
   };
 

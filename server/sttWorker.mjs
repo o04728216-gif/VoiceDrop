@@ -1,9 +1,11 @@
+import os from 'node:os';
 import { parentPort, workerData } from 'node:worker_threads';
 
-// Keep ONNX / OpenMP single-threaded inside the STT worker so it NEVER steals CPU
-// from the main Node.js 20ms telephony audio streaming thread.
-process.env.OMP_NUM_THREADS = process.env.OMP_NUM_THREADS || '1';
-process.env.ORT_NUM_THREADS = process.env.ORT_NUM_THREADS || '1';
+// Use up to 2 threads inside the isolated STT worker for fast ~250-600ms live partial inference,
+// while staying completely off the main Node.js 20ms telephony audio thread.
+const optimalThreads = String(Math.max(1, Math.min(2, os.cpus().length || 1)));
+process.env.OMP_NUM_THREADS = process.env.OMP_NUM_THREADS || optimalThreads;
+process.env.ORT_NUM_THREADS = process.env.ORT_NUM_THREADS || optimalThreads;
 
 const HALLUCINATION_PATTERNS = [
   /^\[.*\]$/,
@@ -42,7 +44,6 @@ function normalizeFloat16kForWhisper(samples) {
     const a = Math.abs(samples[i]);
     if (a > peak) peak = a;
   }
-  // Boost quiet PSTN/mobile voices up to 12x so -36dBFS callers transcribe clearly
   if (peak <= 0.004 || peak >= 0.72) return samples;
   const gain = Math.min(12.0, 0.78 / peak);
   const out = new Float32Array(samples.length);
@@ -69,13 +70,15 @@ async function getWhisperPipeline() {
         '/tmp/voicedrop-stt-cache';
       env.allowLocalModels = true;
       if (env.backends?.onnx?.wasm) {
-        env.backends.onnx.wasm.numThreads = 1;
+        env.backends.onnx.wasm.numThreads = Number(optimalThreads);
       }
       const modelId =
         (workerData && workerData.modelId) ||
         (process.env.VOICEDROP_STT_MODEL || '').trim() ||
         'Xenova/whisper-tiny.en';
-      console.log(`[VoiceDrop STT Worker] Loading built-in zero-key local Whisper (${modelId})...`);
+      console.log(
+        `[VoiceDrop STT Worker] Loading built-in zero-key local Whisper (${modelId}, threads=${optimalThreads})...`
+      );
       const transcriber = await pipeline('automatic-speech-recognition', modelId, {
         dtype: 'q8',
       });
@@ -112,7 +115,7 @@ if (parentPort) {
           msg.samples instanceof Float32Array
             ? msg.samples
             : new Float32Array(msg.samples.buffer || msg.samples);
-        if (!samples || samples.length < 3800) {
+        if (!samples || samples.length < 3200) {
           parentPort.postMessage({ id, ok: true, text: '' });
           return;
         }
@@ -122,7 +125,12 @@ if (parentPort) {
           return;
         }
         const normalized = normalizeFloat16kForWhisper(samples);
-        const result = await transcriber(normalized);
+        // Fast greedy decoding for ultra-low-latency live partial + final streaming
+        const result = await transcriber(normalized, {
+          return_timestamps: false,
+          num_beams: 1,
+          do_sample: false,
+        });
         const rawText =
           typeof result === 'string'
             ? result
@@ -135,7 +143,7 @@ if (parentPort) {
           ok: true,
           text: cleaned,
           engine: 'local-whisper',
-          confidence: 0.91,
+          confidence: msg.isFinal === false ? 0.85 : 0.92,
         });
       } catch (err) {
         console.error('[VoiceDrop STT Worker] Inference error:', err?.message || err);

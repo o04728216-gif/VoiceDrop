@@ -16,6 +16,7 @@ export interface SpeechTranscriptEntry {
   text: string;
   confidence?: number;
   timestamp: string;
+  isPartial?: boolean;
 }
 
 export interface CallEvent {
