@@ -9,6 +9,7 @@ import {
   type TelephonyCodec,
   type TelephonyRate,
 } from './tts.ts';
+import { InboundSpeechTracker } from './stt.ts';
 
 const requireFromHere = createRequire(import.meta.url);
 let cachedGrpcModule: any = null;
@@ -1228,6 +1229,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
   let voiceFramesSeen = 0;
   let silenceAfterVoiceFrames = 0;
   let ended = false;
+  let speechTracker: InboundSpeechTracker | null = null;
 
   const markWaiters = new Map<string, Array<(res: { cleared: boolean }) => void>>();
 
@@ -1361,7 +1363,12 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
   };
 
   const handleInboundAudioFrame = (frame: Buffer) => {
-    if (!activeState || activeState.greetStarted || ended) return;
+    if (!activeState || ended) return;
+
+    // Continuously feed every inbound recipient audio frame into live STT (before, during, and after prompts!)
+    speechTracker?.pushFrame(frame);
+
+    if (activeState.greetStarted) return;
     const elapsed = Date.now() - connectedAt;
     if (elapsed < 220) return;
 
@@ -1480,6 +1487,22 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
 
     activeState = state;
     activeFonosterCalls.set(session.id, state);
+
+    // Attach real-time zero-key built-in local Whisper STT tracker.
+    // Continuously transcribes recipient speech live without ever interrupting active voice prompts!
+    speechTracker = new InboundSpeechTracker({
+      callId: session.id,
+      codec: negotiatedCodec,
+      sampleRate: negotiatedRate,
+      onTranscript: async (text, confidence) => {
+        if (!activeSessionObj) return;
+        const shouldWake = await hooks.onSpeechTurn(activeSessionObj, text, confidence);
+        if (shouldWake) {
+          await triggerGreetingOnce('speech_human_pickup');
+        }
+      },
+    });
+
     hooks.onSessionConnected(session, meta.callRef);
 
     // Crisp fallback: start greeting smoothly at 750ms even if callee answered quietly
@@ -1496,6 +1519,7 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
     clearTimeout(startTimeout);
     clearInterval(pingTimer);
     clearAllMarks();
+    speechTracker?.flushAndClose();
 
     if (activeState) {
       activeState.playbackEpoch += 1;
@@ -1564,6 +1588,8 @@ function handleDualProtocolSocket(ws: WebSocket, hooks: FonosterVoiceBridgeHooks
         return;
       }
       if (msg.event === 'media') {
+        const track = String(msg.media?.track || 'inbound').toLowerCase();
+        if (track.includes('outbound')) return;
         const b64 = msg.media?.payload;
         if (typeof b64 === 'string' && b64.length > 0) {
           handleInboundAudioFrame(Buffer.from(b64, 'base64'));

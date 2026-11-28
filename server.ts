@@ -19,6 +19,7 @@ import {
   type FonosterSessionState,
 } from './server/fonoster.ts';
 import { warmTtsCache } from './server/tts.ts';
+import { warmSttEngine } from './server/stt.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -1122,9 +1123,11 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
 
         // Pre-synthesize all spoken prompts into memory while Fonoster is dialing
         // so the greeting & custom prompt play instantly upon pickup with zero Deepgram latency!
-        const combinedIntroPrompt = [newSession.introGreeting, newSession.script]
-          .filter((t) => Boolean(t && t.trim()))
-          .join(' ');
+        const firstPrompt = newSession.introGreeting.trim();
+        const secondPrompt = newSession.script.trim();
+        const combinedIntroPrompt = firstPrompt && secondPrompt
+          ? `${/[.!?]$/.test(firstPrompt) ? firstPrompt : `${firstPrompt}.`} ${secondPrompt}`
+          : firstPrompt || secondPrompt;
         void warmTtsCache(
           [
             combinedIntroPrompt,
@@ -1134,6 +1137,7 @@ app.post('/api/call/initiate', async (req: Request, res: Response) => {
           ],
           newSession.voice
         );
+        void warmSttEngine();
 
         const dispatched = await dispatchFonosterOutboundCall(fonosterCreds, {
           from: fonosterPhone,
@@ -1717,12 +1721,14 @@ async function redirectLiveCallToHumanStart(
           description: `Live human confirmed. Playing voice greeting & prompt: "${session.introGreeting}"`,
           data: { greeting: session.introGreeting, script: session.script },
         });
-        const spokenPrompt = [session.introGreeting, session.script]
-          .filter((t) => Boolean(t && t.trim()))
-          .join(' ');
+        const p1 = (session.introGreeting || '').trim();
+        const p2 = (session.script || '').trim();
+        const spokenPrompt = p1 && p2
+          ? `${/[.!?]$/.test(p1) ? p1 : `${p1}.`} ${p2}`
+          : p1 || p2;
         if (spokenPrompt) {
           void sayOnFonosterCall(session.id, spokenPrompt, {
-            interruptible: true,
+            interruptible: false,
             preempt: true,
           });
         }
@@ -2525,7 +2531,15 @@ function populateHumanGreetingTwiml(
     broadcastEvent(session.id, 'session-update', session);
   }
 
-  twiml.say({ voice: session.voice as any }, session.introGreeting);
+  // Speak BOTH initial custom prompts (Prompt 1: introGreeting, Prompt 2: script)
+  // outside <Gather input="dtmf speech"> so recipient speech NEVER triggers barge-in
+  // and interrupts either of the first 2 custom prompts!
+  if (session.introGreeting?.trim()) {
+    twiml.say({ voice: session.voice as any }, session.introGreeting);
+  }
+  if (session.script?.trim()) {
+    twiml.say({ voice: session.voice as any }, session.script);
+  }
 
   const gather = twiml.gather({
     action: gatherActionUrl,
@@ -2536,7 +2550,7 @@ function populateHumanGreetingTwiml(
     finishOnKey: '#',
     timeout: 25,
   });
-  gather.say({ voice: session.voice as any }, session.script);
+  gather.pause({ length: 1 });
 
   const gatherSecondChance = twiml.gather({
     action: gatherActionUrl,
@@ -3531,8 +3545,9 @@ app.all(['/api/plivo/outbound', '/api/plivo/answer'], (req: Request, res: Respon
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
 ${recordTag}  <Speak>${escapeXml(session.introGreeting)}</Speak>
+  <Speak>${escapeXml(session.script)}</Speak>
   <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
-    <Speak>${escapeXml(session.script)}</Speak>
+    <Wait length="25" />
   </GetInput>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
   <Hangup />
@@ -3666,8 +3681,9 @@ app.all(['/api/plivo/amd-gate', '/api/plivo/human-start'], async (req: Request, 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Speak>${escapeXml(session.introGreeting)}</Speak>
+  <Speak>${escapeXml(session.script)}</Speak>
   <GetInput action="${escapeXml(gatherUrl)}" method="POST" inputType="dtmf speech" numDigits="${maxDigits}" finishOnKey="#" executionTimeout="25" digitEndTimeout="8" speechEndTimeout="auto">
-    <Speak>${escapeXml(session.script)}</Speak>
+    <Wait length="25" />
   </GetInput>
   <Speak>We did not receive your code. Thank you for your time. Goodbye.</Speak>
   <Hangup />
@@ -4636,6 +4652,10 @@ function startServer() {
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`VoiceDrop Interactive server running on http://0.0.0.0:${PORT}`);
+    // Pre-warm built-in zero-key local Whisper STT model automatically on startup
+    setTimeout(() => {
+      void warmSttEngine();
+    }, 1500);
   });
 
   attachFonosterVoiceServer(httpServer, {
@@ -4689,11 +4709,15 @@ function startServer() {
         description: `Playing voice prompt: "${session.introGreeting}"`,
         data: { greeting: session.introGreeting, script: session.script },
       });
-      const promptText = [session.introGreeting, session.script]
-        .filter((t) => Boolean(t && t.trim()))
-        .join(' ');
+      const p1 = (session.introGreeting || '').trim();
+      const p2 = (session.script || '').trim();
+      const promptText = p1 && p2
+        ? `${/[.!?]$/.test(p1) ? p1 : `${p1}.`} ${p2}`
+        : p1 || p2;
       if (promptText) {
-        await sayOnFonosterCall(session.id, promptText, { interruptible: true, preempt: true });
+        // First 2 custom prompts (introGreeting + script) are strictly non-interruptible so recipient
+        // speech NEVER cuts them off while live STT continues transcribing every word in parallel!
+        await sayOnFonosterCall(session.id, promptText, { interruptible: false, preempt: true });
       }
     },
     onSpeechTurn: async (session: CallSession, text: string, confidence?: number) => {
